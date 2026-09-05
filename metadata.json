@@ -1,0 +1,6 @@
+{
+  "name": "IPTVFree",
+  "description": "Native IPTV Media Player with Jetpack Media3 and Room cache support",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
