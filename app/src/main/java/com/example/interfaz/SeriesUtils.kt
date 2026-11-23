@@ -1,9 +1,9 @@
 package com.example.interfaz
 
-import com.example.motor.db.EpgChannelData
-import com.example.motor.db.EpgProgramme
 import com.example.motor.db.IptvItem
-import com.example.motor.repository.TmdbRepository
+import com.example.motor.db.SeriesEpisode
+import com.example.motor.db.SeriesSeason
+import com.example.motor.repository.IptvRepository
 
 data class PrecomputedSeriesData(
     val groups: List<String>,
@@ -28,8 +28,8 @@ fun computeMoviesData(moviesMap: Map<String, List<IptvItem>>): PrecomputedMovies
     val counts = HashMap<String, Int>()
 
     moviesMap.forEach { (group, list) ->
-        if (!com.example.motor.parser.BaseEngine.isDividerOrHeader(group)) {
-            val validItems = list.filter { !com.example.motor.parser.BaseEngine.isDividerOrHeader(it.name) }
+        if (!IptvRepository.isDividerOrHeader(group)) {
+            val validItems = list.filter { !IptvRepository.isDividerOrHeader(it.name) }
             if (validItems.isNotEmpty()) {
                 cleanedMap[group] = validItems
                 counts[group] = validItems.size
@@ -56,27 +56,6 @@ fun computeMoviesData(moviesMap: Map<String, List<IptvItem>>): PrecomputedMovies
     )
 }
 
-private val s00e00RegexVM = Regex("(?i)\\b[ST]\\s*\\d+\\s*[-_.]?\\s*E\\s*\\d+\\b")
-private val s00RegexVM = Regex("(?i)\\b[ST]\\s*\\d+\\b")
-private val e00RegexVM = Regex("(?i)\\b[EC]\\s*\\d+\\b")
-private val x00RegexVM = Regex("(?i)\\b\\d+\\s*x\\s*\\d+\\b")
-private val temporadaRegexVM = Regex("(?i)\\b(temporada|temp|t)\\.?\\s*\\d+\\b")
-private val seasonRegexVM = Regex("(?i)\\bseason\\s*\\d+\\b")
-private val capituloRegexVM = Regex("(?i)\\bcapitulo\\s*\\d+\\b")
-private val capRegexVM = Regex("(?i)\\bcap\\.?\\s*\\d+\\b")
-private val episodioRegexVM = Regex("(?i)\\bepisodio\\s*\\d+\\b")
-private val epRegexVM = Regex("(?i)\\bep\\.?\\s*\\d+\\b")
-private val spacesRegexVM = Regex("\\s+")
-
-private val regexStEp = Regex("(?i)\\b[ST]\\s*\\d+\\s*[-_.]?\\s*(?:E|EP|EPISODE|EPISODIO|C|CAP|CAPITULO)?\\s*[-_.]?\\s*\\d+\\b")
-private val regexNxN = Regex("(?i)\\b\\d+\\s*x\\s*\\d+\\b")
-private val regexSeasonTemp = Regex("(?i)\\b(?:season|temporada|temp|t|s)\\.?\\s*\\d+\\b")
-private val regexEpisodeCap = Regex("(?i)\\b(?:episode|episodio|ep|capitulo|cap|c|e)\\.?\\s*\\d+\\b")
-private val regexStDigits = Regex("(?i)\\b[ST]\\d+\\b")
-private val regexEpcDigits = Regex("(?i)\\b[EPC]\\d+\\b")
-private val regexTrailingDashEp = Regex("(?i)[-_/#:]+\\s*(?:ep|ep\\.|cap|cap\\.|e|c)?\\s*\\d{1,4}\\b")
-private val regexTrailingDigit = Regex("\\s+[-_.]?\\s*\\d{1,4}$")
-private val regexMultiSpace = Regex("\\s+")
 private val regexNonAlphaNum = Regex("[^a-z0-9áéíóúñ]")
 
 private val regexCategoryGroup = Regex("^(?i)([a-z]{2,4}|latino|castellano|canales|esp|spa|usa|uk|fra|ger|ita|por)\\s*[|:\\-➔➔➔]\\s*(.*)$")
@@ -88,11 +67,6 @@ private val regexFR = Regex("(?i)\\b(france|francia|fr)\\b")
 private val regexPT = Regex("(?i)\\b(portugal|pt)\\b")
 private val regexDE = Regex("(?i)\\b(germany|alemania|de)\\b")
 
-fun normalizeBaseSeriesName(name: String?): String {
-    if (name.isNullOrBlank()) return ""
-    val base = getBaseSeriesName(name)
-    return base.lowercase().replace(regexNonAlphaNum, "")
-}
 
 private val countryPrefixRegexSeries = Regex("(?i)^(?:[:|\\-]?\\s*(?:en|es|esp|spa|lat|latino|latam|cast|castellano|fr|fra|de|deu|it|ita|pt|por|uk|us|usa|eng|fhd|hd|sd|4k|uhd|3d|2d|hdx|movistar|m\\+|ar|mx|cl|co|pe|uy|ve|br)\\b[:|\\-]?\\s*|^\\[[^\\]]+\\]\\s*|^\\([^\\)]+\\)\\s*|^[a-zA-Z]{2,3}[:|\\-]\\s*|^:([a-zA-Z]{2,3})\\s*)+")
 
@@ -113,8 +87,6 @@ private val punctuationInBase = Regex("[.\\-_/|+]")
 private val nonAlphaNumInBase = Regex("[^a-zA-Z0-9áéíóúÁÉÍÓÚñÑ ]")
 private val multiSpaceInBase = Regex("\\s+")
 
-private const val DEBUG_SERIES_LOG = false
-
 private val basePatterns = arrayOf(
     sEPatternBase,
     xPatternBase,
@@ -125,6 +97,7 @@ private val basePatterns = arrayOf(
     trailingDashNumPatternBase
 )
 
+@JvmOverloads
 fun normalizeBaseSeriesName(name: String?, groupTitle: String? = null): String {
     if (name.isNullOrBlank() && groupTitle.isNullOrBlank()) return ""
     val base = getBaseSeriesName(name, groupTitle)
@@ -189,9 +162,6 @@ fun getBaseSeriesName(name: String?, groupTitle: String? = null): String {
     }
 
     val result = if (base.length >= 2) base else (name ?: "").trim()
-    if (DEBUG_SERIES_LOG) {
-        android.util.Log.d("M3U_SERIES_BASE_LOG", "$name\n↓\n$result")
-    }
     return result
 }
 
@@ -262,13 +232,12 @@ fun computeSeriesData(seriesMap: Map<String, List<IptvItem>>): PrecomputedSeries
     val allSeries = ArrayList<IptvItem>()
     val cleanedGroupToSeries = LinkedHashMap<String, List<IptvItem>>()
     val counts = HashMap<String, Int>()
-    val baseNameCache = HashMap<String, String>()
     val allSeriesUnique = ArrayList<IptvItem>()
 
     seriesMap.forEach { (group, list) ->
         val trimmedGroup = group.trim()
-        if (trimmedGroup.isNotEmpty() && !com.example.motor.parser.BaseEngine.isDividerOrHeader(trimmedGroup)) {
-            val validItems = list.filter { !com.example.motor.parser.BaseEngine.isDividerOrHeader(it.name) }
+        if (trimmedGroup.isNotEmpty() && !IptvRepository.isDividerOrHeader(trimmedGroup)) {
+            val validItems = list.filter { !IptvRepository.isDividerOrHeader(it.name) }
             if (validItems.isNotEmpty()) {
                 allSeries.addAll(validItems)
 
@@ -276,7 +245,6 @@ fun computeSeriesData(seriesMap: Map<String, List<IptvItem>>): PrecomputedSeries
                 val seenInGroup = LinkedHashMap<String, IptvItem>()
                 for (item in validItems) {
                     val normBase = normalizeBaseSeriesName(item.name, item.group)
-                    baseNameCache[item.name] = normBase
                     
                     val groupKey = if (!item.seriesId.isNullOrBlank()) item.seriesId!! else normBase
                     if (!seenInGroup.containsKey(groupKey)) {
@@ -314,7 +282,7 @@ fun computeSeriesData(seriesMap: Map<String, List<IptvItem>>): PrecomputedSeries
 
     return PrecomputedSeriesData(
         groups = groupsList,
-        seriesBaseNameCache = baseNameCache,
+        seriesBaseNameCache = emptyMap(),
         categoryCounts = counts,
         allSeriesUnique = allSeriesUnique,
         groupToUniqueSeries = cleanedGroupToSeries,
@@ -323,8 +291,6 @@ fun computeSeriesData(seriesMap: Map<String, List<IptvItem>>): PrecomputedSeries
 }
 
 private val s00e00Regex = Regex("(?i)\\b[ST]\\s*\\d+\\s*[-_.]?\\s*E\\s*\\d+\\b")
-private val s00Regex = Regex("(?i)\\b[ST]\\s*\\d+\\b")
-private val e00Regex = Regex("(?i)\\b[EC]\\s*\\d+\\b")
 private val x00Regex = Regex("(?i)\\b\\d+\\s*x\\s*\\d+\\b")
 private val temporadaRegex = Regex("(?i)\\b(temporada|temp|t)\\.?\\s*\\d+\\b")
 private val seasonRegex = Regex("(?i)\\bseason\\s*\\d+\\b")
@@ -332,7 +298,6 @@ private val capituloRegex = Regex("(?i)\\bcapitulo\\s*\\d+\\b")
 private val capRegex = Regex("(?i)\\bcap\\.?\\s*\\d+\\b")
 private val episodioRegex = Regex("(?i)\\bepisodio\\s*\\d+\\b")
 private val epRegex = Regex("(?i)\\bep\\.?\\s*\\d+\\b")
-private val spacesRegex = Regex("\\s+")
 
 private val regexCountryPrefixStrip = Regex("^(?:es|esp|spa|lat|latino|latam|us|usa|uk|eng|fr|fra|de|deu|it|ita|pt|por|ar|mx|cl|co|pe|uy|ve|br)")
 
@@ -340,7 +305,7 @@ fun groupM3uEpisodes(
     seriesItem: IptvItem,
     allSeries: List<IptvItem>,
     baseNameCache: Map<String, String>? = null
-): List<EpgChannelData> {
+): List<SeriesSeason> {
     val baseName = baseNameCache?.get(seriesItem.name) ?: normalizeBaseSeriesName(seriesItem.name, seriesItem.group)
     
     // Fast O(1) matching using baseNameCache, falling back to cached local computations
@@ -382,15 +347,16 @@ fun groupM3uEpisodes(
 
     if (matchingEpisodes.isEmpty()) {
         return listOf(
-            EpgChannelData(
+            SeriesSeason(
                 id = "1",
                 name = "Temporada 1",
-                programmes = listOf(
-                    EpgProgramme(
-                        start = 0,
-                        stop = 0,
+                episodes = listOf(
+                    SeriesEpisode(
+                        id = "1",
+                        episodeNum = "1",
+                        seasonNum = "1",
                         title = seriesItem.name,
-                        category = seriesItem.url ?: "",
+                        playbackUrl = seriesItem.url ?: "",
                         rating = "1"
                     )
                 )
@@ -417,8 +383,8 @@ fun groupM3uEpisodes(
     return seasonsMap.entries.sortedBy { it.key }.map { (seasonNum, epList) ->
         val sortedList = epList.sortedBy { it.first }
 
-        val programmes = sortedList.map { (epNum, epItem) ->
-            val cleanEpName = TmdbRepository.getInstance().cleanTitleAndExtractYear(epItem.name).title
+        val episodes = sortedList.map { (epNum, epItem) ->
+            val cleanEpName = IptvRepository.cleanTitleAndExtractYear(epItem.name).title
             var displayName = cleanEpName.replace(displayBaseName, "", ignoreCase = true).trim()
             displayName = displayName.replace(s00e00Regex, "").trim()
             displayName = displayName.replace(x00Regex, "").trim()
@@ -440,19 +406,20 @@ fun groupM3uEpisodes(
                 "S${seasonNum} E${epNum}"
             }
 
-            EpgProgramme(
-                start = 0,
-                stop = 0,
+            SeriesEpisode(
+                id = epNum.toString(),
+                episodeNum = epNum.toString(),
+                seasonNum = seasonNum.toString(),
                 title = titleText,
-                category = epItem.url ?: "",
+                playbackUrl = epItem.url ?: "",
                 rating = epNum.toString()
             )
         }
 
-        EpgChannelData(
+        SeriesSeason(
             id = seasonNum.toString(),
             name = "Temporada $seasonNum",
-            programmes = programmes
+            episodes = episodes
         )
     }
 }

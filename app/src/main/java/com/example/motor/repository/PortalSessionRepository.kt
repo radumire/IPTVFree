@@ -12,13 +12,15 @@ import com.example.motor.config.PlayerSettings
 import com.example.motor.config.Playlist
 import com.example.motor.config.StalkerDevice
 import com.example.motor.db.*
-import com.example.motor.parser.StalkerParser
+import com.example.motor.source.StalkerSource
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 class PortalSessionRepository private constructor(
     private val application: Application
@@ -27,6 +29,7 @@ class PortalSessionRepository private constructor(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val db = AppDatabase.getDatabase(application)
     private val profileDao = db.userProfileDao()
+    private val profileUpdateMutex = kotlinx.coroutines.sync.Mutex()
 
     // Network connectivity
     private val _isOnline = MutableStateFlow(true)
@@ -62,6 +65,8 @@ class PortalSessionRepository private constructor(
 
     // MAC Stalker session cache (by playlist ID string)
     private val stalkerSessions = java.util.concurrent.ConcurrentHashMap<String, Map<String, Any>>()
+    // MAC Stalker learned compatibility state (by playlist ID string)
+    private val stalkerCompatStates = java.util.concurrent.ConcurrentHashMap<String, com.example.motor.parser.PortalCompatibilityState>()
 
     init {
         // Initialize network monitor
@@ -88,14 +93,14 @@ class PortalSessionRepository private constructor(
             Log.e(TAG, "Error registering network callback", e)
         }
 
-        // Initialize default profile if needed
+        // Initialize default profile if needed, WITHOUT auto-selecting so ProfileSelector stays visible
         scope.launch {
             val list = profileDao.getAllProfiles()
             if (list.isEmpty()) {
                 val defaultProfile = UserProfile(
-                    id = 0L,
+                    id = 1L,
                     name = "Usuario Principal",
-                    avatar = "👤",
+                    avatar = "avatar_plumber",
                     colorIdx = 0,
                     pin = "",
                     playlistsJson = "[]",
@@ -104,9 +109,14 @@ class PortalSessionRepository private constructor(
                     customThemesJson = "{}"
                 )
                 profileDao.insertProfile(defaultProfile)
-                _currentProfile.value = defaultProfile
-            } else if (_currentProfile.value == null) {
-                _currentProfile.value = list.firstOrNull()
+            }
+        }
+
+        // Keep subtitle provider credentials synchronized with current profile settings
+        scope.launch {
+            settings.collect { s ->
+                com.example.motor.subtitles.OpenSubtitlesProvider.setGlobalApiKey(s.openSubtitlesKey.takeIf { it.isNotBlank() })
+                com.example.motor.subtitles.AssrtSubtitleProvider.setGlobalToken(s.assrtToken.takeIf { it.isNotBlank() })
             }
         }
     }
@@ -121,11 +131,58 @@ class PortalSessionRepository private constructor(
         _currentProfile.value = profile
     }
 
+    fun logoutProfile() {
+        _currentProfile.value = null
+    }
+
+    fun setActivePlaylist(playlistId: Long): Playlist? {
+        val current = _currentProfile.value ?: return null
+        val plList = JsonUtils.playlistsFromJson(current.playlistsJson)
+        val target = plList.find { it.id == playlistId } ?: return null
+        val updatedList = plList.map { p ->
+            p.copy(active = p.id == playlistId)
+        }
+        val optimisticProfile = current.copy(playlistsJson = JsonUtils.playlistsToJson(updatedList))
+        _currentProfile.value = optimisticProfile
+        val targetProfileId = current.id
+        scope.launch(Dispatchers.IO) {
+            profileUpdateMutex.withLock {
+                try {
+                    val latest = profileDao.getProfileById(targetProfileId)
+                        ?: _currentProfile.value?.takeIf { it.id == targetProfileId }
+                        ?: return@withLock
+                    val latestList = JsonUtils.playlistsFromJson(latest.playlistsJson)
+                    if (latestList.none { it.id == playlistId }) {
+                        // Playlist was concurrently deleted; preserve deletion cleanly
+                        if (_currentProfile.value?.id == targetProfileId) {
+                            _currentProfile.value = latest
+                        }
+                        return@withLock
+                    }
+                    val lockedList = latestList.map { p -> p.copy(active = p.id == playlistId) }
+                    val updatedProfile = latest.copy(playlistsJson = JsonUtils.playlistsToJson(lockedList))
+                    profileDao.insertProfile(updatedProfile)
+                    if (_currentProfile.value?.id == targetProfileId) {
+                        _currentProfile.value = updatedProfile
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error saving updated profile to DB", e)
+                }
+            }
+        }
+        return target.copy(active = true)
+    }
+
     suspend fun updateCurrentProfile(update: (UserProfile) -> UserProfile) = withContext(Dispatchers.IO) {
-        val current = _currentProfile.value ?: return@withContext
-        val updated = update(current)
-        profileDao.insertProfile(updated)
-        _currentProfile.value = updated
+        profileUpdateMutex.withLock {
+            val activeSnapshot = _currentProfile.value ?: return@withLock
+            val current = profileDao.getProfileById(activeSnapshot.id) ?: activeSnapshot
+            val updated = update(current)
+            profileDao.insertProfile(updated)
+            if (_currentProfile.value?.id == updated.id) {
+                _currentProfile.value = updated
+            }
+        }
     }
 
     fun getStalkerSession(playlistIdKey: String): Map<String, Any>? {
@@ -140,6 +197,18 @@ class PortalSessionRepository private constructor(
         stalkerSessions.remove(playlistIdKey)
     }
 
+    fun getStalkerCompatState(playlistIdKey: String): com.example.motor.parser.PortalCompatibilityState? {
+        return stalkerCompatStates[playlistIdKey]
+    }
+
+    fun setStalkerCompatState(playlistIdKey: String, state: com.example.motor.parser.PortalCompatibilityState) {
+        stalkerCompatStates[playlistIdKey] = state
+    }
+
+    fun clearStalkerCompatState(playlistIdKey: String) {
+        stalkerCompatStates.remove(playlistIdKey)
+    }
+
     suspend fun reconnectActivePlaylistSilently() = withContext(Dispatchers.IO) {
         val pl = activePlaylist.value ?: return@withContext
         if ((pl.type == "mac" || pl.type == "stalker") && pl.mac.isNotBlank()) {
@@ -147,13 +216,33 @@ class PortalSessionRepository private constructor(
                 val host = pl.host
                 val mac = pl.mac
                 val device = if (pl.stalkerDeviceJson.isNotBlank()) JsonUtils.stalkerDeviceFromJson(pl.stalkerDeviceJson) else StalkerDevice()
-                val sessionMap = StalkerParser.performStalkerHandshake(host, mac, device)
+                val stalkerSource = StalkerSource(this@PortalSessionRepository)
+                val sessionMap = stalkerSource.performHandshake(host, mac, device, pl.id)
                 setStalkerSession(pl.id.toString(), sessionMap)
                 Log.d(TAG, "Silent re-handshake succeeded for MAC playlist: ${pl.name}")
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 Log.w(TAG, "Silent re-handshake failed: ${e.message}")
             }
         }
+    }
+
+    suspend fun keepActivePlaylistSessionAlive(): Boolean = withContext(Dispatchers.IO) {
+        val pl = activePlaylist.value ?: return@withContext false
+        if ((pl.type == "mac" || pl.type == "stalker") && pl.mac.isNotBlank()) {
+            val session = getStalkerSession(pl.id.toString())
+            if (session == null) {
+                reconnectActivePlaylistSilently()
+                return@withContext getStalkerSession(pl.id.toString()) != null
+            }
+            val alive = com.example.motor.parser.StalkerParser.sendStalkerWatchdogPing(session)
+            if (!alive) {
+                Log.i(TAG, "Stalker watchdog reported expired token for ${pl.name}; refreshing session silently...")
+                reconnectActivePlaylistSilently()
+                return@withContext getStalkerSession(pl.id.toString()) != null
+            }
+            return@withContext true
+        }
+        true
     }
 
     companion object {
@@ -164,6 +253,10 @@ class PortalSessionRepository private constructor(
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: PortalSessionRepository(application).also { INSTANCE = it }
             }
+        }
+
+        fun getInstanceOrNull(): PortalSessionRepository? {
+            return INSTANCE
         }
     }
 }

@@ -18,6 +18,8 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
@@ -27,7 +29,6 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.foundation.lazy.items
 import androidx.compose.ui.text.style.TextOverflow
-import com.example.motor.parser.BaseEngine
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -38,12 +39,15 @@ import com.example.interfaz.AppThemeColors
 import com.example.interfaz.viewmodel.SettingsViewModel
 import com.example.interfaz.THEMES_LIST
 import com.example.interfaz.components.tvClickable
+import com.example.interfaz.components.tvCardFocusable
 import com.example.interfaz.components.TvButton
 import com.example.interfaz.components.TvIconButton
 import com.example.interfaz.components.TV_FOCUSED_BG
 import com.example.interfaz.components.TV_FOCUSED_TEXT
 import com.example.interfaz.components.TV_FOCUSED_BORDER
+import com.example.interfaz.components.rememberTvInitialFocusRequester
 import com.example.interfaz.components.TvQrScannerDialog
+import com.example.interfaz.ParentalPinSettingsCard
 import android.Manifest
 import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -57,16 +61,23 @@ import kotlinx.coroutines.launch
 fun SettingsScreen(
     viewModel: SettingsViewModel,
     theme: AppThemeColors,
-    onFullScreenChange: (Boolean) -> Unit = {}
+    onFullScreenChange: (Boolean) -> Unit = {},
+    onBack: () -> Unit = {}
 ) {
     val currentProfile by viewModel.currentProfile.collectAsStateWithLifecycle()
     val settingsObj by viewModel.settings.collectAsStateWithLifecycle()
     val lang = settingsObj.lang
 
     var activeCategory by remember { mutableStateOf("general") }
+    val initialFocusRequester = rememberTvInitialFocusRequester()
     
     var activeManageCategoriesType by remember { mutableStateOf<String?>(null) } // "tv", "movies", "series"
     var showSyncDialog by remember { mutableStateOf(false) }
+
+    // Capture back button to return to Home when not managing categories
+    androidx.activity.compose.BackHandler(enabled = activeManageCategoriesType == null) {
+        onBack()
+    }
 
     LaunchedEffect(activeManageCategoriesType) {
         onFullScreenChange(activeManageCategoriesType != null)
@@ -76,6 +87,10 @@ fun SettingsScreen(
         onDispose {
             onFullScreenChange(false)
         }
+    }
+
+    LaunchedEffect(Unit) {
+        viewModel.ensureCategoriesLoaded()
     }
 
     val liveChannelsMap by viewModel.liveChannels.collectAsStateWithLifecycle()
@@ -171,51 +186,59 @@ fun SettingsScreen(
             
             val categories = listOf(
                 Triple("general", Translator.translate("general", lang), Icons.Default.Tune),
-                Triple("player", Translator.translate("player", lang), Icons.Default.PlayCircle),
-                Triple("subtitles", Translator.translate("subtitles", lang), Icons.Default.Subtitles),
-                Triple("parental", Translator.translate("parental", lang), Icons.Default.Lock),
+                Triple("categories", Translator.translate("categories", lang), Icons.Default.Category),
                 Triple("themes", Translator.translate("themes", lang), Icons.Default.ColorLens),
+                Triple("subtitles", Translator.translate("subtitles", lang), Icons.Default.Subtitles),
                 Triple("sync", if (lang == "es") "Sincronizar TV" else if (lang == "ro") "Sincronizare TV" else "TV Sync", Icons.Default.QrCode),
+                Triple("parental", Translator.translate("parental", lang), Icons.Default.Lock),
+                Triple("player", Translator.translate("player", lang), Icons.Default.PlayCircle),
                 Triple("diagnostic", Translator.translate("diagnostic", lang), Icons.Default.Info),
                 Triple("cache", Translator.translate("cache", lang), Icons.Default.DeleteSweep)
             )
 
-            categories.forEach { (catId, catLabel, catIcon) ->
+            categories.forEachIndexed { index, (catId, catLabel, catIcon) ->
                 val isSelected = activeCategory == catId
-                val bg = if (isSelected) parseHexColor(theme.accent) else Color.Transparent
-                val tc = if (isSelected) Color.White else Color.LightGray
                 var isCatFocused by remember { mutableStateOf(false) }
+
+                val tc = if (isCatFocused) TV_FOCUSED_TEXT
+                    else if (isSelected) Color.White
+                    else Color.LightGray
 
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(if (isCatFocused) TV_FOCUSED_BG else bg)
-                        .tvClickable(
+                        .tvCardFocusable(
                             shape = RoundedCornerShape(8.dp),
-                            onFocusChange = { isCatFocused = it }
-                        ) {
-                            activeCategory = catId
-                            if (catId == "sync") {
-                                showSyncDialog = true
+                            scaleFocused = 1.03f,
+                            elevationFocused = 6.dp,
+                            unfocusedBackgroundColor = if (isSelected) parseHexColor(theme.accent).copy(alpha = 0.60f) else parseHexColor(theme.card).copy(alpha = 0.55f),
+                            focusedBackgroundColor = parseHexColor(theme.accent).copy(alpha = 0.35f),
+                            unfocusedBorderColor = if (isSelected) parseHexColor(theme.accentLight).copy(alpha = 0.8f) else Color.White.copy(alpha = 0.12f),
+                            focusedBorderColor = parseHexColor(theme.accent),
+                            focusRequester = if (index == 0) initialFocusRequester else null,
+                            onFocusChange = { isCatFocused = it },
+                            onClick = {
+                                activeCategory = catId
+                                if (catId == "sync") {
+                                    showSyncDialog = true
+                                }
                             }
-                        }
+                        )
                         .padding(horizontal = 12.dp, vertical = 10.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    val currentTc = if (isCatFocused) TV_FOCUSED_TEXT else tc
                     Icon(
                         imageVector = catIcon,
                         contentDescription = catLabel,
-                        tint = currentTc,
+                        tint = tc,
                         modifier = Modifier.size(18.dp)
                     )
                     Spacer(modifier = Modifier.width(10.dp))
                     Text(
                         text = catLabel,
-                        color = currentTc,
+                        color = tc,
                         fontSize = 13.sp,
-                        fontWeight = if (isCatFocused) FontWeight.ExtraBold else if (isSelected) FontWeight.Bold else FontWeight.Normal
+                        fontWeight = if (isCatFocused || isSelected) FontWeight.Bold else FontWeight.Medium
                     )
                 }
             }
@@ -276,12 +299,96 @@ fun SettingsScreen(
                         theme = theme
                     )
 
-                    SettingsToggleRow(
-                        title = Translator.translate("tv_mode", lang),
-                        subtitle = Translator.translate("tv_mode_desc", lang),
-                        checked = settingsObj.tvMode,
-                        onCheckedChange = { viewModel.updateCurrentProfileField(settings = settingsObj.copy(tvMode = it)) },
+                    SettingsSelectorRow(
+                        title = Translator.translate("home_interface", lang),
+                        subtitle = Translator.translate("home_interface_desc", lang),
+                        selectedValue = settingsObj.homeLayout,
+                        options = listOf(
+                            "vivo_glass" to Translator.translate("interface_vivo", lang),
+                            "classic_tiles" to Translator.translate("interface_classic", lang),
+                            "modern" to Translator.translate("interface_modern", lang),
+                            "cinema_bar" to Translator.translate("interface_cinema", lang)
+                        ),
+                        onSelected = { viewModel.updateCurrentProfileField(settings = settingsObj.copy(homeLayout = it)) },
                         theme = theme
+                    )
+                }
+
+                "sync" -> {
+                    LaunchedEffect(Unit) {
+                        showSyncDialog = true
+                    }
+
+                    SettingsHeader(
+                        title = if (lang == "es") "Sincronización TV" else if (lang == "ro") "Sincronizare TV" else "TV Sync",
+                        subtitle = if (lang == "es") "Abre la pantalla flotante para ver el Código QR y la dirección IP de sincronización." else "Open the floating screen to view the QR Code and local sync IP address."
+                    )
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = parseHexColor(theme.surface).copy(alpha = 0.6f)),
+                        shape = RoundedCornerShape(16.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .border(1.dp, parseHexColor(theme.accent).copy(alpha = 0.4f), RoundedCornerShape(16.dp))
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(24.dp),
+                            verticalArrangement = Arrangement.spacedBy(16.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.QrCodeScanner,
+                                contentDescription = null,
+                                tint = parseHexColor(theme.accent),
+                                modifier = Modifier.size(56.dp)
+                            )
+
+                            Text(
+                                text = if (lang == "es") "Pantalla Flotante de Sincronización TV" else "TV Sync Floating Window",
+                                color = Color.White,
+                                fontSize = 18.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+
+                            Text(
+                                text = if (lang == "es") "Usa el Código QR para escanear desde tu móvil o ingresa la IP para transferir listas directamente a esta Smart TV." else "Use the QR Code to scan from your phone or enter the IP to transfer lists directly to this Smart TV.",
+                                color = Color.LightGray,
+                                fontSize = 13.sp,
+                                textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                            )
+
+                            TvButton(
+                                onClick = { showSyncDialog = true },
+                                containerColor = parseHexColor(theme.accent).copy(alpha = 0.15f),
+                                unfocusedBorderColor = parseHexColor(theme.accent).copy(alpha = 0.40f),
+                                focusedContainerColor = parseHexColor(theme.accent).copy(alpha = 0.35f),
+                                focusedBorderColor = parseHexColor(theme.accent),
+                                shape = RoundedCornerShape(10.dp)
+                            ) { isFocused ->
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                                ) {
+                                    Icon(imageVector = Icons.Default.QrCode, contentDescription = null, tint = if (isFocused) TV_FOCUSED_TEXT else Color.White)
+                                    Text(
+                                        text = if (lang == "es") "ABRIR PANTALLA FLOTANTE DE SINCRONIZACIÓN" else "OPEN FLOATING SYNC SCREEN",
+                                        color = if (isFocused) TV_FOCUSED_TEXT else Color.White,
+                                        fontSize = 14.sp,
+                                        fontWeight = if (isFocused) FontWeight.ExtraBold else FontWeight.Bold
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                "categories" -> {
+                    SettingsHeader(
+                        title = Translator.translate("categories_settings", lang),
+                        subtitle = Translator.translate("categories_desc", lang)
                     )
 
                     SettingsActionRow(
@@ -343,74 +450,6 @@ fun SettingsScreen(
                         onClick = { activeManageCategoriesType = "series" },
                         theme = theme
                     )
-                }
-
-                "sync" -> {
-                    LaunchedEffect(Unit) {
-                        showSyncDialog = true
-                    }
-
-                    SettingsHeader(
-                        title = if (lang == "es") "Sincronización TV" else if (lang == "ro") "Sincronizare TV" else "TV Sync",
-                        subtitle = if (lang == "es") "Abre la pantalla flotante para ver el Código QR y la dirección IP de sincronización." else "Open the floating screen to view the QR Code and local sync IP address."
-                    )
-
-                    Spacer(modifier = Modifier.height(16.dp))
-
-                    Card(
-                        colors = CardDefaults.cardColors(containerColor = parseHexColor(theme.surface).copy(alpha = 0.6f)),
-                        shape = RoundedCornerShape(16.dp),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .border(1.dp, parseHexColor(theme.accent).copy(alpha = 0.4f), RoundedCornerShape(16.dp))
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(24.dp),
-                            verticalArrangement = Arrangement.spacedBy(16.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.QrCodeScanner,
-                                contentDescription = null,
-                                tint = parseHexColor(theme.accent),
-                                modifier = Modifier.size(56.dp)
-                            )
-
-                            Text(
-                                text = if (lang == "es") "Pantalla Flotante de Sincronización TV" else "TV Sync Floating Window",
-                                color = Color.White,
-                                fontSize = 18.sp,
-                                fontWeight = FontWeight.Bold
-                            )
-
-                            Text(
-                                text = if (lang == "es") "Usa el Código QR para escanear desde tu móvil o ingresa la IP para transferir listas directamente a esta Smart TV." else "Use the QR Code to scan from your phone or enter the IP to transfer lists directly to this Smart TV.",
-                                color = Color.LightGray,
-                                fontSize = 13.sp,
-                                textAlign = androidx.compose.ui.text.style.TextAlign.Center
-                            )
-
-                            TvButton(
-                                onClick = { showSyncDialog = true },
-                                containerColor = parseHexColor(theme.accent),
-                                shape = RoundedCornerShape(10.dp)
-                            ) { isFocused ->
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
-                                ) {
-                                    Icon(imageVector = Icons.Default.QrCode, contentDescription = null, tint = if (isFocused) TV_FOCUSED_TEXT else Color.White)
-                                    Text(
-                                        text = if (lang == "es") "ABRIR PANTALLA FLOTANTE DE SINCRONIZACIÓN" else "OPEN FLOATING SYNC SCREEN",
-                                        color = if (isFocused) TV_FOCUSED_TEXT else Color.White,
-                                        fontSize = 14.sp,
-                                        fontWeight = if (isFocused) FontWeight.ExtraBold else FontWeight.Bold
-                                    )
-                                }
-                            }
-                        }
-                    }
                 }
 
                 "player" -> {
@@ -525,6 +564,34 @@ fun SettingsScreen(
                             theme = theme
                         )
                     }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    SubtitleApiKeyCard(
+                        title = Translator.translate("opensubtitles_key", lang),
+                        description = Translator.translate("opensubtitles_desc", lang),
+                        currentValue = settingsObj.openSubtitlesKey,
+                        onSaveKey = { newKey ->
+                            viewModel.updateCurrentProfileField(settings = settingsObj.copy(openSubtitlesKey = newKey))
+                            com.example.motor.subtitles.OpenSubtitlesProvider.setGlobalApiKey(newKey.takeIf { it.isNotBlank() })
+                        },
+                        lang = lang,
+                        theme = theme
+                    )
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    SubtitleApiKeyCard(
+                        title = Translator.translate("assrt_token", lang),
+                        description = Translator.translate("assrt_desc", lang),
+                        currentValue = settingsObj.assrtToken,
+                        onSaveKey = { newToken ->
+                            viewModel.updateCurrentProfileField(settings = settingsObj.copy(assrtToken = newToken))
+                            com.example.motor.subtitles.AssrtSubtitleProvider.setGlobalToken(newToken.takeIf { it.isNotBlank() })
+                        },
+                        lang = lang,
+                        theme = theme
+                    )
                 }
 
                 "parental" -> {
@@ -549,85 +616,15 @@ fun SettingsScreen(
                         )
                     }
 
-                    // Numeric entry for parental pin
-                    var parentalPinField by remember(settingsObj.parentalPin) { mutableStateOf(settingsObj.parentalPin) }
-                    var parentalPinVisible by remember { mutableStateOf(false) }
-                    Card(
-                        colors = CardDefaults.cardColors(containerColor = parseHexColor(theme.surface)),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Column(modifier = Modifier.padding(16.dp)) {
-                            Text(Translator.translate("parental_pin", lang), color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
-                            Text(Translator.translate("parental_pin_desc", lang), color = Color.LightGray, fontSize = 11.sp, modifier = Modifier.padding(bottom = 8.dp))
-                            
-                            TextField(
-                                value = parentalPinField,
-                                onValueChange = {
-                                    parentalPinField = it
-                                    viewModel.updateCurrentProfileField(settings = settingsObj.copy(parentalPin = it))
-                                },
-                                placeholder = { Text("Sin PIN", color = Color.Gray) },
-                                visualTransformation = if (parentalPinVisible) VisualTransformation.None else PasswordVisualTransformation(),
-                                trailingIcon = {
-                                    IconButton(onClick = { parentalPinVisible = !parentalPinVisible }) {
-                                        Icon(
-                                            imageVector = if (parentalPinVisible) Icons.Default.Visibility else Icons.Default.VisibilityOff,
-                                            contentDescription = if (parentalPinVisible) "Ocultar" else "Mostrar",
-                                            tint = Color.LightGray
-                                        )
-                                    }
-                                },
-                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                                colors = TextFieldDefaults.colors(
-                                    focusedContainerColor = parseHexColor(theme.bg),
-                                    unfocusedContainerColor = parseHexColor(theme.bg),
-                                    focusedTextColor = Color.White,
-                                    unfocusedTextColor = Color.White
-                                ),
-                                modifier = Modifier.fillMaxWidth()
-                            )
-                        }
-                    }
-
-                    // Profile lock PIN entry
-                    var profilePinField by remember(currentProfile?.pin) { mutableStateOf(currentProfile?.pin ?: "") }
-                    var profilePinVisible by remember { mutableStateOf(false) }
-                    Card(
-                        colors = CardDefaults.cardColors(containerColor = parseHexColor(theme.surface)),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Column(modifier = Modifier.padding(16.dp)) {
-                            Text(Translator.translate("profile_pin", lang), color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
-                            Text(Translator.translate("profile_pin_desc", lang), color = Color.LightGray, fontSize = 11.sp, modifier = Modifier.padding(bottom = 8.dp))
-                            
-                            TextField(
-                                value = profilePinField,
-                                onValueChange = {
-                                    profilePinField = it
-                                    viewModel.updateCurrentProfileField(pin = it)
-                                },
-                                placeholder = { Text("Sin PIN (Abierto)", color = Color.Gray) },
-                                visualTransformation = if (profilePinVisible) VisualTransformation.None else PasswordVisualTransformation(),
-                                trailingIcon = {
-                                    IconButton(onClick = { profilePinVisible = !profilePinVisible }) {
-                                        Icon(
-                                            imageVector = if (profilePinVisible) Icons.Default.Visibility else Icons.Default.VisibilityOff,
-                                            contentDescription = if (profilePinVisible) "Ocultar" else "Mostrar",
-                                            tint = Color.LightGray
-                                        )
-                                    }
-                                },
-                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                                colors = TextFieldDefaults.colors(
-                                    focusedContainerColor = parseHexColor(theme.bg),
-                                    unfocusedContainerColor = parseHexColor(theme.bg),
-                                    focusedTextColor = Color.White,
-                                    unfocusedTextColor = Color.White
-                                ),
-                                modifier = Modifier.fillMaxWidth()
-                            )
-                        }
-                    }
+                    // Parental PIN management card with Save and Change actions
+                    ParentalPinSettingsCard(
+                        currentPin = settingsObj.parentalPin,
+                        onSavePin = { newPin ->
+                            viewModel.updateCurrentProfileField(settings = settingsObj.copy(parentalPin = newPin))
+                        },
+                        lang = lang,
+                        theme = theme
+                    )
                 }
 
                 "themes" -> {
@@ -747,14 +744,18 @@ fun SettingsScreen(
                             
                             TvButton(
                                 onClick = {
-                                    viewModel.clearAllCategoryAndEpgCaches()
+                                    viewModel.clearAllCategoryCaches()
                                     coroutineScope.launch {
                                         showCacheClearedMessage = true
                                         delay(3000)
                                         showCacheClearedMessage = false
                                     }
                                 },
-                                containerColor = Color.Red,
+                                containerColor = Color(0xFFE53935).copy(alpha = 0.20f),
+                                unfocusedBorderColor = Color(0xFFE53935).copy(alpha = 0.50f),
+                                focusedContainerColor = Color(0xFFE53935).copy(alpha = 0.45f),
+                                focusedBorderColor = Color(0xFFFF5252),
+                                shape = RoundedCornerShape(10.dp),
                                 modifier = Modifier.fillMaxWidth()
                             ) { isFocused ->
                                 Icon(
@@ -845,14 +846,33 @@ fun SettingsToggleRow(
                 Text(title, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold)
                 Text(subtitle, color = Color.LightGray, fontSize = 11.sp, modifier = Modifier.padding(top = 2.dp))
             }
-            Switch(
-                checked = checked,
-                onCheckedChange = onCheckedChange,
-                colors = SwitchDefaults.colors(
-                    checkedThumbColor = parseHexColor(theme.accent),
-                    checkedTrackColor = parseHexColor(theme.accent).copy(alpha = 0.4f)
+            var isFocused by remember { mutableStateOf(false) }
+            val accentColor = parseHexColor(theme.accent)
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(16.dp))
+                    .border(
+                        width = if (isFocused) 2.5.dp else 0.dp,
+                        color = if (isFocused) TV_FOCUSED_BORDER else Color.Transparent,
+                        shape = RoundedCornerShape(16.dp)
+                    )
+                    .background(
+                        color = if (isFocused) accentColor.copy(alpha = 0.22f) else Color.Transparent,
+                        shape = RoundedCornerShape(16.dp)
+                    )
+                    .padding(horizontal = 4.dp, vertical = 2.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Switch(
+                    checked = checked,
+                    onCheckedChange = onCheckedChange,
+                    modifier = Modifier.onFocusChanged { isFocused = it.isFocused },
+                    colors = SwitchDefaults.colors(
+                        checkedThumbColor = accentColor,
+                        checkedTrackColor = accentColor.copy(alpha = 0.4f)
+                    )
                 )
-            )
+            }
         }
     }
 }
@@ -882,13 +902,19 @@ fun SettingsSelectorRow(
             ) {
                 options.forEach { (value, label) ->
                     val isSel = selectedValue == value
-                    val bg = if (isSel) parseHexColor(theme.accent) else Color.DarkGray
+                    val unselBg = Color.White.copy(alpha = 0.08f)
+                    val bg = if (isSel) parseHexColor(theme.accent) else unselBg
                     var isFocused by remember { mutableStateOf(false) }
                     
                     Box(
                         modifier = Modifier
                             .weight(1f)
                             .clip(RoundedCornerShape(6.dp))
+                            .border(
+                                width = 1.dp,
+                                color = if (isSel) parseHexColor(theme.accent) else Color.White.copy(alpha = 0.20f),
+                                shape = RoundedCornerShape(6.dp)
+                            )
                             .background(if (isFocused) TV_FOCUSED_BG else bg)
                             .tvClickable(
                                 shape = RoundedCornerShape(6.dp),
@@ -901,7 +927,7 @@ fun SettingsSelectorRow(
                             text = label,
                             color = if (isFocused) TV_FOCUSED_TEXT else Color.White,
                             fontSize = 11.sp,
-                            fontWeight = if (isFocused) FontWeight.ExtraBold else FontWeight.Bold
+                            fontWeight = if (isFocused || isSel) FontWeight.ExtraBold else FontWeight.Bold
                         )
                     }
                 }
@@ -934,7 +960,13 @@ fun SettingsActionRow(
             }
             TvButton(
                 onClick = onClick,
-                containerColor = parseHexColor(theme.accent)
+                modifier = Modifier.border(
+                    width = 1.dp,
+                    color = Color.White.copy(alpha = 0.20f),
+                    shape = RoundedCornerShape(8.dp)
+                ),
+                containerColor = Color.White.copy(alpha = 0.08f),
+                shape = RoundedCornerShape(8.dp)
             ) { isFocused ->
                 Text(
                     text = buttonText,
@@ -1031,7 +1063,10 @@ fun ManageCategoriesFullScreen(
                         onClick = {
                             visibleCategoriesState = allCategories.toSet()
                         },
-                        containerColor = parseHexColor(theme.surface),
+                        containerColor = parseHexColor(theme.accent).copy(alpha = 0.15f),
+                        unfocusedBorderColor = parseHexColor(theme.accent).copy(alpha = 0.45f),
+                        focusedContainerColor = parseHexColor(theme.accent).copy(alpha = 0.35f),
+                        focusedBorderColor = parseHexColor(theme.accent),
                         modifier = Modifier.fillMaxWidth(),
                         contentPadding = PaddingValues(vertical = 12.dp),
                         shape = RoundedCornerShape(8.dp)
@@ -1055,7 +1090,10 @@ fun ManageCategoriesFullScreen(
                         onClick = {
                             visibleCategoriesState = emptySet()
                         },
-                        containerColor = parseHexColor(theme.surface),
+                        containerColor = Color.White.copy(alpha = 0.08f),
+                        unfocusedBorderColor = Color.White.copy(alpha = 0.25f),
+                        focusedContainerColor = parseHexColor(theme.accent).copy(alpha = 0.35f),
+                        focusedBorderColor = parseHexColor(theme.accent),
                         modifier = Modifier.fillMaxWidth(),
                         contentPadding = PaddingValues(vertical = 12.dp),
                         shape = RoundedCornerShape(8.dp)
@@ -1063,7 +1101,7 @@ fun ManageCategoriesFullScreen(
                         Icon(
                             imageVector = Icons.Default.VisibilityOff,
                             contentDescription = null,
-                            tint = if (isFocused) TV_FOCUSED_TEXT else Color.Gray,
+                            tint = if (isFocused) TV_FOCUSED_TEXT else Color.LightGray,
                             modifier = Modifier.size(18.dp)
                         )
                         Spacer(modifier = Modifier.width(8.dp))
@@ -1087,14 +1125,17 @@ fun ManageCategoriesFullScreen(
                             modifier = Modifier
                                 .weight(1f)
                                 .height(44.dp),
-                            containerColor = Color.Transparent,
+                            containerColor = Color.White.copy(alpha = 0.08f),
+                            unfocusedBorderColor = Color.White.copy(alpha = 0.25f),
+                            focusedContainerColor = parseHexColor(theme.accent).copy(alpha = 0.35f),
+                            focusedBorderColor = parseHexColor(theme.accent),
                             shape = RoundedCornerShape(8.dp)
                         ) { isFocused ->
                             Text(
                                 text = if (lang == "es") "Cancelar" else if (lang == "ro") "Anulează" else "Cancel",
-                                color = if (isFocused) TV_FOCUSED_TEXT else Color.LightGray,
+                                color = if (isFocused) TV_FOCUSED_TEXT else Color.White,
                                 fontSize = 13.sp,
-                                fontWeight = if (isFocused) FontWeight.ExtraBold else FontWeight.SemiBold
+                                fontWeight = if (isFocused) FontWeight.ExtraBold else FontWeight.Bold
                             )
                         }
 
@@ -1103,7 +1144,10 @@ fun ManageCategoriesFullScreen(
                                 val hidden = allCategories.filter { it !in visibleCategoriesState }
                                 onSave(hidden)
                             },
-                            containerColor = parseHexColor(theme.accent),
+                            containerColor = parseHexColor(theme.accent).copy(alpha = 0.25f),
+                            unfocusedBorderColor = parseHexColor(theme.accent).copy(alpha = 0.50f),
+                            focusedContainerColor = parseHexColor(theme.accent).copy(alpha = 0.40f),
+                            focusedBorderColor = parseHexColor(theme.accent),
                             shape = RoundedCornerShape(8.dp),
                             modifier = Modifier
                                 .weight(1.2f)
@@ -1326,9 +1370,12 @@ fun TvSyncPanel(
                 if (parsed != null) {
                     targetIpAddress = "${parsed.host}:${parsed.port}"
                 }
+                val (osKey, assrt) = viewModel.getSubtitleKeys()
                 com.example.motor.sync.LocalSyncServer.syncPlaylistsWithTv(
                     qrOrAddress = scannedQr,
                     playlists = viewModel.getPlaylists(),
+                    openSubtitlesKey = osKey.ifBlank { null },
+                    assrtToken = assrt.ifBlank { null },
                     context = context,
                     onSuccess = { msg ->
                         isSending = false
@@ -1427,13 +1474,24 @@ fun TvSyncPanel(
                                 modifier = Modifier.fillMaxSize()
                             )
                         } else {
-                            val encodedUrl = remember(qrPayload) { java.net.URLEncoder.encode(qrPayload, "UTF-8") }
-                            val qrImageUrl = "https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=$encodedUrl"
-                            AsyncImage(
-                                model = qrImageUrl,
-                                contentDescription = "Código QR Web",
-                                modifier = Modifier.fillMaxSize()
-                            )
+                            Column(
+                                modifier = Modifier.fillMaxSize(),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.QrCode2,
+                                    contentDescription = "Código QR",
+                                    tint = Color.DarkGray,
+                                    modifier = Modifier.size(48.dp)
+                                )
+                                Text(
+                                    text = if (lang == "es") "Usa la URL local" else "Use local URL",
+                                    color = Color.DarkGray,
+                                    fontSize = 9.sp,
+                                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                                )
+                            }
                         }
                     }
 
@@ -1522,23 +1580,26 @@ fun TvSyncPanel(
                         }
                     },
                     enabled = !isSending,
-                    containerColor = parseHexColor(theme.accent).copy(alpha = 0.18f),
+                    containerColor = parseHexColor(theme.accent).copy(alpha = 0.15f),
+                    unfocusedBorderColor = parseHexColor(theme.accent).copy(alpha = 0.50f),
+                    focusedContainerColor = parseHexColor(theme.accent).copy(alpha = 0.35f),
+                    focusedBorderColor = parseHexColor(theme.accent),
                     modifier = Modifier.fillMaxWidth(),
-                    contentPadding = PaddingValues(vertical = 8.dp, horizontal = 10.dp),
+                    contentPadding = PaddingValues(vertical = 10.dp, horizontal = 12.dp),
                     shape = RoundedCornerShape(8.dp)
                 ) { isFocused ->
                     Icon(
                         imageVector = Icons.Default.QrCodeScanner,
                         contentDescription = null,
-                        tint = if (isFocused) TV_FOCUSED_TEXT else parseHexColor(theme.accent),
-                        modifier = Modifier.size(16.dp)
+                        tint = if (isFocused) Color.White else parseHexColor(theme.accent),
+                        modifier = Modifier.size(18.dp)
                     )
-                    Spacer(modifier = Modifier.width(6.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
                     Text(
                         text = if (lang == "es") "ESCANEAR QR DE LA TV" else "SCAN TV QR CODE",
-                        color = if (isFocused) TV_FOCUSED_TEXT else Color.White,
-                        fontSize = 11.sp,
-                        fontWeight = if (isFocused) FontWeight.ExtraBold else FontWeight.Bold
+                        color = Color.White,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold
                     )
                 }
 
@@ -1587,9 +1648,12 @@ fun TvSyncPanel(
                         sendSuccess = false
                         sendSuccessMessage = null
                         val playlistsToSend = viewModel.getPlaylists()
+                        val (osKey, assrt) = viewModel.getSubtitleKeys()
                         com.example.motor.sync.LocalSyncServer.syncPlaylistsWithTv(
                             qrOrAddress = targetIpAddress,
                             playlists = playlistsToSend,
+                            openSubtitlesKey = osKey.ifBlank { null },
+                            assrtToken = assrt.ifBlank { null },
                             context = context,
                             onSuccess = { msg ->
                                 isSending = false
@@ -1603,23 +1667,26 @@ fun TvSyncPanel(
                         )
                     },
                     enabled = !isSending,
-                    containerColor = parseHexColor(theme.accent),
+                    containerColor = parseHexColor(theme.accent).copy(alpha = 0.25f),
+                    unfocusedBorderColor = parseHexColor(theme.accent).copy(alpha = 0.60f),
+                    focusedContainerColor = parseHexColor(theme.accent).copy(alpha = 0.45f),
+                    focusedBorderColor = parseHexColor(theme.accent),
                     modifier = Modifier.fillMaxWidth(),
-                    contentPadding = PaddingValues(vertical = 8.dp),
+                    contentPadding = PaddingValues(vertical = 10.dp),
                     shape = RoundedCornerShape(8.dp)
                 ) { isFocused ->
                     Icon(
                         imageVector = Icons.Default.Send,
                         contentDescription = null,
-                        tint = if (isFocused) TV_FOCUSED_TEXT else Color.White,
-                        modifier = Modifier.size(14.dp)
+                        tint = Color.White,
+                        modifier = Modifier.size(16.dp)
                     )
-                    Spacer(modifier = Modifier.width(6.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
                     Text(
                         text = if (isSending) (if (lang == "es") "Enviando..." else "Sending...") else (if (lang == "es") "ENVIAR A LA TV" else "SEND TO TV"),
-                        color = if (isFocused) TV_FOCUSED_TEXT else Color.White,
-                        fontSize = 11.sp,
-                        fontWeight = if (isFocused) FontWeight.ExtraBold else FontWeight.Bold
+                        color = Color.White,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold
                     )
                 }
             }
@@ -1701,16 +1768,180 @@ fun SyncTvDialog(
                 ) {
                     TvButton(
                         onClick = onDismiss,
-                        containerColor = parseHexColor(theme.accent),
-                        shape = RoundedCornerShape(8.dp)
+                        containerColor = Color.White.copy(alpha = 0.10f),
+                        unfocusedBorderColor = Color.White.copy(alpha = 0.25f),
+                        focusedContainerColor = parseHexColor(theme.accent).copy(alpha = 0.35f),
+                        focusedBorderColor = parseHexColor(theme.accent),
+                        shape = RoundedCornerShape(8.dp),
+                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
                     ) { isFocused ->
                         Text(
                             text = if (lang == "es") "Cerrar" else if (lang == "ro") "Închide" else "Close",
-                            color = if (isFocused) TV_FOCUSED_TEXT else Color.White,
+                            color = Color.White,
                             fontSize = 12.sp,
-                            fontWeight = if (isFocused) FontWeight.ExtraBold else FontWeight.Bold
+                            fontWeight = FontWeight.Bold
                         )
                     }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun SubtitleApiKeyCard(
+    title: String,
+    description: String,
+    currentValue: String,
+    onSaveKey: (String) -> Unit,
+    lang: String,
+    theme: AppThemeColors
+) {
+    var keyInput by remember(currentValue) { mutableStateOf(currentValue) }
+    var keyVisible by remember { mutableStateOf(false) }
+    var hasSavedFeedback by remember { mutableStateOf(false) }
+
+    Card(
+        colors = CardDefaults.cardColors(containerColor = parseHexColor(theme.surface)),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.VpnKey,
+                    contentDescription = null,
+                    tint = parseHexColor(theme.accent),
+                    modifier = Modifier.size(20.dp)
+                )
+                Text(
+                    text = title,
+                    color = Color.White,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            Text(
+                text = description,
+                color = Color.LightGray,
+                fontSize = 12.sp
+            )
+
+            OutlinedTextField(
+                value = keyInput,
+                onValueChange = {
+                    keyInput = it
+                    hasSavedFeedback = false
+                },
+                label = { Text(title, color = Color.Gray) },
+                placeholder = { Text("Introduce tu clave...", color = Color.DarkGray) },
+                visualTransformation = if (keyVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                trailingIcon = {
+                    IconButton(onClick = { keyVisible = !keyVisible }) {
+                        Icon(
+                            imageVector = if (keyVisible) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                            contentDescription = if (keyVisible) "Ocultar" else "Mostrar",
+                            tint = Color.Gray
+                        )
+                    }
+                },
+                singleLine = true,
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedTextColor = Color.White,
+                    unfocusedTextColor = Color.White,
+                    focusedBorderColor = parseHexColor(theme.accent),
+                    unfocusedBorderColor = Color.DarkGray,
+                    cursorColor = parseHexColor(theme.accent)
+                ),
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                TvButton(
+                    onClick = {
+                        onSaveKey(keyInput.trim())
+                        hasSavedFeedback = true
+                    },
+                    containerColor = parseHexColor(theme.accent).copy(alpha = 0.20f),
+                    unfocusedBorderColor = parseHexColor(theme.accent).copy(alpha = 0.50f),
+                    focusedContainerColor = parseHexColor(theme.accent).copy(alpha = 0.38f),
+                    focusedBorderColor = parseHexColor(theme.accent),
+                    shape = RoundedCornerShape(8.dp),
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
+                ) { isFocused ->
+                    Icon(
+                        imageVector = Icons.Default.Check,
+                        contentDescription = null,
+                        tint = Color.White,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text = Translator.translate("save_key", lang),
+                        color = Color.White,
+                        fontWeight = if (isFocused) FontWeight.ExtraBold else FontWeight.Bold,
+                        fontSize = 13.sp
+                    )
+                }
+
+                if (keyInput.isNotBlank()) {
+                    TvButton(
+                        onClick = {
+                            keyInput = ""
+                            onSaveKey("")
+                            hasSavedFeedback = false
+                        },
+                        containerColor = Color.White.copy(alpha = 0.08f),
+                        unfocusedBorderColor = Color.White.copy(alpha = 0.25f),
+                        focusedContainerColor = parseHexColor(theme.accent).copy(alpha = 0.35f),
+                        focusedBorderColor = parseHexColor(theme.accent),
+                        shape = RoundedCornerShape(8.dp),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
+                    ) { isFocused ->
+                        Icon(
+                            imageVector = Icons.Default.Clear,
+                            contentDescription = null,
+                            tint = if (isFocused) Color.White else Color.White.copy(alpha = 0.85f),
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            text = Translator.translate("clear_key", lang),
+                            color = if (isFocused) Color.White else Color.White.copy(alpha = 0.85f),
+                            fontWeight = if (isFocused) FontWeight.Bold else FontWeight.Normal,
+                            fontSize = 13.sp
+                        )
+                    }
+                }
+
+                TvIconButton(
+                    onClick = { keyVisible = !keyVisible },
+                    containerColor = Color.White.copy(alpha = 0.08f),
+                    unfocusedBorderColor = Color.White.copy(alpha = 0.25f),
+                    focusedContainerColor = parseHexColor(theme.accent).copy(alpha = 0.35f),
+                    focusedBorderColor = parseHexColor(theme.accent),
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.size(38.dp)
+                ) { isFocused ->
+                    Icon(
+                        imageVector = if (keyVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                        contentDescription = if (keyVisible) "Ocultar" else "Mostrar",
+                        tint = if (isFocused) Color.White else Color.White.copy(alpha = 0.85f),
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+
+                if (hasSavedFeedback) {
+                    Text("✅ Guardado", color = Color(0xFF4CAF50), fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                 }
             }
         }

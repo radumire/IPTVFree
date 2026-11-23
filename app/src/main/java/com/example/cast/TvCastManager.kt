@@ -7,6 +7,8 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.Uri
+import android.net.nsd.NsdManager
+import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.util.Log
@@ -32,6 +34,7 @@ import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.MulticastSocket
@@ -39,6 +42,8 @@ import java.net.NetworkInterface
 import java.net.Socket
 import java.net.URL
 import javax.net.SocketFactory
+import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * Universal TV & Chromecast discovery and casting engine with VPN bypass,
@@ -47,21 +52,39 @@ import javax.net.SocketFactory
 class TvCastManager private constructor() {
 
     private val DIAG_TAG = "CAST_DISCOVERY_DIAGNOSTIC"
+    private val PREFS_NAME = "tv_cast_preferences"
+    private val KEY_SAVED_DEVICES_JSON = "saved_tv_devices"
 
     private val _discoveredDevices = MutableStateFlow<List<TvCastDevice>>(emptyList())
     val discoveredDevices: StateFlow<List<TvCastDevice>> = _discoveredDevices.asStateFlow()
 
+    private val _savedDevices = MutableStateFlow<List<TvCastDevice>>(emptyList())
+    val savedDevices: StateFlow<List<TvCastDevice>> = _savedDevices.asStateFlow()
+
+    private val _currentCastingDevice = MutableStateFlow<TvCastDevice?>(null)
+    val currentCastingDevice: StateFlow<TvCastDevice?> = _currentCastingDevice.asStateFlow()
+
+    private val _isCasting = MutableStateFlow(false)
+    val isCasting: StateFlow<Boolean> = _isCasting.asStateFlow()
+
     private val _isScanning = MutableStateFlow(false)
     val isScanning: StateFlow<Boolean> = _isScanning.asStateFlow()
 
+    private val nativeCastV2Client = NativeCastV2Client()
+
+    @Volatile
+    private var appContext: Context? = null
+
     private var mediaRouter: MediaRouter? = null
     private var mediaRouteSelector: MediaRouteSelector? = null
+    private var nsdManager: NsdManager? = null
+    private var nsdDiscoveryListener: NsdManager.DiscoveryListener? = null
     private var multicastLock: WifiManager.MulticastLock? = null
     private var discoveryJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.IO)
 
-    // Concurrency limiter for subnet scanning to prevent OS socket exhaustion
-    private val subnetScanSemaphore = Semaphore(16)
+    // High-performance parallel subnet scanning concurrency
+    private val subnetScanSemaphore = Semaphore(48)
 
     private val mediaRouterCallback = object : MediaRouter.Callback() {
         override fun onRouteAdded(router: MediaRouter, route: MediaRouter.RouteInfo) {
@@ -103,14 +126,16 @@ class TvCastManager private constructor() {
     }
 
     fun startDiscovery(context: Context) {
-        _discoveredDevices.value = emptyList()
+        this.appContext = context.applicationContext
+        val saved = loadSavedDevices(context)
+        _discoveredDevices.value = saved
         _isScanning.value = true
 
         // 1. Diagnostic Network & VPN analysis
         val cm = context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
         val physicalNetwork = getPhysicalWifiNetwork(context)
         val hasVpn = checkIsVpnActive(cm)
-        val physicalIp = CastStreamProxyServer.getPhysicalWifiIp(context)
+        val physicalIp = com.example.motor.sync.NetworkIpUtils.getPhysicalWifiIp(context)
         val physicalIfaces = getPhysicalNetworkInterfaces()
         val ifaceNames = physicalIfaces.joinToString(", ") { it.name }
 
@@ -145,11 +170,77 @@ class TvCastManager private constructor() {
             Log.e(DIAG_TAG, "[Google Cast] Error initializing MediaRouter: ${e.message}", e)
         }
 
-        // 3. Physical LAN discovery routines (mDNS, SSDP, Subnet probing)
+        // 3. Android System NsdManager (Native DNS-SD daemon for Google Cast & AirPlay)
+        try {
+            val nsd = context.applicationContext.getSystemService(Context.NSD_SERVICE) as? NsdManager
+            nsdManager = nsd
+            val nsdListener = object : NsdManager.DiscoveryListener {
+                override fun onDiscoveryStarted(regType: String) {
+                    Log.d(DIAG_TAG, "[NSD] Started discovery for $regType")
+                }
+                override fun onServiceFound(service: NsdServiceInfo) {
+                    Log.d(DIAG_TAG, "[NSD] Service found: ${service.serviceName} (${service.serviceType})")
+                    try {
+                        nsd?.resolveService(service, object : NsdManager.ResolveListener {
+                            override fun onServiceResolved(resolved: NsdServiceInfo) {
+                                val host = resolved.host?.hostAddress
+                                val port = resolved.port
+                                val name = resolved.serviceName
+                                if (!host.isNullOrBlank() && !host.startsWith("127.")) {
+                                    var friendlyName = name
+                                    val attributes = resolved.attributes
+                                    val fnBytes = attributes?.get("fn")
+                                    if (fnBytes != null && fnBytes.isNotEmpty()) {
+                                        friendlyName = String(fnBytes, Charsets.UTF_8)
+                                    }
+                                    val mdBytes = attributes?.get("md")
+                                    val model = if (mdBytes != null && mdBytes.isNotEmpty()) String(mdBytes, Charsets.UTF_8) else null
+
+                                    Log.i(DIAG_TAG, "[NSD] Discovered Cast device: '$friendlyName' at $host:$port (model: $model)")
+                                    addOrUpdateDevice(
+                                        TvCastDevice(
+                                            id = "nsd_${host}_$port",
+                                            name = friendlyName,
+                                            type = TvCastType.CHROMECAST,
+                                            ipAddress = host,
+                                            modelName = model
+                                        )
+                                    )
+                                }
+                            }
+                            override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
+                                Log.d(DIAG_TAG, "[NSD] Resolve failed for ${serviceInfo.serviceName}: $errorCode")
+                            }
+                        })
+                    } catch (e: Exception) {
+                        Log.d(DIAG_TAG, "[NSD] Resolve exception: ${e.message}")
+                    }
+                }
+                override fun onServiceLost(service: NsdServiceInfo) {
+                    Log.d(DIAG_TAG, "[NSD] Service lost: ${service.serviceName}")
+                }
+                override fun onDiscoveryStopped(regType: String) {}
+                override fun onStartDiscoveryFailed(regType: String, errorCode: Int) {
+                    Log.e(DIAG_TAG, "[NSD] Start failed: $errorCode")
+                }
+                override fun onStopDiscoveryFailed(regType: String, errorCode: Int) {}
+            }
+            nsdDiscoveryListener = nsdListener
+            nsd?.discoverServices("_googlecast._tcp", NsdManager.PROTOCOL_DNS_SD, nsdListener)
+        } catch (e: Exception) {
+            Log.e(DIAG_TAG, "[NSD] Error starting NsdManager: ${e.message}")
+        }
+
+        // 4. Physical LAN discovery routines (High-Speed Subnet Scan, mDNS, SSDP)
         discoveryJob = scope.launch(Dispatchers.IO) {
             acquireMulticastLock(context)
             try {
-                // Auxiliary mDNS discovery
+                // High-speed physical subnet probing (Probes port 8009 & 8008 across local Wi-Fi in < 2s)
+                launch {
+                    discoverSubnetDevices(context, physicalNetwork, physicalIp)
+                }
+
+                // Auxiliary mDNS discovery with QU unicast response bit
                 launch {
                     discoverMdns(physicalNetwork, physicalIfaces)
                 }
@@ -157,11 +248,6 @@ class TvCastManager private constructor() {
                 // Auxiliary SSDP (UPnP / DLNA) multicast discovery
                 launch {
                     discoverSsdp(physicalNetwork, physicalIfaces)
-                }
-
-                // Controlled physical subnet scanning
-                launch {
-                    discoverSubnetDevices(context, physicalNetwork, physicalIp)
                 }
 
             } catch (e: Exception) {
@@ -178,6 +264,12 @@ class TvCastManager private constructor() {
         } catch (e: Exception) {
             Log.e(DIAG_TAG, "Error removing MediaRouter callback: ${e.message}")
         }
+        try {
+            nsdDiscoveryListener?.let { nsdManager?.stopServiceDiscovery(it) }
+        } catch (e: Exception) {
+            Log.e(DIAG_TAG, "Error stopping NsdManager: ${e.message}")
+        }
+        nsdDiscoveryListener = null
         discoveryJob?.cancel()
         releaseMulticastLock()
     }
@@ -421,12 +513,12 @@ class TvCastManager private constructor() {
     private fun buildDnsSdQuery(serviceName: String): ByteArray {
         val baos = ByteArrayOutputStream()
         val dos = DataOutputStream(baos)
-        dos.writeShort(0x0001)
-        dos.writeShort(0x0000)
-        dos.writeShort(0x0001)
-        dos.writeShort(0x0000)
-        dos.writeShort(0x0000)
-        dos.writeShort(0x0000)
+        dos.writeShort(0x0001) // Transaction ID
+        dos.writeShort(0x0000) // Flags: Standard query
+        dos.writeShort(0x0001) // Questions count: 1
+        dos.writeShort(0x0000) // Answer RRs: 0
+        dos.writeShort(0x0000) // Authority RRs: 0
+        dos.writeShort(0x0000) // Additional RRs: 0
 
         for (label in serviceName.split(".")) {
             if (label.isNotEmpty()) {
@@ -436,8 +528,8 @@ class TvCastManager private constructor() {
             }
         }
         dos.writeByte(0)
-        dos.writeShort(12)
-        dos.writeShort(1)
+        dos.writeShort(12) // Type: PTR (12)
+        dos.writeShort(0x8001) // Class: IN (1) with QU unicast response bit (0x8000) set!
         dos.flush()
         return baos.toByteArray()
     }
@@ -447,90 +539,166 @@ class TvCastManager private constructor() {
         physicalNetwork: Network?,
         physicalPhoneIp: String?
     ) = withContext(Dispatchers.IO) {
-        val prefixes = mutableSetOf<String>()
+        val prefixes = com.example.motor.sync.NetworkIpUtils.resolveLocalSubnetPrefixes(context)
+        Log.i(DIAG_TAG, "[Subnet Scan] Scanning localized subnets: ${prefixes.joinToString(", ") { "$it.0/24" }}")
 
-        if (!physicalPhoneIp.isNullOrBlank() && physicalPhoneIp.contains(".")) {
-            val prefix = physicalPhoneIp.substringBeforeLast(".")
-            prefixes.add(prefix)
-            Log.i(DIAG_TAG, "[Subnet Scan] Detected primary phone subnet: $prefix.0/24")
-        }
-
-        prefixes.add("192.168.1")
-        prefixes.add("192.168.100")
-        prefixes.add("192.168.0")
-
-        val socketFactory = physicalNetwork?.socketFactory ?: SocketFactory.getDefault()
-
-        for (prefix in prefixes) {
-            Log.d(DIAG_TAG, "[Subnet Scan] Probing subnet $prefix.1 - $prefix.254 (Max concurrency: 16)...")
-            for (hostNum in 1..254) {
-                if (!_isScanning.value) break
-                val targetIp = "$prefix.$hostNum"
-                if (targetIp == physicalPhoneIp) continue
-
-                launch {
-                    subnetScanSemaphore.withPermit {
-                        probeHostForAllServices(targetIp, socketFactory, physicalNetwork)
+        // Fast-path: immediately probe all previously saved devices to make them appear within 100ms
+        val saved = _savedDevices.value
+        if (saved.isNotEmpty()) {
+            launch {
+                for (dev in saved) {
+                    val ip = dev.ipAddress
+                    if (!ip.isNullOrBlank()) {
+                        probeHostForAllServices(ip, physicalNetwork)
                     }
                 }
             }
+        }
+
+        for (prefix in prefixes) {
+            if (!_isScanning.value) break
+            Log.d(DIAG_TAG, "[Subnet Scan] Probing subnet $prefix.1 - $prefix.254 (High-speed parallel scan)...")
+
+            val jobs = (1..254).map { hostNum ->
+                val targetIp = "$prefix.$hostNum"
+                if (targetIp == physicalPhoneIp) return@map null
+
+                launch {
+                    subnetScanSemaphore.withPermit {
+                        if (_isScanning.value) {
+                            probeHostForAllServices(targetIp, physicalNetwork)
+                        }
+                    }
+                }
+            }.filterNotNull()
+
+            // Wait for current subnet to finish before next one
+            jobs.forEach { it.join() }
         }
     }
 
     private suspend fun probeHostForAllServices(
         ip: String,
-        socketFactory: SocketFactory,
         physicalNetwork: Network?
     ) {
-        // 1. Check Google Cast / DIAL port 8008
-        if (isPortOpen(ip, 8008, socketFactory)) {
-            Log.d(DIAG_TAG, "[Subnet Scan] Host $ip has open Google Cast / DIAL port 8008. Checking device info...")
-            val eurekaJson = fetchHttpContent("http://$ip:8008/setup/eureka_info", physicalNetwork)
-            var devName: String? = null
+        var discoveredCastName: String? = null
+        var discoveredModelName: String? = null
 
+        // 1. Check Google Cast TLS port 8009 (Present on all Android TV, Google TV, Chromecast & Android boxes)
+        val isCast8009 = isPortOpen(ip, 8009, physicalNetwork, 350)
+        val isDial8008 = if (!isCast8009) isPortOpen(ip, 8008, physicalNetwork, 300) else false
+
+        if (isCast8009 || isDial8008) {
+            Log.d(DIAG_TAG, "[Fast Probe] Host $ip responded on Cast port (8009=$isCast8009, 8008=$isDial8008)")
+            var devName: String? = null
+            var modelName: String? = null
+
+            // Try eureka_info on port 8008
+            val eurekaJson = fetchHttpContent("http://$ip:8008/setup/eureka_info", physicalNetwork, 500)
             if (!eurekaJson.isNullOrBlank()) {
                 if (eurekaJson.contains("\"name\":")) {
                     devName = eurekaJson.substringAfter("\"name\":").substringAfter("\"").substringBefore("\"")
                 }
-            }
-
-            if (devName.isNullOrBlank()) {
-                val xmlDesc = fetchHttpContent("http://$ip:8008/ssdp/device-desc.xml", physicalNetwork)
-                if (!xmlDesc.isNullOrBlank()) {
-                    devName = extractXmlTag(xmlDesc, "friendlyName")
+                if (eurekaJson.contains("\"model_name\":")) {
+                    modelName = eurekaJson.substringAfter("\"model_name\":").substringAfter("\"").substringBefore("\"")
                 }
             }
 
-            val finalName = devName?.takeIf { it.isNotBlank() } ?: "Google TV / Cast ($ip)"
-            Log.i(DIAG_TAG, "[Subnet Scan] Discovered Google Cast on $ip: '$finalName'")
+            if (devName.isNullOrBlank()) {
+                val xmlDesc = fetchHttpContent("http://$ip:8008/ssdp/device-desc.xml", physicalNetwork, 500)
+                if (!xmlDesc.isNullOrBlank()) {
+                    devName = extractXmlTag(xmlDesc, "friendlyName")
+                    modelName = extractXmlTag(xmlDesc, "modelName")
+                }
+            }
+
+            // Check if we previously remembered this device name
+            if (devName.isNullOrBlank()) {
+                val savedMatch = _savedDevices.value.firstOrNull { it.ipAddress == ip }
+                if (savedMatch != null) {
+                    devName = savedMatch.name
+                    modelName = savedMatch.modelName
+                }
+            }
+
+            val finalName = devName?.takeIf { it.isNotBlank() } ?: "Google Cast / TV ($ip)"
+            discoveredCastName = finalName
+            discoveredModelName = modelName
+            Log.i(DIAG_TAG, "[Subnet Scan] Discovered Google Cast device on $ip: '$finalName' (model: $modelName)")
 
             val castDevice = TvCastDevice(
                 id = "ip_cast_$ip",
                 name = finalName,
                 type = TvCastType.CHROMECAST,
-                ipAddress = ip
+                ipAddress = ip,
+                modelName = modelName
             )
             addOrUpdateDevice(castDevice)
+        }
+
+        // 2. Check DLNA / UPnP on this host (Smart TVs, Shield, Android TV boxes with UPnP)
+        val controlUrl = findControlUrlForIp(ip, physicalNetwork)
+        if (!controlUrl.isNullOrBlank()) {
+            val baseName = discoveredCastName?.removeSuffix(" (Cast)")?.removeSuffix(" (DLNA)") ?: "Smart TV / Shield ($ip)"
+            val dlnaName = "$baseName (DLNA)"
+            val dlnaDevice = TvCastDevice(
+                id = "dlna_$ip",
+                name = dlnaName,
+                type = TvCastType.DLNA_TV,
+                ipAddress = ip,
+                avTransportUrl = controlUrl,
+                modelName = discoveredModelName
+            )
+            addOrUpdateDevice(dlnaDevice)
             return
         }
 
-        // 2. Check Google Cast TLS port 8009
-        if (isPortOpen(ip, 8009, socketFactory)) {
-            Log.d(DIAG_TAG, "[Subnet Scan] Host $ip has open Google Cast TLS port 8009.")
-            val castDevice = TvCastDevice(
-                id = "ip_cast_$ip",
-                name = "Google Cast / TV ($ip)",
-                type = TvCastType.CHROMECAST,
-                ipAddress = ip
+        if (discoveredCastName != null) return
+
+        // 3. Check Samsung Smart TV (Tizen port 8001)
+        if (isPortOpen(ip, 8001, physicalNetwork, 300)) {
+            val samsungJson = fetchHttpContent("http://$ip:8001/api/v2/", physicalNetwork, 500)
+            var tvName = "Samsung Smart TV ($ip)"
+            if (!samsungJson.isNullOrBlank() && samsungJson.contains("\"name\":")) {
+                val parsed = samsungJson.substringAfter("\"name\":").substringAfter("\"").substringBefore("\"")
+                if (parsed.isNotBlank()) tvName = parsed
+            }
+            addOrUpdateDevice(
+                TvCastDevice(
+                    id = "samsung_$ip",
+                    name = tvName,
+                    type = TvCastType.DLNA_TV,
+                    ipAddress = ip,
+                    manufacturer = "Samsung"
+                )
             )
-            addOrUpdateDevice(castDevice)
             return
         }
 
-        // 3. Check DLNA UPnP ports: 1900, 8080, 49152, 49153, 2869, 7676, 9197, 9000
-        val upnpPorts = listOf(1900, 8080, 49152, 49153, 2869, 7676, 9197, 9000)
+        // 4. Check Roku TV (port 8060)
+        if (isPortOpen(ip, 8060, physicalNetwork, 300)) {
+            val rokuXml = fetchHttpContent("http://$ip:8060/query/device-info", physicalNetwork, 500)
+            var rokuName = "Roku TV ($ip)"
+            if (!rokuXml.isNullOrBlank()) {
+                val parsed = extractXmlTag(rokuXml, "user-given-name") ?: extractXmlTag(rokuXml, "friendly-device-name")
+                if (!parsed.isNullOrBlank()) rokuName = parsed
+            }
+            addOrUpdateDevice(
+                TvCastDevice(
+                    id = "roku_$ip",
+                    name = rokuName,
+                    type = TvCastType.DLNA_TV,
+                    ipAddress = ip,
+                    manufacturer = "Roku"
+                )
+            )
+            return
+        }
+
+        // 4. Check DLNA UPnP ports: 1900, 8080, 49152, 49153, 9197, 2869
+        val upnpPorts = listOf(1900, 8080, 49152, 49153, 9197, 2869)
         for (port in upnpPorts) {
-            if (isPortOpen(ip, port, socketFactory)) {
+            if (isPortOpen(ip, port, physicalNetwork, 250)) {
                 val testUrls = listOf(
                     "http://$ip:$port/description.xml",
                     "http://$ip:$port/device-desc.xml",
@@ -540,7 +708,7 @@ class TvCastManager private constructor() {
                 )
 
                 for (descUrl in testUrls) {
-                    val xml = fetchHttpContent(descUrl, physicalNetwork)
+                    val xml = fetchHttpContent(descUrl, physicalNetwork, 500)
                     if (!xml.isNullOrBlank()) {
                         inspectDeviceLocationUrl(descUrl, ip, physicalNetwork, "Port $port")
                         return
@@ -550,11 +718,28 @@ class TvCastManager private constructor() {
         }
     }
 
-    private fun isPortOpen(ip: String, port: Int, socketFactory: SocketFactory): Boolean {
+    private fun isPortOpen(ip: String, port: Int, physicalNetwork: Network?, timeoutMs: Int = 450): Boolean {
         var socket: Socket? = null
         return try {
-            socket = socketFactory.createSocket()
-            socket.connect(InetSocketAddress(ip, port), 250)
+            socket = Socket()
+            socket.soTimeout = timeoutMs
+            if (physicalNetwork != null) {
+                try {
+                    physicalNetwork.bindSocket(socket)
+                } catch (e: Exception) {
+                    Log.v(DIAG_TAG, "bindSocket warning on $ip:$port: ${e.message}")
+                }
+            }
+
+            // Bind to physical Wi-Fi local address if available to ensure probe bypasses VPN routing table
+            val localWifiIp = com.example.motor.sync.NetworkIpUtils.getPhysicalWifiIp(appContext)
+            if (!localWifiIp.isNullOrBlank() && !socket.isBound) {
+                try {
+                    socket.bind(InetSocketAddress(localWifiIp, 0))
+                } catch (_: Exception) {}
+            }
+
+            socket.connect(InetSocketAddress(ip, port), timeoutMs)
             true
         } catch (_: Exception) {
             false
@@ -598,22 +783,27 @@ class TvCastManager private constructor() {
         }
     }
 
-    private fun fetchHttpContent(urlStr: String, physicalNetwork: Network?): String? {
+    private fun fetchHttpContent(urlStr: String, physicalNetwork: Network?, timeoutMs: Int = 600): String? {
+        var conn: java.net.HttpURLConnection? = null
         return try {
             val url = URL(urlStr)
-            val conn = if (physicalNetwork != null) {
+            conn = if (physicalNetwork != null) {
                 physicalNetwork.openConnection(url) as java.net.HttpURLConnection
             } else {
                 url.openConnection() as java.net.HttpURLConnection
             }
-            conn.connectTimeout = 600
-            conn.readTimeout = 600
+            conn.connectTimeout = timeoutMs
+            conn.readTimeout = timeoutMs
             conn.setRequestProperty("User-Agent", "Android-Cast-Scanner/2.0")
             if (conn.responseCode in 200..299) {
                 conn.inputStream.bufferedReader().use { it.readText() }
             } else null
         } catch (_: Exception) {
             null
+        } finally {
+            try {
+                conn?.disconnect()
+            } catch (_: Exception) {}
         }
     }
 
@@ -628,42 +818,431 @@ class TvCastManager private constructor() {
     }
 
     private fun extractControlUrl(xml: String, baseUrl: String): String? {
-        val serviceTypeTag = "urn:schemas-upnp-org:service:AVTransport:1"
-        if (!xml.contains(serviceTypeTag)) return null
+        try {
+            val avtIdx = xml.indexOf("AVTransport", ignoreCase = true)
+            if (avtIdx == -1) return null
 
-        val serviceChunk = xml.substringAfter(serviceTypeTag, "")
-        val controlSub = extractXmlTag(serviceChunk, "controlURL") ?: return null
+            val serviceStart = xml.lastIndexOf("<service>", avtIdx, ignoreCase = true).let {
+                if (it == -1) xml.lastIndexOf("<service ", avtIdx, ignoreCase = true) else it
+            }
+            val serviceEnd = xml.indexOf("</service>", avtIdx, ignoreCase = true)
+            val serviceChunk = if (serviceStart != -1 && serviceEnd != -1 && serviceEnd > serviceStart) {
+                xml.substring(serviceStart, serviceEnd)
+            } else {
+                xml.substring(avtIdx, (avtIdx + 800).coerceAtMost(xml.length))
+            }
 
-        return if (controlSub.startsWith("http://", ignoreCase = true) || controlSub.startsWith("https://", ignoreCase = true)) {
-            controlSub
-        } else {
-            val base = URL(baseUrl)
-            "${base.protocol}://${base.host}:${if (base.port > 0) base.port else 80}${if (controlSub.startsWith("/")) "" else "/"}$controlSub"
+            val controlRegex = Regex("(?i)<controlURL>\\s*([^<\\s]+)\\s*</controlURL>")
+            val match = controlRegex.find(serviceChunk) ?: return null
+            val controlSub = match.groupValues[1].trim()
+
+            return if (controlSub.startsWith("http://", ignoreCase = true) || controlSub.startsWith("https://", ignoreCase = true)) {
+                controlSub
+            } else {
+                try {
+                    java.net.URI(baseUrl).resolve(controlSub).toString()
+                } catch (_: Exception) {
+                    val base = URL(baseUrl)
+                    "${base.protocol}://${base.host}:${if (base.port > 0) base.port else 80}${if (controlSub.startsWith("/")) "" else "/"}$controlSub"
+                }
+            }
+        } catch (_: Exception) {
+            return null
+        }
+    }
+
+    fun loadSavedDevices(context: Context): List<TvCastDevice> {
+        return try {
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val jsonStr = prefs.getString(KEY_SAVED_DEVICES_JSON, null) ?: return emptyList()
+            val jsonArray = JSONArray(jsonStr)
+            val list = mutableListOf<TvCastDevice>()
+            for (i in 0 until jsonArray.length()) {
+                val obj = jsonArray.getJSONObject(i)
+                val typeStr = obj.optString("type", TvCastType.CHROMECAST.name)
+                val type = try { TvCastType.valueOf(typeStr) } catch (_: Exception) { TvCastType.CHROMECAST }
+                list.add(
+                    TvCastDevice(
+                        id = obj.optString("id"),
+                        name = obj.optString("name"),
+                        type = type,
+                        ipAddress = obj.optString("ipAddress").takeIf { it.isNotBlank() },
+                        avTransportUrl = obj.optString("avTransportUrl").takeIf { it.isNotBlank() },
+                        manufacturer = obj.optString("manufacturer").takeIf { it.isNotBlank() },
+                        modelName = obj.optString("modelName").takeIf { it.isNotBlank() },
+                        isSaved = true
+                    )
+                )
+            }
+            _savedDevices.value = list
+            list
+        } catch (e: Exception) {
+            Log.e(DIAG_TAG, "Error loading saved devices: ${e.message}")
+            emptyList()
+        }
+    }
+
+    fun rememberDevice(context: Context, device: TvCastDevice) {
+        try {
+            val current = loadSavedDevices(context).toMutableList()
+            val existingIdx = current.indexOfFirst {
+                it.id == device.id || (!device.ipAddress.isNullOrBlank() && it.ipAddress == device.ipAddress)
+            }
+            val devToSave = device.copy(isSaved = true)
+            if (existingIdx >= 0) {
+                current[existingIdx] = devToSave
+            } else {
+                current.add(0, devToSave)
+            }
+
+            val jsonArray = JSONArray()
+            for (d in current) {
+                val obj = JSONObject().apply {
+                    put("id", d.id)
+                    put("name", d.name)
+                    put("type", d.type.name)
+                    put("ipAddress", d.ipAddress ?: "")
+                    put("avTransportUrl", d.avTransportUrl ?: "")
+                    put("manufacturer", d.manufacturer ?: "")
+                    put("modelName", d.modelName ?: "")
+                }
+                jsonArray.put(obj)
+            }
+
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            prefs.edit().putString(KEY_SAVED_DEVICES_JSON, jsonArray.toString()).apply()
+            _savedDevices.value = current
+            addOrUpdateDevice(devToSave)
+            Log.i(DIAG_TAG, "Device remembered in IP memory: ${device.name} (${device.ipAddress})")
+        } catch (e: Exception) {
+            Log.e(DIAG_TAG, "Error saving device to memory: ${e.message}")
+        }
+    }
+
+    fun forgetDevice(context: Context, deviceIdOrIp: String) {
+        try {
+            val current = loadSavedDevices(context).toMutableList()
+            current.removeAll { it.id == deviceIdOrIp || it.ipAddress == deviceIdOrIp }
+
+            val jsonArray = JSONArray()
+            for (d in current) {
+                val obj = JSONObject().apply {
+                    put("id", d.id)
+                    put("name", d.name)
+                    put("type", d.type.name)
+                    put("ipAddress", d.ipAddress ?: "")
+                    put("avTransportUrl", d.avTransportUrl ?: "")
+                    put("manufacturer", d.manufacturer ?: "")
+                    put("modelName", d.modelName ?: "")
+                }
+                jsonArray.put(obj)
+            }
+
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            prefs.edit().putString(KEY_SAVED_DEVICES_JSON, jsonArray.toString()).apply()
+            _savedDevices.value = current
+
+            val discovered = _discoveredDevices.value.map {
+                if (it.id == deviceIdOrIp || it.ipAddress == deviceIdOrIp) it.copy(isSaved = false) else it
+            }
+            _discoveredDevices.value = discovered
+        } catch (e: Exception) {
+            Log.e(DIAG_TAG, "Error forgetting device: ${e.message}")
         }
     }
 
     private fun addOrUpdateDevice(device: TvCastDevice) {
         val current = _discoveredDevices.value.toMutableList()
+        val isSavedAlready = _savedDevices.value.any {
+            it.id == device.id || (!device.ipAddress.isNullOrBlank() && it.ipAddress == device.ipAddress && it.type == device.type)
+        }
+        val deviceWithSaved = if (isSavedAlready) device.copy(isSaved = true) else device
+
         val existingIndex = current.indexOfFirst {
-            it.id == device.id || (!device.ipAddress.isNullOrBlank() && it.ipAddress == device.ipAddress)
+            it.id == deviceWithSaved.id || (!deviceWithSaved.ipAddress.isNullOrBlank() && it.ipAddress == deviceWithSaved.ipAddress && it.type == deviceWithSaved.type)
         }
 
         if (existingIndex >= 0) {
             val existing = current[existingIndex]
             val updated = existing.copy(
-                name = if (device.name.length > existing.name.length && !device.name.contains("($")) device.name else existing.name,
-                mediaRoute = existing.mediaRoute ?: device.mediaRoute,
-                avTransportUrl = existing.avTransportUrl ?: device.avTransportUrl,
-                ipAddress = existing.ipAddress ?: device.ipAddress,
-                manufacturer = existing.manufacturer ?: device.manufacturer,
-                modelName = existing.modelName ?: device.modelName
+                name = if (deviceWithSaved.name.length > existing.name.length && !deviceWithSaved.name.contains("($")) deviceWithSaved.name else existing.name,
+                mediaRoute = existing.mediaRoute ?: deviceWithSaved.mediaRoute,
+                avTransportUrl = existing.avTransportUrl ?: deviceWithSaved.avTransportUrl,
+                ipAddress = existing.ipAddress ?: deviceWithSaved.ipAddress,
+                manufacturer = existing.manufacturer ?: deviceWithSaved.manufacturer,
+                modelName = existing.modelName ?: deviceWithSaved.modelName,
+                isSaved = existing.isSaved || deviceWithSaved.isSaved
             )
             current[existingIndex] = updated
         } else {
-            current.add(device)
-            Log.i(DIAG_TAG, "Added new TV Cast device: [${device.type}] '${device.name}' (${device.ipAddress ?: "MediaRoute"})")
+            current.add(deviceWithSaved)
+            Log.i(DIAG_TAG, "Added new TV Cast device: [${deviceWithSaved.type}] '${deviceWithSaved.name}' (${deviceWithSaved.ipAddress ?: "MediaRoute"}) [saved=${deviceWithSaved.isSaved}]")
         }
         _discoveredDevices.value = current
+    }
+
+    private fun probeUnicastSsdp(ip: String, physicalNetwork: Network?): String? {
+        var socket: DatagramSocket? = null
+        return try {
+            val localWifiIp = com.example.motor.sync.NetworkIpUtils.getPhysicalWifiIp(appContext)
+            socket = if (!localWifiIp.isNullOrBlank()) {
+                try {
+                    DatagramSocket(InetSocketAddress(InetAddress.getByName(localWifiIp), 0))
+                } catch (_: Exception) {
+                    DatagramSocket()
+                }
+            } else {
+                DatagramSocket()
+            }
+            socket.soTimeout = 700
+            if (physicalNetwork != null) {
+                try { physicalNetwork.bindSocket(socket) } catch (_: Exception) {}
+            }
+            val query = "M-SEARCH * HTTP/1.1\r\n" +
+                    "HOST: $ip:1900\r\n" +
+                    "MAN: \"ssdp:discover\"\r\n" +
+                    "MX: 1\r\n" +
+                    "ST: urn:schemas-upnp-org:service:AVTransport:1\r\n\r\n"
+            val bytes = query.toByteArray(Charsets.UTF_8)
+            val targetAddr = InetAddress.getByName(ip)
+            socket.send(DatagramPacket(bytes, bytes.size, targetAddr, 1900))
+
+            val buf = ByteArray(2048)
+            val packet = DatagramPacket(buf, buf.size)
+            socket.receive(packet)
+            val resp = String(packet.data, 0, packet.length)
+            resp.lines().firstOrNull {
+                it.startsWith("LOCATION:", ignoreCase = true) || it.startsWith("Location:", ignoreCase = true)
+            }?.substringAfter(":")?.trim()
+        } catch (_: Exception) {
+            null
+        } finally {
+            try { socket?.close() } catch (_: Exception) {}
+        }
+    }
+
+    fun findControlUrlForIp(ip: String, physicalNetwork: Network?): String? {
+        // 1. Try unicast SSDP M-SEARCH directly to device port 1900 (< 100ms)
+        val locationUrl = probeUnicastSsdp(ip, physicalNetwork)
+        if (!locationUrl.isNullOrBlank()) {
+            val xml = fetchHttpContent(locationUrl, physicalNetwork, 600)
+            if (!xml.isNullOrBlank()) {
+                val control = extractControlUrl(xml, locationUrl)
+                if (!control.isNullOrBlank()) {
+                    Log.i(DIAG_TAG, "[DLNA Probe] Unicast SSDP resolved control URL for $ip: $control")
+                    return control
+                }
+            }
+        }
+
+        // 2. Scan common DLNA UPnP ports
+        val upnpPorts = listOf(1900, 8080, 49152, 49153, 52235, 8200, 2869, 7676, 9197, 9000, 8008, 38400, 5000, 60024)
+        val testPaths = listOf(
+            "/description.xml",
+            "/device-desc.xml",
+            "/dmr/SamsungMRDesc.xml",
+            "/upnp/dev/MediaRenderer/desc.xml",
+            "/rootDesc.xml",
+            "/dd.xml",
+            "/devicedesc.xml",
+            "/dmr.xml",
+            "/renderer.xml",
+            "/ssdp/device-desc.xml"
+        )
+
+        for (port in upnpPorts) {
+            if (isPortOpen(ip, port, physicalNetwork, 200)) {
+                for (path in testPaths) {
+                    val descUrl = "http://$ip:$port$path"
+                    val xml = fetchHttpContent(descUrl, physicalNetwork, 400)
+                    if (!xml.isNullOrBlank()) {
+                        val controlUrl = extractControlUrl(xml, descUrl)
+                        if (!controlUrl.isNullOrBlank()) {
+                            Log.i(DIAG_TAG, "[DLNA Probe] Port $port ($path) resolved control URL for $ip: $controlUrl")
+                            return controlUrl
+                        }
+                    }
+                }
+            }
+        }
+        return null
+    }
+
+    /**
+     * Resolves the direct, cloud-accessible streaming URL for Google Cast & Smart TVs.
+     * Like Vegeta TV, this sends the direct server stream directly to the TV so the TV
+     * downloads independently from the internet without passing gigabytes through the phone.
+     * This allows the user to close the app, lock the phone, or turn off the screen without
+     * interrupting playback on the TV.
+     */
+    data class StreamProbeResult(
+        val resolvedUrl: String,
+        val hasCors: Boolean,
+        val isHighPort: Boolean
+    )
+
+    /**
+     * Resolves the streaming URL for Google Cast & Smart TVs.
+     * For Chromecast live channels, converts .ts to .m3u8 (HLS) because Google Cast HTML5 player
+     * only supports HLS and cannot play raw MPEG-TS over HTTP.
+     * For DLNA, retains .ts or .m3u8 as supported by Smart TV renderers.
+     */
+    fun resolveDirectStreamUrl(sourceUrl: String, isLive: Boolean, isChromecast: Boolean = false): String {
+        val trimmed = sourceUrl.trim()
+        if (trimmed.isBlank()) return trimmed
+
+        // Local content (e.g. device storage content:// or file://)
+        if (trimmed.startsWith("content://", ignoreCase = true) || trimmed.startsWith("file://", ignoreCase = true)) {
+            return trimmed
+        }
+
+        // VOD (Movies & Series): Use direct source URL (.mp4, .mkv, etc.)
+        if (!isLive) {
+            return trimmed
+        }
+
+        // Live Channels:
+        if (isChromecast) {
+            // Google Cast Web Receiver requires HLS (.m3u8) for live streams
+            if (trimmed.contains(".m3u8", ignoreCase = true)) {
+                return trimmed
+            }
+            if (trimmed.endsWith(".ts", ignoreCase = true)) {
+                return trimmed.substringBeforeLast(".ts") + ".m3u8"
+            }
+            if (trimmed.contains(".ts?", ignoreCase = true)) {
+                return trimmed.replace(".ts?", ".m3u8?")
+            }
+            if (trimmed.contains("output=ts", ignoreCase = true)) {
+                return trimmed.replace("output=ts", "output=m3u8")
+            }
+            val qIdx = trimmed.indexOf('?')
+            return if (qIdx != -1) {
+                val base = trimmed.substring(0, qIdx)
+                val query = trimmed.substring(qIdx)
+                "$base.m3u8$query"
+            } else {
+                "$trimmed.m3u8"
+            }
+        }
+
+        // DLNA / Other Smart TVs:
+        if (trimmed.contains(".m3u8", ignoreCase = true) || trimmed.contains("token=", ignoreCase = true)) {
+            return trimmed
+        }
+        if (trimmed.contains(".ts", ignoreCase = true)) {
+            return trimmed
+        }
+        if (trimmed.contains("output=ts", ignoreCase = true)) {
+            return trimmed
+        }
+        val slashParts = trimmed.split("/")
+        if (slashParts.size >= 6 &&
+            !trimmed.contains("/live/", ignoreCase = true) &&
+            !trimmed.contains("/movie/", ignoreCase = true) &&
+            !trimmed.contains("/series/", ignoreCase = true)
+        ) {
+            val protoAndHost = "${slashParts[0]}//${slashParts[2]}"
+            val remaining = slashParts.drop(3).joinToString("/")
+            val cleanRemaining = remaining.substringBefore("?").removeSuffix(".ts")
+            val query = if (trimmed.contains("?")) "?" + trimmed.substringAfter("?") else ""
+            return "$protoAndHost/live/$cleanRemaining.ts$query"
+        }
+        val qIdx = trimmed.indexOf('?')
+        return if (qIdx != -1) {
+            val base = trimmed.substring(0, qIdx)
+            val query = trimmed.substring(qIdx)
+            "$base.ts$query"
+        } else {
+            "$trimmed.ts"
+        }
+    }
+
+    /**
+     * Pre-resolves dynamic tokens and 302 redirects by probing with an authorized IPTV User-Agent.
+     * Also checks for CORS headers (Access-Control-Allow-Origin) and non-standard high ports.
+     */
+    suspend fun resolveStreamWithAuthorizedHeaders(
+        sourceUrl: String,
+        headers: Map<String, String> = emptyMap(),
+        physicalNetwork: Network? = null
+    ): StreamProbeResult = withContext(Dispatchers.IO) {
+        if (!sourceUrl.startsWith("http://", ignoreCase = true) && !sourceUrl.startsWith("https://", ignoreCase = true)) {
+            return@withContext StreamProbeResult(sourceUrl, hasCors = true, isHighPort = false)
+        }
+
+        try {
+            val url = URL(sourceUrl)
+            val conn = if (physicalNetwork != null) {
+                physicalNetwork.openConnection(url) as java.net.HttpURLConnection
+            } else {
+                url.openConnection() as java.net.HttpURLConnection
+            }
+
+            conn.instanceFollowRedirects = false
+            conn.connectTimeout = 3000
+            conn.readTimeout = 3000
+            conn.requestMethod = "GET"
+
+            val ua = headers["User-Agent"] ?: "IPTVSmarters/3.1.5 (Linux; Android 12)"
+            conn.setRequestProperty("User-Agent", ua)
+            headers.forEach { (k, v) ->
+                if (!k.equals("User-Agent", ignoreCase = true) && !k.equals("Host", ignoreCase = true)) {
+                    conn.setRequestProperty(k, v)
+                }
+            }
+
+            val code = conn.responseCode
+            var finalUrl = sourceUrl
+            var corsHeader = conn.getHeaderField("Access-Control-Allow-Origin")
+
+            if (code in 300..399) {
+                val location = conn.getHeaderField("Location")
+                if (!location.isNullOrBlank()) {
+                    finalUrl = try {
+                        url.toURI().resolve(location).toString()
+                    } catch (_: Exception) {
+                        location
+                    }
+                    Log.i(DIAG_TAG, "[Token Resolver] Successfully pre-resolved redirect token URL: $finalUrl")
+
+                    // Check CORS on redirected target
+                    try {
+                        val finalUrlObj = URL(finalUrl)
+                        val finalConn = if (physicalNetwork != null) {
+                            physicalNetwork.openConnection(finalUrlObj) as java.net.HttpURLConnection
+                        } else {
+                            finalUrlObj.openConnection() as java.net.HttpURLConnection
+                        }
+                        finalConn.instanceFollowRedirects = true
+                        finalConn.connectTimeout = 2500
+                        finalConn.readTimeout = 2500
+                        finalConn.requestMethod = "HEAD"
+                        finalConn.setRequestProperty("User-Agent", ua)
+                        finalConn.setRequestProperty("Origin", "https://www.gstatic.com")
+                        finalConn.connect()
+                        corsHeader = finalConn.getHeaderField("Access-Control-Allow-Origin")
+                        finalConn.disconnect()
+                    } catch (_: Exception) {}
+                }
+            }
+            conn.disconnect()
+
+            val parsedUrl = try { URL(finalUrl) } catch (_: Exception) { null }
+            val port = parsedUrl?.port ?: if (parsedUrl?.protocol.equals("https", ignoreCase = true)) 443 else 80
+            val isHighPort = port > 10000
+            val hasCors = corsHeader != null && (corsHeader == "*" || corsHeader.contains("gstatic", ignoreCase = true) || corsHeader.contains("null"))
+
+            Log.i(DIAG_TAG, "[Probe Result] URL: $finalUrl | CORS: $hasCors ($corsHeader) | HighPort: $isHighPort (port=$port)")
+            return@withContext StreamProbeResult(finalUrl, hasCors, isHighPort)
+
+        } catch (e: Exception) {
+            Log.v(DIAG_TAG, "[Token Resolver] Fast probe skipped: ${e.message}")
+            val parsedUrl = try { URL(sourceUrl) } catch (_: Exception) { null }
+            val port = parsedUrl?.port ?: 80
+            val isHighPort = port > 10000
+            return@withContext StreamProbeResult(sourceUrl, hasCors = false, isHighPort = isHighPort)
+        }
     }
 
     suspend fun castToDevice(
@@ -671,155 +1250,317 @@ class TvCastManager private constructor() {
         device: TvCastDevice,
         videoUrl: String,
         title: String,
-        headers: Map<String, String> = emptyMap()
+        headers: Map<String, String> = emptyMap(),
+        mediaType: String = "live",
+        forceDlna: Boolean = false
     ): Boolean = withContext(Dispatchers.IO) {
         Log.i(DIAG_TAG, "==================================================")
         Log.i(DIAG_TAG, "CAST TO DEVICE REQUEST")
-        Log.i(DIAG_TAG, "Target: '${device.name}' (Type: ${device.type}, IP: ${device.ipAddress})")
+        Log.i(DIAG_TAG, "Target: '${device.name}' (Type: ${device.type}, IP: ${device.ipAddress}) [forceDlna=$forceDlna]")
         Log.i(DIAG_TAG, "Original Source URL: $videoUrl")
         Log.i(DIAG_TAG, "Media Title: $title")
+        Log.i(DIAG_TAG, "Media Type: $mediaType")
         Log.i(DIAG_TAG, "==================================================")
 
         try {
-            CastStreamProxyServer.start(videoUrl, headers)
-            val proxyUrl = CastStreamProxyServer.getLocalProxyUrl(context)
-            val streamUrlToUse = if (proxyUrl.isNotBlank()) proxyUrl else videoUrl
-            Log.i(DIAG_TAG, "Proxy URL generated for casting: $streamUrlToUse")
+            val isVod = mediaType.equals("movie", ignoreCase = true) ||
+                    mediaType.equals("series", ignoreCase = true) ||
+                    videoUrl.contains("/movie/", ignoreCase = true) ||
+                    videoUrl.contains("/series/", ignoreCase = true) ||
+                    videoUrl.endsWith(".mp4", ignoreCase = true) ||
+                    videoUrl.contains(".mp4?", ignoreCase = true) ||
+                    videoUrl.endsWith(".mkv", ignoreCase = true) ||
+                    videoUrl.contains(".mkv?", ignoreCase = true)
+
+            val isLiveStream = !isVod && (
+                    mediaType.equals("live", ignoreCase = true) ||
+                    mediaType.equals("tv", ignoreCase = true) ||
+                    videoUrl.contains(".m3u8", ignoreCase = true) ||
+                    videoUrl.contains("/live/", ignoreCase = true) ||
+                    videoUrl.endsWith(".ts", ignoreCase = true) ||
+                    videoUrl.contains(".ts?", ignoreCase = true)
+            )
+
+            val isDlnaTarget = forceDlna || device.type == TvCastType.DLNA_TV || !device.avTransportUrl.isNullOrBlank()
+            val isChromecastTarget = device.type == TvCastType.CHROMECAST && !forceDlna
 
             val physicalNetwork = getPhysicalWifiNetwork(context)
+            val baseDirectUrl = resolveDirectStreamUrl(videoUrl, isLiveStream, isChromecast = isChromecastTarget)
+            val probeResult = resolveStreamWithAuthorizedHeaders(baseDirectUrl, headers, physicalNetwork)
+            val directStreamUrl = probeResult.resolvedUrl
 
-            when (device.type) {
-                TvCastType.CHROMECAST -> {
-                    val route = device.mediaRoute
-                    if (route != null) {
-                        Log.d(DIAG_TAG, "[Google Cast] Selecting MediaRoute: ${route.name}")
-                        withContext(Dispatchers.Main) {
-                            mediaRouter?.selectRoute(route)
+            // Determine if local proxy is needed:
+            // 1. For Chromecast: Web Receiver demands CORS (Access-Control-Allow-Origin: *).
+            //    If provider lacks CORS (like fortv.cc or ynjuomzz.store) or redirects to a high port (:25461),
+            //    local proxy injects CORS and proxies HLS chunks/Range bytes so Chromecast plays instantly.
+            // 2. For DLNA: If stream is on a high port blocked by home router/firewall, proxy bypasses it.
+            val needsCorsProxy = isChromecastTarget && (!probeResult.hasCors || probeResult.isHighPort)
+            val streamForChromecast = if (needsCorsProxy) {
+                CastStreamProxyServer.start(context, directStreamUrl, headers, isLive = isLiveStream)
+                val proxyUrl = CastStreamProxyServer.getLocalProxyUrl(context, isLive = isLiveStream, isDlna = false, sourceUrl = directStreamUrl)
+                Log.i(DIAG_TAG, "[Chromecast CORS Proxy] Remote server lacks CORS / high port. Using local CORS proxy: $proxyUrl")
+                proxyUrl
+            } else {
+                directStreamUrl
+            }
+
+            val streamForDlna = if (probeResult.isHighPort) {
+                CastStreamProxyServer.start(context, directStreamUrl, headers, isLive = isLiveStream)
+                val proxyUrl = CastStreamProxyServer.getLocalProxyUrl(context, isLive = isLiveStream, isDlna = true, sourceUrl = directStreamUrl)
+                Log.i(DIAG_TAG, "[DLNA High-Port Proxy] Remote server uses high port. Using local DLNA proxy: $proxyUrl")
+                proxyUrl
+            } else {
+                directStreamUrl
+            }
+
+            Log.i(DIAG_TAG, "[Stream Dispatch] Chromecast Stream: $streamForChromecast | DLNA Stream: $streamForDlna")
+
+            val hostIp = device.ipAddress
+
+            // 1. DLNA DISPATCH (FOR SMART TVS: SAMSUNG TIZEN, LG WEBOS, ETC.)
+            if (isDlnaTarget) {
+                Log.i(DIAG_TAG, "[DLNA Priority] Dispatching to Smart TV (IP=$hostIp): $streamForDlna")
+
+                val controlUrl = device.avTransportUrl ?: (if (!hostIp.isNullOrBlank()) findControlUrlForIp(hostIp, physicalNetwork) else null)
+                if (!controlUrl.isNullOrBlank()) {
+                    var dlnaOk = sendDlnaPlay(controlUrl, streamForDlna, title, physicalNetwork)
+                    if (!dlnaOk && streamForDlna != directStreamUrl) {
+                        Log.d(DIAG_TAG, "[DLNA Priority] Retrying DLNA with direct stream: $directStreamUrl")
+                        dlnaOk = sendDlnaPlay(controlUrl, directStreamUrl, title, physicalNetwork)
+                    }
+                    if (dlnaOk) {
+                        Log.i(DIAG_TAG, "[DLNA Priority] Successfully started stream on $hostIp via DLNA!")
+                        val updatedDev = device.copy(type = TvCastType.DLNA_TV, avTransportUrl = controlUrl)
+                        rememberDevice(context, updatedDev)
+                        _currentCastingDevice.value = updatedDev
+                        _isCasting.value = true
+                        return@withContext true
+                    }
+                }
+
+                // Fallback to CastV2 ONLY if forceDlna was not explicitly requested and port 8009 is open
+                if (!forceDlna && !hostIp.isNullOrBlank() && isPortOpen(hostIp, 8009, physicalNetwork, 300)) {
+                    val connected = nativeCastV2Client.connect(hostIp, physicalNetwork, context = context.applicationContext)
+                    if (connected) {
+                        val ok = nativeCastV2Client.launchAndPlay(streamForChromecast, title, isLiveStream)
+                        if (ok) {
+                            rememberDevice(context, device.copy(type = TvCastType.CHROMECAST))
+                            _currentCastingDevice.value = device
+                            _isCasting.value = true
+                            return@withContext true
+                        }
+                    }
+                }
+                return@withContext false
+            }
+
+            // 2. CHROMECAST / GOOGLE CAST DISPATCH (HLS / MP4 with CORS)
+            if (device.type == TvCastType.CHROMECAST) {
+                Log.i(DIAG_TAG, "[Chromecast Priority] Dispatching stream to Cast device (IP=$hostIp): $streamForChromecast")
+
+                // Option A: Try Native CastV2 engine directly on port 8009 (Fastest, VPN bypass)
+                if (!hostIp.isNullOrBlank()) {
+                    val connected = nativeCastV2Client.connect(hostIp, physicalNetwork, context = context.applicationContext)
+                    if (connected) {
+                        val ok = nativeCastV2Client.launchAndPlay(streamForChromecast, title, isLiveStream)
+                        if (ok) {
+                            Log.i(DIAG_TAG, "[Native CastV2] Successfully playing on $hostIp!")
+                            rememberDevice(context, device)
+                            _currentCastingDevice.value = device
+                            _isCasting.value = true
+                            return@withContext true
+                        }
+                    }
+                }
+
+                // Option B: Google Cast SDK via MediaRouter
+                val route = device.mediaRoute
+                if (route != null) {
+                    Log.d(DIAG_TAG, "[Google Cast] Selecting MediaRoute: ${route.name}")
+                    withContext(Dispatchers.Main) {
+                        mediaRouter?.selectRoute(route)
+                    }
+
+                    val castContext = try {
+                        CastContext.getSharedInstance(context.applicationContext)
+                    } catch (e: Exception) {
+                        Log.e(DIAG_TAG, "[Google Cast] CastContext initialization error: ${e.message}")
+                        null
+                    }
+
+                    if (castContext != null) {
+                        var castSession = castContext.sessionManager.currentCastSession
+                        var attempts = 0
+                        while (castSession == null && attempts < 15) {
+                            delay(200)
+                            castSession = castContext.sessionManager.currentCastSession
+                            attempts++
                         }
 
-                        val castContext = try {
-                            CastContext.getSharedInstance(context.applicationContext)
-                        } catch (e: Exception) {
-                            Log.e(DIAG_TAG, "[Google Cast] CastContext initialization error: ${e.message}")
-                            null
-                        }
-
-                        if (castContext != null) {
-                            var castSession = castContext.sessionManager.currentCastSession
-                            var attempts = 0
-                            while (castSession == null && attempts < 15) {
-                                delay(200)
-                                castSession = castContext.sessionManager.currentCastSession
-                                attempts++
+                        val remoteMediaClient = castSession?.remoteMediaClient
+                        if (remoteMediaClient != null) {
+                            val metadata = MediaMetadata(MediaMetadata.MEDIA_TYPE_MOVIE).apply {
+                                putString(MediaMetadata.KEY_TITLE, title)
                             }
 
-                            val remoteMediaClient = castSession?.remoteMediaClient
-                            if (remoteMediaClient != null) {
-                                val metadata = MediaMetadata(MediaMetadata.MEDIA_TYPE_MOVIE).apply {
-                                    putString(MediaMetadata.KEY_TITLE, title)
-                                }
-
-                                val mimeType = when {
-                                    streamUrlToUse.contains(".m3u8", ignoreCase = true) || videoUrl.contains(".m3u8", ignoreCase = true) -> "application/x-mpegURL"
-                                    streamUrlToUse.contains(".mpd", ignoreCase = true) || videoUrl.contains(".mpd", ignoreCase = true) -> "application/dash+xml"
-                                    streamUrlToUse.contains(".ts", ignoreCase = true) || videoUrl.contains(".ts", ignoreCase = true) -> "video/mp2t"
+                            val mimeType = if (isLiveStream) "application/x-mpegURL" else {
+                                when {
+                                    streamForChromecast.contains(".mpd", ignoreCase = true) || videoUrl.contains(".mpd", ignoreCase = true) -> "application/dash+xml"
+                                    streamForChromecast.contains(".mkv", ignoreCase = true) -> "video/x-matroska"
                                     else -> "video/mp4"
                                 }
-
-                                val isLiveStream = videoUrl.contains(".m3u8", ignoreCase = true) ||
-                                        videoUrl.contains("live", ignoreCase = true) ||
-                                        videoUrl.contains(":8080", ignoreCase = true)
-
-                                val mediaInfo = MediaInfo.Builder(streamUrlToUse)
-                                    .setStreamType(if (isLiveStream) MediaInfo.STREAM_TYPE_LIVE else MediaInfo.STREAM_TYPE_BUFFERED)
-                                    .setContentType(mimeType)
-                                    .setMetadata(metadata)
-                                    .build()
-
-                                Log.i(DIAG_TAG, "[Google Cast] Sending MediaInfo.load() to RemoteMediaClient...")
-                                withContext(Dispatchers.Main) {
-                                    remoteMediaClient.load(mediaInfo, true, 0)
-                                }
-                                return@withContext true
                             }
+
+                            val mediaInfo = MediaInfo.Builder(streamForChromecast)
+                                .setStreamType(if (isLiveStream) MediaInfo.STREAM_TYPE_LIVE else MediaInfo.STREAM_TYPE_BUFFERED)
+                                .setContentType(mimeType)
+                                .setMetadata(metadata)
+                                .build()
+
+                            Log.i(DIAG_TAG, "[Google Cast] Sending MediaInfo.load() with stream to RemoteMediaClient...")
+                            withContext(Dispatchers.Main) {
+                                remoteMediaClient.load(mediaInfo, true, 0)
+                            }
+                            rememberDevice(context, device)
+                            _currentCastingDevice.value = device
+                            _isCasting.value = true
+                            return@withContext true
                         }
                     }
-
-                    // Fallback to DIAL / Direct REST launch if route wasn't in MediaRouter due to VPN
-                    val hostIp = device.ipAddress
-                    if (!hostIp.isNullOrBlank()) {
-                        Log.i(DIAG_TAG, "[Direct Cast] Attempting DIAL launch on $hostIp:8008...")
-                        val dialOk = sendDialLaunch(hostIp, streamUrlToUse, physicalNetwork)
-                        if (dialOk) return@withContext true
-                    }
-
-                    // If device also has DLNA AVTransport URL
-                    if (!device.avTransportUrl.isNullOrBlank()) {
-                        return@withContext sendDlnaPlay(device.avTransportUrl, streamUrlToUse, title, physicalNetwork)
-                    }
-
-                    return@withContext false
                 }
 
-                TvCastType.DLNA_TV -> {
-                    val controlUrl = device.avTransportUrl
+                // Option C: DLNA fallback for hybrid TV models that advertise both Cast & DLNA
+                if (!hostIp.isNullOrBlank()) {
+                    val controlUrl = device.avTransportUrl ?: findControlUrlForIp(hostIp, physicalNetwork)
                     if (!controlUrl.isNullOrBlank()) {
-                        return@withContext sendDlnaPlay(controlUrl, streamUrlToUse, title, physicalNetwork)
-                    }
-                    val hostIp = device.ipAddress
-                    if (!hostIp.isNullOrBlank()) {
-                        return@withContext sendDialLaunch(hostIp, streamUrlToUse, physicalNetwork)
-                    }
-                    return@withContext false
-                }
-
-                TvCastType.SYSTEM_CAST -> {
-                    Log.i(DIAG_TAG, "[System Cast] Launching Android system display / cast settings")
-                    withContext(Dispatchers.Main) {
-                        try {
-                            val intent = Intent(android.provider.Settings.ACTION_CAST_SETTINGS).apply {
-                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                            }
-                            context.startActivity(intent)
-                        } catch (e: Exception) {
-                            val intent = Intent("android.settings.WIFI_DISPLAY_SETTINGS").apply {
-                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                            }
-                            context.startActivity(intent)
+                        Log.i(DIAG_TAG, "[Chromecast DLNA Fallback] Attempting DLNA on $controlUrl...")
+                        val dlnaOk = sendDlnaPlay(controlUrl, streamForDlna, title, physicalNetwork)
+                        if (dlnaOk) {
+                            rememberDevice(context, device.copy(type = TvCastType.DLNA_TV, avTransportUrl = controlUrl))
+                            _currentCastingDevice.value = device
+                            _isCasting.value = true
+                            return@withContext true
                         }
                     }
-                    return@withContext true
                 }
+
+                return@withContext false
             }
+
+            // 3. SYSTEM CAST FALLBACK
+            if (device.type == TvCastType.SYSTEM_CAST) {
+                withContext(Dispatchers.Main) {
+                    try {
+                        val intent = Intent(android.provider.Settings.ACTION_CAST_SETTINGS).apply {
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        context.startActivity(intent)
+                    } catch (e: Exception) {
+                        val intent = Intent("android.settings.WIFI_DISPLAY_SETTINGS").apply {
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        context.startActivity(intent)
+                    }
+                }
+                return@withContext true
+            }
+
+            return@withContext false
         } catch (e: Exception) {
             Log.e(DIAG_TAG, "Fatal error executing castToDevice: ${e.message}", e)
             return@withContext false
         }
     }
 
-    private fun sendDialLaunch(hostIp: String, streamUrl: String, physicalNetwork: Network?): Boolean {
-        return try {
-            val url = URL("http://$hostIp:8008/apps/DefaultMediaReceiver")
-            val conn = if (physicalNetwork != null) {
-                physicalNetwork.openConnection(url) as java.net.HttpURLConnection
+    suspend fun castToDirectIp(
+        context: Context,
+        ipAddress: String,
+        videoUrl: String,
+        title: String,
+        headers: Map<String, String> = emptyMap(),
+        saveDevice: Boolean = true,
+        mediaType: String = "live",
+        preferDlna: Boolean = false
+    ): Boolean = withContext(Dispatchers.IO) {
+        val ip = ipAddress.trim()
+        if (!isValidIpv4(ip)) {
+            Log.e(DIAG_TAG, "Invalid IP address provided: $ip")
+            return@withContext false
+        }
+
+        Log.i(DIAG_TAG, "Starting cast to Direct IP: $ip (Save=$saveDevice, mediaType=$mediaType, preferDlna=$preferDlna)")
+        val physicalNetwork = getPhysicalWifiNetwork(context)
+
+        if (preferDlna) {
+            // 1. Direct DLNA requested by user
+            Log.i(DIAG_TAG, "[Direct IP] Probing DLNA control URL on $ip...")
+            val controlUrl = findControlUrlForIp(ip, physicalNetwork)
+            if (!controlUrl.isNullOrBlank()) {
+                val dev = TvCastDevice(
+                    id = "direct_dlna_$ip",
+                    name = "Smart TV (DLNA - $ip)",
+                    type = TvCastType.DLNA_TV,
+                    ipAddress = ip,
+                    avTransportUrl = controlUrl,
+                    isSaved = saveDevice
+                )
+                val ok = castToDevice(context, dev, videoUrl, title, headers, mediaType, forceDlna = true)
+                if (ok) {
+                    if (saveDevice) rememberDevice(context, dev)
+                    return@withContext true
+                }
             } else {
-                url.openConnection() as java.net.HttpURLConnection
+                Log.w(DIAG_TAG, "[Direct IP] No DLNA service found on $ip")
+                return@withContext false
             }
-            conn.requestMethod = "POST"
-            conn.doOutput = true
-            conn.connectTimeout = 3000
-            conn.readTimeout = 3000
-            conn.setRequestProperty("Content-Type", "application/json")
-            val payload = "{\"url\":\"$streamUrl\"}"
-            conn.outputStream.use { os ->
-                os.write(payload.toByteArray(Charsets.UTF_8))
+        } else {
+            // 2. Direct Chromecast / Google Cast requested by user
+            Log.i(DIAG_TAG, "[Direct IP] Checking Google Cast port 8009 on $ip...")
+            val isCastOpen = isPortOpen(ip, 8009, physicalNetwork, 500)
+            if (isCastOpen) {
+                val dev = TvCastDevice(
+                    id = "direct_cast_$ip",
+                    name = "Google TV / Cast ($ip)",
+                    type = TvCastType.CHROMECAST,
+                    ipAddress = ip,
+                    isSaved = saveDevice
+                )
+                val ok = castToDevice(context, dev, videoUrl, title, headers, mediaType, forceDlna = false)
+                if (ok) {
+                    if (saveDevice) rememberDevice(context, dev)
+                    return@withContext true
+                }
+            } else {
+                Log.w(DIAG_TAG, "[Direct IP] Google Cast port 8009 is closed on $ip")
+                return@withContext false
             }
-            val code = conn.responseCode
-            Log.d(DIAG_TAG, "[DIAL] Response from $hostIp: HTTP $code")
-            code in 200..299
-        } catch (e: Exception) {
-            Log.d(DIAG_TAG, "[DIAL] Launch failed on $hostIp: ${e.message}")
-            false
+        }
+
+        return@withContext false
+    }
+
+    private fun isValidIpv4(ip: String): Boolean {
+        val parts = ip.split(".")
+        if (parts.size != 4) return false
+        return parts.all {
+            val num = it.toIntOrNull() ?: return false
+            num in 0..255
+        }
+    }
+
+    fun stopCasting() {
+        scope.launch(Dispatchers.IO) {
+            try {
+                nativeCastV2Client.stopMedia()
+            } catch (_: Exception) {}
+            try {
+                nativeCastV2Client.disconnect()
+            } catch (_: Exception) {}
+            try {
+                CastStreamProxyServer.stop()
+            } catch (_: Exception) {}
+            _isCasting.value = false
+            _currentCastingDevice.value = null
         }
     }
 
@@ -831,23 +1572,29 @@ class TvCastManager private constructor() {
     ): Boolean = withContext(Dispatchers.IO) {
         Log.i(DIAG_TAG, "[DLNA Cast] Starting UPnP AVTransport sequence to $controlUrl")
         try {
+            val isLive = streamUrl.contains(".m3u8", ignoreCase = true) ||
+                    streamUrl.endsWith(".ts", ignoreCase = true) ||
+                    streamUrl.contains("/live", ignoreCase = true)
+
             val mimeType = when {
                 streamUrl.contains(".m3u8", ignoreCase = true) -> "application/x-mpegURL"
                 streamUrl.contains(".mpd", ignoreCase = true) -> "application/dash+xml"
-                streamUrl.contains(".ts", ignoreCase = true) -> "video/mp2t"
+                streamUrl.contains(".ts", ignoreCase = true) || streamUrl.contains("/live", ignoreCase = true) -> "video/mp2t"
+                streamUrl.contains(".mkv", ignoreCase = true) -> "video/x-matroska"
                 else -> "video/mp4"
             }
 
+            val dlnaOp = if (isLive) "00" else "01"
             val safeTitle = (if (title.isBlank()) "Stream" else title)
                 .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
             val safeUrl = streamUrl
                 .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
 
             val didlXml = "&lt;DIDL-Lite xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/&quot; xmlns:dc=&quot;http://purl.org/dc/elements/1.1/&quot; xmlns:upnp=&quot;urn:schemas-upnp-org:metadata-1-0/upnp/&quot;&gt;" +
-                    "&lt;item id=&quot;1&quot; parentID=&quot;0&quot; restricted=&quot;1&quot;&gt;" +
+                    "&lt;item id=&quot;0&quot; parentID=&quot;-1&quot; restricted=&quot;1&quot;&gt;" +
                     "&lt;dc:title&gt;$safeTitle&lt;/dc:title&gt;" +
-                    "&lt;upnp:class&gt;object.item.videoItem.movie&lt;/upnp:class&gt;" +
-                    "&lt;res protocolInfo=&quot;http-get:*:$mimeType:DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000&quot;&gt;$safeUrl&lt;/res&gt;" +
+                    "&lt;upnp:class&gt;object.item.videoItem&lt;/upnp:class&gt;" +
+                    "&lt;res protocolInfo=&quot;http-get:*:$mimeType:DLNA.ORG_OP=$dlnaOp;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000&quot;&gt;$safeUrl&lt;/res&gt;" +
                     "&lt;/item&gt;" +
                     "&lt;/DIDL-Lite&gt;"
 
@@ -874,14 +1621,29 @@ class TvCastManager private constructor() {
                     "  </s:Body>\n" +
                     "</s:Envelope>"
 
-            val uriSuccess = sendSoapRequest(controlUrl, "urn:schemas-upnp-org:service:AVTransport:1#SetAVTransportURI", setUriSoap, physicalNetwork)
+            var uriSuccess = sendSoapRequest(controlUrl, "urn:schemas-upnp-org:service:AVTransport:1#SetAVTransportURI", setUriSoap, physicalNetwork)
+            if (!uriSuccess) {
+                Log.d(DIAG_TAG, "[DLNA Cast] Retrying SetAVTransportURI without metadata...")
+                val fallbackSetUri = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n" +
+                        "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\n" +
+                        "  <s:Body>\n" +
+                        "    <u:SetAVTransportURI xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">\n" +
+                        "      <InstanceID>0</InstanceID>\n" +
+                        "      <CurrentURI>$safeUrl</CurrentURI>\n" +
+                        "      <CurrentURIMetaData></CurrentURIMetaData>\n" +
+                        "    </u:SetAVTransportURI>\n" +
+                        "  </s:Body>\n" +
+                        "</s:Envelope>"
+                uriSuccess = sendSoapRequest(controlUrl, "urn:schemas-upnp-org:service:AVTransport:1#SetAVTransportURI", fallbackSetUri, physicalNetwork)
+            }
+
             if (!uriSuccess) {
                 Log.e(DIAG_TAG, "[DLNA Cast] SetAVTransportURI failed on $controlUrl")
                 return@withContext false
             }
 
             // 3. Send Play
-            delay(300)
+            delay(250)
             val playSoap = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n" +
                     "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\n" +
                     "  <s:Body>\n" +
@@ -916,10 +1678,12 @@ class TvCastManager private constructor() {
             }
             conn.requestMethod = "POST"
             conn.doOutput = true
-            conn.connectTimeout = 5000
-            conn.readTimeout = 5000
+            conn.connectTimeout = 6000
+            conn.readTimeout = 6000
             conn.setRequestProperty("Content-Type", "text/xml; charset=\"utf-8\"")
             conn.setRequestProperty("SOAPACTION", "\"$soapAction\"")
+            conn.setRequestProperty("User-Agent", "DLNADOC/1.50 UPnP/1.0 DLNADR/1.0")
+            conn.setRequestProperty("Connection", "close")
 
             conn.outputStream.use { os ->
                 os.write(xmlPayload.toByteArray(Charsets.UTF_8))
@@ -946,9 +1710,8 @@ class TvCastManager private constructor() {
         headers: Map<String, String> = emptyMap()
     ): Boolean {
         return try {
-            CastStreamProxyServer.start(videoUrl, headers)
-            val proxyUrl = CastStreamProxyServer.getLocalProxyUrl(context)
-            val streamToUse = if (proxyUrl.isNotBlank()) proxyUrl else videoUrl
+            val isLive = videoUrl.contains(".ts", ignoreCase = true) || videoUrl.contains("live", ignoreCase = true)
+            val streamToUse = resolveDirectStreamUrl(videoUrl, isLive)
 
             val mimeType = when {
                 streamToUse.contains(".m3u8", ignoreCase = true) || videoUrl.contains(".m3u8", ignoreCase = true) -> "application/x-mpegURL"

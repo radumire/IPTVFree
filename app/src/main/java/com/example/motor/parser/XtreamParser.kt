@@ -2,8 +2,8 @@ package com.example.motor.parser
 
 import android.util.Log
 import com.example.motor.db.IptvItem
-import com.example.motor.db.EpgChannelData
-import com.example.motor.db.EpgProgramme
+import com.example.motor.db.SeriesEpisode
+import com.example.motor.db.SeriesSeason
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.Types
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
@@ -298,6 +298,11 @@ object XtreamParser {
                                 }
                             } catch (e: Throwable) {
                                 Log.w(TAG, "Skipping malformed item in JSON array: ${e.message}")
+                                try {
+                                    reader.skipValue()
+                                } catch (_: Throwable) {
+                                    break
+                                }
                             }
                         }
                         reader.endArray()
@@ -482,7 +487,7 @@ object XtreamParser {
         }
     }
 
-    suspend fun fetchXtreamSeriesEpisodes(host: String, port: String, user: String, pass: String, seriesId: String): List<EpgChannelData> {
+    suspend fun fetchXtreamSeriesEpisodes(host: String, port: String, user: String, pass: String, seriesId: String): List<SeriesSeason> {
         val cleanId = seriesId.toDoubleOrNull()?.let {
             if (it % 1.0 == 0.0) it.toLong().toString() else seriesId
         } ?: seriesId
@@ -493,11 +498,11 @@ object XtreamParser {
         val map = adapter.fromJson(json) ?: return emptyList()
 
         val episodesRaw = map["episodes"] ?: return emptyList()
-        val outSeasons = ArrayList<EpgChannelData>()
+        val outSeasons = ArrayList<SeriesSeason>()
 
         if (episodesRaw is Map<*, *>) {
             episodesRaw.forEach { (seasonNum, epsList) ->
-                val eps = ArrayList<EpgProgramme>()
+                val eps = ArrayList<SeriesEpisode>()
                 val cleanedSeasonNum = cleanJsonId(seasonNum).let { raw ->
                     val digits = Regex("\\d+").find(raw)?.value
                     if (!digits.isNullOrEmpty() && digits != "0") digits else "1"
@@ -541,23 +546,24 @@ object XtreamParser {
                         if (cleanTitle.isNotEmpty()) "S$cleanedSeasonNum E$epNum: $cleanTitle" else "S$cleanedSeasonNum E$epNum"
                     }
                     
-                    eps.add(EpgProgramme(
-                        start = 0,
-                        stop = 0,
+                    eps.add(SeriesEpisode(
+                        id = id,
+                        episodeNum = epNum,
+                        seasonNum = cleanedSeasonNum,
                         title = finalTitle,
                         desc = (epMap["info"] as? Map<*, *>)?.get("plot")?.toString() ?: epMap["plot"]?.toString() ?: "",
-                        category = playUrl, // Store stream url here for playback navigation
+                        playbackUrl = playUrl,
                         rating = epNum
                     ))
                 }
-                outSeasons.add(EpgChannelData(
+                outSeasons.add(SeriesSeason(
                     id = cleanedSeasonNum,
                     name = "Temporada $cleanedSeasonNum",
-                    programmes = eps.sortedBy { it.rating.toIntOrNull() ?: 0 }
+                    episodes = eps.sortedBy { it.rating.toIntOrNull() ?: 0 }
                 ))
             }
         } else if (episodesRaw is List<*>) {
-            val episodesBySeason = HashMap<String, ArrayList<EpgProgramme>>()
+            val episodesBySeason = HashMap<String, ArrayList<SeriesEpisode>>()
             episodesRaw.forEachIndexed { idx, ep ->
                 val epMap = ep as? Map<*, *> ?: return@forEachIndexed
                 val title = epMap["title"]?.toString() ?: ""
@@ -589,12 +595,13 @@ object XtreamParser {
                     if (cleanTitle.isNotEmpty()) "S$seasonNum E$epNum: $cleanTitle" else "S$seasonNum E$epNum"
                 }
                 
-                val prog = EpgProgramme(
-                    start = 0,
-                    stop = 0,
+                val prog = SeriesEpisode(
+                    id = id,
+                    episodeNum = epNum,
+                    seasonNum = seasonNum,
                     title = finalTitle,
                     desc = (epMap["info"] as? Map<*, *>)?.get("plot")?.toString() ?: "",
-                    category = playUrl,
+                    playbackUrl = playUrl,
                     rating = epNum
                 )
                 if (!episodesBySeason.containsKey(seasonNum)) {
@@ -604,10 +611,10 @@ object XtreamParser {
             }
             
             episodesBySeason.forEach { (seasonNum, eps) ->
-                outSeasons.add(EpgChannelData(
+                outSeasons.add(SeriesSeason(
                     id = seasonNum,
                     name = "Temporada $seasonNum",
-                    programmes = eps.sortedBy { it.rating.toIntOrNull() ?: 0 }
+                    episodes = eps.sortedBy { it.rating.toIntOrNull() ?: 0 }
                 ))
             }
         }
@@ -681,14 +688,21 @@ object XtreamParser {
             val json = BaseEngine.executeGetRequest(url)
             listAdapter.fromJson(json)?.forEach { s ->
                 val sId = cleanJsonId(s["series_id"])
+                val cover = s["cover"]?.toString() ?: s["stream_icon"]?.toString() ?: s["poster"]?.toString() ?: s["backdrop_path"]?.toString()
+                val name = (s["name"] ?: s["title"])?.toString() ?: "Sin nombre"
+                val rating = s["rating"]?.toString()?.toFloatOrNull() ?: s["rating_5based"]?.toString()?.toFloatOrNull()?.let { it * 2 }
+                val year = s["releaseDate"]?.toString()?.take(4)?.toIntOrNull()
+                    ?: s["release_date"]?.toString()?.take(4)?.toIntOrNull()
+                    ?: s["year"]?.toString()?.take(4)?.toIntOrNull()
+
                 series.add(IptvItem(
-                    name = s["name"]?.toString() ?: "Sin nombre",
+                    name = name,
                     group = categoryName,
-                    logo = s["cover"]?.toString(),
-                    tvgLogo = s["cover"]?.toString(),
+                    logo = cover,
+                    tvgLogo = cover,
                     seriesId = sId,
-                    rating = s["rating"]?.toString()?.toFloatOrNull(),
-                    year = s["releaseDate"]?.toString()?.take(4)?.toIntOrNull()
+                    rating = rating,
+                    year = year
                 ))
             }
         } catch (e: Exception) { Log.e(TAG, "Error fetching series for category $categoryId", e) }

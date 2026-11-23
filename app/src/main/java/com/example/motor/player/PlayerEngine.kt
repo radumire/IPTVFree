@@ -12,13 +12,18 @@ data class TrackOption(
     val groupIndex: Int,
     val trackIndex: Int,
     val isSelected: Boolean,
-    val isNone: Boolean = false
+    val isNone: Boolean = false,
+    val formatId: String? = null,
+    val formatLabel: String? = null,
+    val externalSubtitleId: String? = null
 )
 
 // ─── PLAYER ENGINE UTILITIES ──────────────────────────────────────────────────
 
 object PlayerEngine {
     
+    private const val TAG_SUBTITLES = "SUBTITLE_TRACKS"
+
     fun getReadableLanguageName(code: String?, label: String?): String {
         if (!label.isNullOrBlank()) return label
         if (code.isNullOrBlank()) return "Desconocido"
@@ -76,19 +81,33 @@ object PlayerEngine {
                 for (trackIndex in 0 until group.length) {
                     if (group.isTrackSupported(trackIndex)) {
                         val format = group.getTrackFormat(trackIndex)
-                        val label = getReadableLanguageName(format.language, format.label)
+                        val label = if (!format.label.isNullOrBlank()) {
+                            format.label!!
+                        } else {
+                            getReadableLanguageName(format.language, format.label)
+                        }
                         val isSelected = !player.trackSelectionParameters.disabledTrackTypes.contains(type) && group.isTrackSelected(trackIndex)
+                        val trackId = format.id ?: "${groupIndex}_${trackIndex}"
                         
-                        options.add(
-                            TrackOption(
-                                id = "${groupIndex}_${trackIndex}",
-                                name = label,
-                                type = type,
-                                groupIndex = groupIndex,
-                                trackIndex = trackIndex,
-                                isSelected = isSelected
-                            )
+                        val opt = TrackOption(
+                            id = trackId,
+                            name = label,
+                            type = type,
+                            groupIndex = groupIndex,
+                            trackIndex = trackIndex,
+                            isSelected = isSelected,
+                            formatId = format.id,
+                            formatLabel = format.label,
+                            externalSubtitleId = format.id
                         )
+                        options.add(opt)
+
+                        if (type == androidx.media3.common.C.TRACK_TYPE_TEXT) {
+                            android.util.Log.i(
+                                TAG_SUBTITLES,
+                                "SUBTITLE_TRACKS_LOADED externalId=${format.id} group=$groupIndex track=$trackIndex label=\"$label\""
+                            )
+                        }
                     }
                 }
             }
@@ -98,22 +117,32 @@ object PlayerEngine {
 
     fun selectTrack(player: Player, option: TrackOption) {
         if (option.isNone) {
+            android.util.Log.i(TAG_SUBTITLES, "SUBTITLE_TRACK_DISABLED")
             player.trackSelectionParameters = player.trackSelectionParameters
                 .buildUpon()
                 .setTrackTypeDisabled(option.type, true)
+                .clearOverridesOfType(option.type)
                 .build()
         } else {
             val tracks = player.currentTracks
             if (option.groupIndex >= 0 && option.groupIndex < tracks.groups.size) {
                 val group = tracks.groups[option.groupIndex]
-                player.trackSelectionParameters = player.trackSelectionParameters
-                    .buildUpon()
-                    .setTrackTypeDisabled(option.type, false)
-                    .setOverrideForType(
-                        TrackSelectionOverride(group.mediaTrackGroup, option.trackIndex)
+                if (option.trackIndex >= 0 && option.trackIndex < group.length) {
+                    android.util.Log.i(
+                        TAG_SUBTITLES,
+                        "SUBTITLE_TRACK_SELECTED id=${option.id} group=${option.groupIndex} track=${option.trackIndex} label=\"${option.name}\""
                     )
-                    .build()
+                    player.trackSelectionParameters = player.trackSelectionParameters
+                        .buildUpon()
+                        .setTrackTypeDisabled(option.type, false)
+                        .setOverrideForType(
+                            TrackSelectionOverride(group.mediaTrackGroup, option.trackIndex)
+                        )
+                        .build()
+                    return
+                }
             }
+            android.util.Log.w(TAG_SUBTITLES, "SUBTITLE_TRACK_NOT_FOUND id=${option.id}")
         }
     }
 }

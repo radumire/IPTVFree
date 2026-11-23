@@ -16,7 +16,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
-import com.example.motor.repository.TmdbRepository
 
 @Composable
 fun TmdbPosterImage(
@@ -24,7 +23,8 @@ fun TmdbPosterImage(
     isSeries: Boolean,
     defaultLogo: String?,
     modifier: Modifier = Modifier,
-    onYearResolved: ((Int) -> Unit)? = null
+    onYearResolved: ((Int) -> Unit)? = null,
+    fetchPosterAndYear: suspend (String, Boolean) -> Pair<String?, Int?>
 ) {
     val context = LocalContext.current
     var posterUrl by remember(title) { mutableStateOf<String?>(null) }
@@ -32,7 +32,7 @@ fun TmdbPosterImage(
 
     LaunchedEffect(title) {
         isLoading = true
-        val (poster, realYear) = TmdbRepository.getInstance().fetchPosterAndYear(title, isSeries)
+        val (poster, realYear) = fetchPosterAndYear(title, isSeries)
         posterUrl = poster
         if (realYear != null && realYear > 1900) {
             onYearResolved?.invoke(realYear)

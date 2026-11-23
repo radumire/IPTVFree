@@ -64,7 +64,15 @@ android {
     compose = true
     buildConfig = true
   }
-  testOptions { unitTests { isIncludeAndroidResources = true } }
+  testOptions {
+    unitTests {
+      isIncludeAndroidResources = true
+      isReturnDefaultValues = true
+      all {
+        it.maxHeapSize = "1536m"
+      }
+    }
+  }
   lint {
     abortOnError = false
     checkReleaseBuilds = false

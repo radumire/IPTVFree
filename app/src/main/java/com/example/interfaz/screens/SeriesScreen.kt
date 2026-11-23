@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -21,6 +22,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.key.*
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -32,36 +34,35 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.TextStyle
 import coil.compose.AsyncImage
-import com.example.Translator
 import com.example.parseHexColor
-import com.example.motor.db.*
-import com.example.motor.config.*
+import com.example.motor.db.IptvItem
+import com.example.motor.db.SeriesEpisode
+import com.example.motor.db.SeriesSeason
 import com.example.motor.repository.MediaDetails
 import com.example.interfaz.AppThemeColors
-import com.example.interfaz.groupM3uEpisodes
 import com.example.interfaz.viewmodel.SeriesViewModel
+import com.example.interfaz.viewmodel.EpisodeWatchStatus
 import com.example.interfaz.components.TmdbPosterImage
 import com.example.interfaz.components.tvClickable
+import com.example.interfaz.components.tvCardFocusable
 import com.example.interfaz.components.TvButton
 import com.example.interfaz.components.TvIconButton
 import com.example.interfaz.components.TV_FOCUSED_BG
 import com.example.interfaz.components.TV_FOCUSED_TEXT
-import kotlinx.coroutines.Dispatchers
+import com.example.interfaz.components.TV_FOCUSED_BORDER
+import com.example.interfaz.components.rememberTvInitialFocusRequester
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-
-private const val DEBUG_SERIES_SCREEN_LOG = false
 
 @Composable
 fun SeriesScreen(
     viewModel: SeriesViewModel,
-    onPlay: (src: String, title: String, drmScheme: String?, drmLicenseUrl: String?) -> Unit,
+    onPlay: (src: String, title: String, drmScheme: String?, drmLicenseUrl: String?, seriesTitle: String?, season: Int?, episode: Int?) -> Unit,
     onBack: () -> Unit,
     theme: AppThemeColors
 ) {
-    val seriesMap by viewModel.series.collectAsStateWithLifecycle()
     val settingsObj by viewModel.settings.collectAsStateWithLifecycle()
     val precomputedData by viewModel.precomputedSeriesData.collectAsStateWithLifecycle()
+    val historyList by viewModel.playbackHistory.collectAsStateWithLifecycle()
 
     var searchQuery by remember { mutableStateOf("") }
     var debouncedSearchQuery by remember { mutableStateOf("") }
@@ -71,19 +72,65 @@ fun SeriesScreen(
         debouncedSearchQuery = searchQuery
     }
 
-    var selectedGroup by remember { mutableStateOf("") }
+    val selectedGroup by viewModel.selectedCategoryFlow.collectAsStateWithLifecycle()
     val favoritesList by viewModel.favoritesList.collectAsStateWithLifecycle()
-    val activePl by viewModel.activePlaylist.collectAsStateWithLifecycle()
+    val initialFocusRequester = rememberTvInitialFocusRequester()
 
     val scope = rememberCoroutineScope()
+    val context = androidx.compose.ui.platform.LocalContext.current
 
+    val pendingSeries by viewModel.pendingSelectedSeries.collectAsStateWithLifecycle()
     var selectedSeriesItem by remember { mutableStateOf<IptvItem?>(null) }
-    var seasonsList by remember { mutableStateOf<List<EpgChannelData>?>(null) }
+    var openedFromHome by remember { mutableStateOf(false) }
+    var seasonsList by remember { mutableStateOf<List<SeriesSeason>?>(null) }
     var isLoadingEpisodes by remember { mutableStateOf(false) }
     var selectedSeasonIndex by remember { mutableStateOf(0) }
 
-    // Loading State for when background optimization is processing the massive dataset
-    if (precomputedData == null && seriesMap.isNotEmpty()) {
+    LaunchedEffect(pendingSeries) {
+        val item = pendingSeries ?: return@LaunchedEffect
+        selectedSeriesItem = item
+        openedFromHome = true
+        selectedSeasonIndex = 0
+        viewModel.pendingSelectedSeries.value = null
+
+        val cached = viewModel.getCachedEpisodesForSeries(item)
+        if (cached != null) {
+            seasonsList = cached
+            isLoadingEpisodes = false
+        } else {
+            seasonsList = null
+            isLoadingEpisodes = true
+            scope.launch {
+                try {
+                    val loaded = viewModel.loadEpisodesForSeries(item)
+                    if (selectedSeriesItem == item) {
+                        seasonsList = loaded
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    if (selectedSeriesItem == item) {
+                        seasonsList = emptyList()
+                    }
+                } finally {
+                    if (selectedSeriesItem == item) {
+                        isLoadingEpisodes = false
+                    }
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        viewModel.ensureSeriesLoaded()
+    }
+
+    // Capture back button to return to Home when no series is selected
+    BackHandler(enabled = selectedSeriesItem == null) {
+        onBack()
+    }
+
+    // Loading State for when background optimization is processing the massive dataset and user is viewing catalog
+    if (selectedSeriesItem == null && precomputedData == null) {
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -101,20 +148,11 @@ fun SeriesScreen(
                 )
                 Spacer(modifier = Modifier.height(20.dp))
                 Text(
-                    text = "Optimizando base de datos de series...",
+                    text = "Cargando catálogo de series...",
                     color = Color.White,
                     fontSize = 16.sp,
                     fontWeight = FontWeight.Bold,
                     textAlign = TextAlign.Center
-                )
-                Spacer(modifier = Modifier.height(6.dp))
-                val totalEp = remember(seriesMap) { seriesMap.values.sumOf { it.size } }
-                Text(
-                    text = "Procesando $totalEp episodios. Esto tomará solo un momento para que todo funcione de manera instantánea.",
-                    color = Color.LightGray,
-                    fontSize = 12.sp,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.widthIn(max = 400.dp)
                 )
             }
         }
@@ -127,46 +165,71 @@ fun SeriesScreen(
     }
     val allSeries = precomputedData?.allSeries ?: emptyList()
 
-    val favoritesCount = remember(favoritesList) {
-        favoritesList.count { it.type == "series" }
-    }
-
     val favSeriesKeys = remember(favoritesList) {
         favoritesList.filter { it.type == "series" }.flatMap { listOfNotNull(it.id, it.url, it.title) }.toSet()
     }
 
-    val categoryCounts = remember(precomputedData, favoritesCount) {
+    val hiddenSeries = settingsObj.hiddenSeriesCategories
+    val visibleSeries = remember(precomputedData, hiddenSeries) {
+        val data = precomputedData ?: return@remember emptyList()
+        if (hiddenSeries.isNotEmpty()) {
+            data.allSeriesUnique.filter { it.group !in hiddenSeries }
+        } else {
+            data.allSeriesUnique
+        }
+    }
+
+    val favoriteSeries = remember(visibleSeries, favSeriesKeys) {
+        visibleSeries.filter {
+            (it.name in favSeriesKeys || (it.url != null && it.url in favSeriesKeys) || (it.seriesId != null && it.seriesId in favSeriesKeys))
+        }
+    }
+
+    val favoritesCount = remember(favoriteSeries) {
+        favoriteSeries.size
+    }
+
+    val categoryCounts = remember(precomputedData, favoritesCount, visibleSeries.size) {
         val counts = precomputedData?.categoryCounts ?: emptyMap()
         counts.toMutableMap().apply {
+            this["Todos"] = visibleSeries.size
             this["Favoritos"] = favoritesCount
         }
     }
 
     LaunchedEffect(groups) {
         if ((selectedGroup.isEmpty() || selectedGroup !in groups) && groups.isNotEmpty()) {
-            selectedGroup = groups.first()
+            viewModel.selectedCategoryFlow.value = groups.first()
         }
     }
 
     // High performance search and group filtering that runs in <1ms!
-    val activeSeriesUnique = remember(selectedGroup, debouncedSearchQuery, precomputedData, favoritesList) {
+    val activeSeriesUnique = remember(selectedGroup, debouncedSearchQuery, precomputedData, visibleSeries, favoriteSeries, hiddenSeries) {
         val data = precomputedData ?: return@remember emptyList()
         if (debouncedSearchQuery.isNotBlank()) {
-            data.allSeriesUnique.filter { it.name.contains(debouncedSearchQuery, ignoreCase = true) }
+            visibleSeries.filter { it.name.contains(debouncedSearchQuery, ignoreCase = true) }
         } else {
             when (selectedGroup) {
-                "Todos" -> data.allSeriesUnique
-                "Favoritos" -> {
-                    val favIds = favoritesList.filter { it.type == "series" }.map { it.id }.toSet()
-                    data.allSeriesUnique.filter { favIds.contains(it.name) || (it.url != null && favIds.contains(it.url)) }
+                "Todos" -> visibleSeries
+                "Favoritos" -> favoriteSeries
+                else -> {
+                    if (selectedGroup in hiddenSeries) emptyList() else data.groupToUniqueSeries[selectedGroup] ?: emptyList()
                 }
-                else -> data.groupToUniqueSeries[selectedGroup] ?: emptyList()
             }
         }
     }
 
+    LaunchedEffect(debouncedSearchQuery) {
+        if (debouncedSearchQuery.isNotBlank()) {
+            try {
+                viewModel.seriesGridState.scrollToItem(0)
+            } catch (_: Exception) {}
+        }
+    }
+
     if (selectedSeriesItem == null) {
-        Column(modifier = Modifier.fillMaxSize()) {
+        Box(modifier = Modifier.fillMaxSize()) {
+            Column(modifier = Modifier.fillMaxSize()) {
             // TOP BAR with Search and Back Button
             Row(
                 modifier = Modifier
@@ -268,25 +331,40 @@ fun SeriesScreen(
                     )
                     LazyColumn(
                         modifier = Modifier.fillMaxSize(),
-                        verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(4.dp)
+                        verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(6.dp)
                     ) {
                         items(groups.size, key = { idx -> groups[idx] }) { idx ->
                             val group = groups[idx]
                             val isSel = group == selectedGroup && searchQuery.isEmpty()
                             val count = categoryCounts[group] ?: 0
                             var isFocused by remember { mutableStateOf(false) }
-                            val bg = if (isFocused) TV_FOCUSED_BG else if (isSel) parseHexColor(theme.accent) else Color.Transparent
+                            val bg = if (isFocused) parseHexColor(theme.cardHover) else if (isSel) parseHexColor(theme.accent).copy(alpha = 0.65f) else parseHexColor(theme.surface)
+                            val borderCol = if (isFocused) parseHexColor(theme.accent) else if (isSel) parseHexColor(theme.accentLight).copy(alpha = 0.8f) else Color.White.copy(alpha = 0.12f)
                             val tc = if (isFocused) TV_FOCUSED_TEXT else if (isSel) Color.White else Color.LightGray
 
                             Box(
                                 modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(bg)
-                                    .tvClickable(shape = RoundedCornerShape(8.dp), onFocusChange = { isFocused = it }) {
-                                        searchQuery = "" // Reset search to show group content
-                                        selectedGroup = group
-                                    }
+                                .fillMaxWidth()
+                                .tvCardFocusable(
+                                    shape = RoundedCornerShape(8.dp),
+                                    unfocusedBackgroundColor = if (isSel) parseHexColor(theme.accent).copy(alpha = 0.60f) else parseHexColor(theme.card).copy(alpha = 0.55f),
+                                    focusedBackgroundColor = parseHexColor(theme.accent).copy(alpha = 0.35f),
+                                    unfocusedBorderColor = if (isSel) parseHexColor(theme.accentLight).copy(alpha = 0.8f) else Color.White.copy(alpha = 0.12f),
+                                    focusedBorderColor = parseHexColor(theme.accent),
+                                    focusRequester = if (idx == 0) initialFocusRequester else null,
+                                    onFocusChange = { isFocused = it },
+                                        onClick = {
+                                            searchQuery = "" // Reset search to show group content
+                                            if (viewModel.selectedCategoryFlow.value != group) {
+                                                viewModel.selectedCategoryFlow.value = group
+                                                scope.launch {
+                                                    try {
+                                                        viewModel.seriesGridState.scrollToItem(0)
+                                                    } catch (_: Exception) {}
+                                                }
+                                            }
+                                        }
+                                    )
                                     .padding(horizontal = 12.dp, vertical = 10.dp)
                             ) {
                                 Text(
@@ -334,6 +412,7 @@ fun SeriesScreen(
                         }
                     } else {
                         LazyVerticalGrid(
+                            state = viewModel.seriesGridState,
                             columns = GridCells.Adaptive(minSize = 120.dp),
                             modifier = Modifier.fillMaxSize(),
                             horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(12.dp),
@@ -356,85 +435,41 @@ fun SeriesScreen(
                                     mutableStateOf(cachedYear ?: item.year ?: cleanedInfo.year)
                                 }
                                 var isFocused by remember { mutableStateOf(false) }
-                                val cardBg = if (isFocused) TV_FOCUSED_BG else parseHexColor(theme.surface)
+                                val cardBg = if (isFocused) parseHexColor(theme.cardHover) else parseHexColor(theme.surface)
                                 val titleColor = if (isFocused) TV_FOCUSED_TEXT else Color.White
                                 val subtitleColor = if (isFocused) TV_FOCUSED_TEXT else Color.Gray
 
                                 Column(
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .clip(RoundedCornerShape(10.dp))
-                                        .background(cardBg)
-                                        .tvClickable(shape = RoundedCornerShape(10.dp), onFocusChange = { isFocused = it }) {
-                                            val pl = activePl
-                                            val activePlType = pl?.type ?: "null (m3u/default)"
-                                            val cacheKey = if (pl != null) {
-                                                "${pl.id}_${item.seriesId ?: item.name}"
-                                            } else {
-                                                "m3u_${item.name}"
-                                            }
-
-                                            android.util.Log.d("M3U_FLOW_2", """
-                                                === M3U_FLOW_2 ===
-                                                Nombre de la serie pulsada: ${item.name}
-                                                Número de elementos disponibles en la colección de series: ${allSeries.size}
-                                                Tipo de playlist: $activePlType
-                                                cacheKey: $cacheKey
-                                            """.trimIndent())
-
-                                            selectedSeriesItem = item
-                                            selectedSeasonIndex = 0
-                                            val isRemoteApi = pl != null && (pl.type.lowercase() in listOf("xtream", "m3u", "stalker", "mac"))
-                                            val cached = if (isRemoteApi) viewModel.getCachedEpisodes(cacheKey) else null
-
-                                            if (cached != null) {
-                                                if (DEBUG_SERIES_SCREEN_LOG) {
-                                                    val seasonsBreakdown = cached.joinToString("\n") { season ->
-                                                        "Temporada ${season.name} (ID: ${season.id}): ${season.programmes.size} episodios"
-                                                    }
-                                                    android.util.Log.d("CACHE_DIAGNOSTIC", """
-                                                        === CACHE HIT ===
-                                                        Serie: ${item.name}
-                                                        cacheKey: $cacheKey
-                                                        activePl.type: $activePlType
-                                                        getCachedEpisodes: DATOS EXISTENTES
-                                                        Total temporadas en caché: ${cached.size}
-                                                        Episodios por temporada:
-                                                        $seasonsBreakdown
-                                                        Estado: groupM3uEpisodes() se está OMITIENDO (usando datos de caché).
-                                                    """.trimIndent())
-                                                }
-                                                seasonsList = cached
-                                            } else {
-                                                if (DEBUG_SERIES_SCREEN_LOG) {
-                                                    android.util.Log.d("CACHE_DIAGNOSTIC", """
-                                                        === CACHE MISS ===
-                                                        Serie: ${item.name}
-                                                        cacheKey: $cacheKey
-                                                        activePl.type: $activePlType
-                                                        getCachedEpisodes: null
-                                                        Estado: Se va a ejecutar groupM3uEpisodes() / fetch de episodios.
-                                                    """.trimIndent())
-                                                }
-                                                seasonsList = null
-                                                scope.launch {
-                                                    isLoadingEpisodes = true
-                                                    try {
-                                                        val result = viewModel.fetchSeriesEpisodes(item, allSeries, precomputedData?.seriesBaseNameCache)
-                                                        seasonsList = result
-                                                        viewModel.cacheEpisodes(cacheKey, result)
-                                                    } catch (e: Exception) {
-                                                        val fallback = withContext(Dispatchers.Default) {
-                                                            groupM3uEpisodes(item, allSeries, precomputedData?.seriesBaseNameCache)
+                                        .tvCardFocusable(
+                                            shape = RoundedCornerShape(10.dp),
+                                            unfocusedBackgroundColor = parseHexColor(theme.card).copy(alpha = 0.55f),
+                                            focusedBackgroundColor = parseHexColor(theme.accent).copy(alpha = 0.35f),
+                                            focusedBorderColor = parseHexColor(theme.accent),
+                                            onFocusChange = { isFocused = it },
+                                            onClick = {
+                                                selectedSeriesItem = item
+                                                selectedSeasonIndex = 0
+                                                val cached = viewModel.getCachedEpisodesForSeries(item)
+                                                if (cached != null) {
+                                                    seasonsList = cached
+                                                } else {
+                                                    seasonsList = null
+                                                    scope.launch {
+                                                        isLoadingEpisodes = true
+                                                        try {
+                                                            seasonsList = viewModel.loadEpisodesForSeries(item)
+                                                        } catch (e: Exception) {
+                                                            e.printStackTrace()
+                                                            seasonsList = emptyList()
+                                                        } finally {
+                                                            isLoadingEpisodes = false
                                                         }
-                                                        seasonsList = fallback
-                                                        viewModel.cacheEpisodes(cacheKey, fallback)
-                                                    } finally {
-                                                        isLoadingEpisodes = false
                                                     }
                                                 }
                                             }
-                                        }
+                                        )
                                         .padding(8.dp),
                                     horizontalAlignment = Alignment.CenterHorizontally
                                 ) {
@@ -448,15 +483,19 @@ fun SeriesScreen(
                                                 .clip(RoundedCornerShape(6.dp)),
                                             onYearResolved = { resolvedYear ->
                                                 displayYear = resolvedYear
+                                            },
+                                            fetchPosterAndYear = { title, isSeries ->
+                                                viewModel.fetchPosterAndYear(title, isSeries)
                                             }
                                         )
 
-                                        val isFav = item.name in favSeriesKeys || (item.url != null && item.url in favSeriesKeys)
+                                        val isFav = item.name in favSeriesKeys || (item.url != null && item.url in favSeriesKeys) || (item.seriesId != null && item.seriesId in favSeriesKeys)
                                         TvIconButton(
                                             onClick = {
                                                 if (isFav) {
                                                     viewModel.removeFavorite(item.name)
                                                     item.url?.let { viewModel.removeFavorite(it) }
+                                                    item.seriesId?.let { viewModel.removeFavorite(it) }
                                                 } else {
                                                     viewModel.addFavorite(
                                                         id = item.name,
@@ -509,6 +548,8 @@ fun SeriesScreen(
                 }
             }
         }
+    }
+
     } else {
         val series = selectedSeriesItem!!
         val cleanedInfo = remember(series.name) {
@@ -520,14 +561,10 @@ fun SeriesScreen(
         var isDetailsLoading by remember(series.name) { mutableStateOf(true) }
         var showFullSynopsisDialog by remember(series.name) { mutableStateOf(false) }
 
-        LaunchedEffect(series.name, activePl?.id) {
+        LaunchedEffect(series.name) {
             isDetailsLoading = true
             try {
-                seriesDetails = viewModel.fetchXtreamMediaDetails(
-                    item = series,
-                    activePlaylist = activePl,
-                    isSeries = true
-                )
+                seriesDetails = viewModel.fetchSeriesDetails(series)
             } catch (e: Exception) {
                 e.printStackTrace()
             } finally {
@@ -535,20 +572,31 @@ fun SeriesScreen(
             }
         }
 
-        val isFav = favoritesList.any { it.id == series.name || it.id == series.seriesId }
+        val isFav = series.name in favSeriesKeys || (series.url != null && series.url in favSeriesKeys) || (series.seriesId != null && series.seriesId in favSeriesKeys)
         val firstSeasonFocusRequester = remember { FocusRequester() }
+        val selectedSeasonFocusRequester = remember { FocusRequester() }
+        val firstEpisodeFocusRequester = remember { FocusRequester() }
+        val playButtonFocusRequester = remember { FocusRequester() }
 
-        BackHandler(enabled = true) {
+        val closeSeriesDetail: () -> Unit = {
             if (showFullSynopsisDialog) {
                 showFullSynopsisDialog = false
             } else {
                 selectedSeriesItem = null
+                if (openedFromHome) {
+                    openedFromHome = false
+                    onBack()
+                }
             }
+        }
+
+        BackHandler(enabled = true) {
+            closeSeriesDetail()
         }
 
         LaunchedEffect(seasonsList) {
             if (!seasonsList.isNullOrEmpty()) {
-                kotlinx.coroutines.delay(100)
+                kotlinx.coroutines.delay(120)
                 try {
                     firstSeasonFocusRequester.requestFocus()
                 } catch (_: Exception) {}
@@ -574,7 +622,7 @@ fun SeriesScreen(
                 ) {
                     // Back button
                     TvIconButton(
-                        onClick = { selectedSeriesItem = null },
+                        onClick = closeSeriesDetail,
                         containerColor = Color.White.copy(alpha = 0.08f),
                         shape = CircleShape,
                         modifier = Modifier
@@ -701,34 +749,49 @@ fun SeriesScreen(
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
                                     val firstSeason = seasonsList?.firstOrNull()
-                                    val firstEp = firstSeason?.programmes?.firstOrNull()
+                                    val firstEp = firstSeason?.episodes?.firstOrNull()
 
                                      if (firstEp != null) {
                                         TvButton(
                                             onClick = {
                                                 val finalDrmScheme = selectedSeriesItem?.drmScheme
                                                 val finalDrmLicenseUrl = selectedSeriesItem?.drmLicenseUrl
-                                                val pl = activePl
-                                                if (pl != null && pl.type.lowercase() in listOf("stalker", "mac")) {
-                                                    scope.launch {
-                                                        isLoadingEpisodes = true
-                                                        try {
-                                                            val resolved = viewModel.resolveStalkerPlayUrl(firstEp.category, "series")
-                                                            onPlay(resolved, "$seriesTitle - ${firstSeason.name} - ${firstEp.title}", finalDrmScheme, finalDrmLicenseUrl)
-                                                        } catch (e: Exception) {
-                                                            e.printStackTrace()
-                                                        } finally {
-                                                            isLoadingEpisodes = false
+                                                scope.launch {
+                                                    isLoadingEpisodes = true
+                                                    try {
+                                                        val resolved = viewModel.resolveEpisodePlayUrl(firstEp)
+                                                        if (resolved.isNotBlank()) {
+                                                            val sNum = firstEp.seasonNum.toIntOrNull() ?: com.example.motor.tmdb.TmdbService.extractSeasonEpisode(firstSeason.name)?.season ?: 1
+                                                            val eNum = firstEp.episodeNum.toIntOrNull() ?: com.example.motor.tmdb.TmdbService.extractSeasonEpisode(firstEp.title)?.episode ?: 1
+                                                            onPlay(resolved, "$seriesTitle - ${firstSeason.name} - ${firstEp.title}", finalDrmScheme, finalDrmLicenseUrl, seriesTitle, sNum, eNum)
+                                                        } else {
+                                                            android.widget.Toast.makeText(context, "No se pudo obtener la URL del episodio", android.widget.Toast.LENGTH_SHORT).show()
                                                         }
+                                                    } catch (e: Exception) {
+                                                        e.printStackTrace()
+                                                        android.widget.Toast.makeText(context, "Error al reproducir el episodio", android.widget.Toast.LENGTH_SHORT).show()
+                                                    } finally {
+                                                        isLoadingEpisodes = false
                                                     }
-                                                } else {
-                                                    val episodeUrl = viewModel.resolveEpisodeUrl(firstEp.category, pl)
-                                                    onPlay(episodeUrl, "$seriesTitle - ${firstSeason.name} - ${firstEp.title}", finalDrmScheme, finalDrmLicenseUrl)
                                                 }
                                             },
+                                            focusRequester = playButtonFocusRequester,
                                             containerColor = parseHexColor(theme.accent),
                                             shape = RoundedCornerShape(6.dp),
-                                            modifier = Modifier.height(32.dp)
+                                            modifier = Modifier
+                                                .height(32.dp)
+                                                .onKeyEvent { keyEvent ->
+                                                    if (keyEvent.type == KeyEventType.KeyDown) {
+                                                        val keyCode = keyEvent.nativeKeyEvent.keyCode
+                                                        if (keyEvent.key == Key.DirectionDown || keyCode == android.view.KeyEvent.KEYCODE_DPAD_DOWN) {
+                                                            try {
+                                                                firstSeasonFocusRequester.requestFocus()
+                                                                return@onKeyEvent true
+                                                            } catch (_: Exception) {}
+                                                        }
+                                                    }
+                                                    false
+                                                }
                                         ) { isFocused ->
                                             Icon(
                                                 imageVector = Icons.Default.PlayArrow,
@@ -745,10 +808,11 @@ fun SeriesScreen(
                                         onClick = {
                                             if (isFav) {
                                                 viewModel.removeFavorite(series.name)
+                                                series.url?.let { viewModel.removeFavorite(it) }
                                                 series.seriesId?.let { viewModel.removeFavorite(it) }
                                             } else {
                                                 viewModel.addFavorite(
-                                                    id = series.seriesId ?: series.name,
+                                                    id = series.name,
                                                     title = series.name,
                                                     type = "series",
                                                     url = series.url ?: "",
@@ -788,7 +852,7 @@ fun SeriesScreen(
                                         fontWeight = FontWeight.Bold
                                     )
                                     TvIconButton(
-                                        onClick = { selectedSeriesItem = null },
+                                        onClick = closeSeriesDetail,
                                         containerColor = Color.White.copy(alpha = 0.1f),
                                         shape = CircleShape,
                                         modifier = Modifier.size(28.dp)
@@ -894,9 +958,14 @@ fun SeriesScreen(
                                         items(seasons.size) { idx ->
                                             val season = seasons[idx]
                                             val isSel = idx == seasonIndex
-                                            val itemModifier = if (idx == 0) Modifier.focusRequester(firstSeasonFocusRequester) else Modifier
+                                            val isFirst = idx == 0
+                                            val itemModifier = when {
+                                                isSel -> Modifier.focusRequester(selectedSeasonFocusRequester)
+                                                isFirst -> Modifier.focusRequester(firstSeasonFocusRequester)
+                                                else -> Modifier
+                                            }
                                             var isFocused by remember { mutableStateOf(false) }
-                                            val bg = if (isFocused) TV_FOCUSED_BG else if (isSel) parseHexColor(theme.accent) else Color.White.copy(alpha = 0.05f)
+                                            val bg = if (isFocused) parseHexColor(theme.cardHover) else if (isSel) parseHexColor(theme.accent).copy(alpha = 0.45f) else Color.White.copy(alpha = 0.05f)
                                             val tc = if (isFocused) TV_FOCUSED_TEXT else if (isSel) Color.White else Color.LightGray
 
                                             Box(
@@ -908,6 +977,23 @@ fun SeriesScreen(
                                                         if (it.isFocused) {
                                                             selectedSeasonIndex = idx
                                                         }
+                                                    }
+                                                    .onKeyEvent { keyEvent ->
+                                                        if (keyEvent.type == KeyEventType.KeyDown) {
+                                                            val keyCode = keyEvent.nativeKeyEvent.keyCode
+                                                            if (keyEvent.key == Key.DirectionRight || keyCode == android.view.KeyEvent.KEYCODE_DPAD_RIGHT) {
+                                                                try {
+                                                                    firstEpisodeFocusRequester.requestFocus()
+                                                                    return@onKeyEvent true
+                                                                } catch (_: Exception) {}
+                                                            } else if (isFirst && (keyEvent.key == Key.DirectionUp || keyCode == android.view.KeyEvent.KEYCODE_DPAD_UP)) {
+                                                                try {
+                                                                    playButtonFocusRequester.requestFocus()
+                                                                    return@onKeyEvent true
+                                                                } catch (_: Exception) {}
+                                                            }
+                                                        }
+                                                        false
                                                     }
                                                     .tvClickable(shape = RoundedCornerShape(8.dp), onFocusChange = { isFocused = it }) { selectedSeasonIndex = idx }
                                                     .padding(horizontal = 12.dp, vertical = 10.dp)
@@ -945,45 +1031,64 @@ fun SeriesScreen(
                                         fontWeight = FontWeight.Bold,
                                         modifier = Modifier.padding(bottom = 8.dp)
                                     )
-                                    LazyColumn(
+                                     LazyColumn(
                                         modifier = Modifier.fillMaxSize(),
                                         verticalArrangement = Arrangement.spacedBy(8.dp)
-                                    ) {
-                                        items(currentSeason.programmes.size) { idx ->
-                                            val episode = currentSeason.programmes[idx]
+                                     ) {
+                                        items(currentSeason.episodes.size) { idx ->
+                                            val episode = currentSeason.episodes[idx]
+                                            val watchState = remember(episode, currentSeason.name, seriesTitle, historyList) {
+                                                viewModel.getEpisodeWatchState(episode, currentSeason.name, seriesTitle, historyList)
+                                            }
                                             var isFocused by remember { mutableStateOf(false) }
                                             val cardBg = if (isFocused) TV_FOCUSED_BG else Color.White.copy(alpha = 0.05f)
                                             val titleColor = if (isFocused) TV_FOCUSED_TEXT else Color.White
                                             val descColor = if (isFocused) TV_FOCUSED_TEXT else Color.LightGray
                                             val iconColor = if (isFocused) TV_FOCUSED_TEXT else parseHexColor(theme.accent)
 
+                                            val isFirst = idx == 0
                                             Card(
                                                 colors = CardDefaults.cardColors(containerColor = cardBg),
                                                 shape = RoundedCornerShape(8.dp),
-                                                modifier = Modifier
+                                                modifier = (if (isFirst) Modifier.focusRequester(firstEpisodeFocusRequester) else Modifier)
                                                     .fillMaxWidth()
+                                                    .onKeyEvent { keyEvent ->
+                                                        if (keyEvent.type == KeyEventType.KeyDown) {
+                                                            val keyCode = keyEvent.nativeKeyEvent.keyCode
+                                                            if (keyEvent.key == Key.DirectionLeft || keyCode == android.view.KeyEvent.KEYCODE_DPAD_LEFT) {
+                                                                try {
+                                                                    selectedSeasonFocusRequester.requestFocus()
+                                                                    return@onKeyEvent true
+                                                                } catch (_: Exception) {}
+                                                            } else if (isFirst && (keyEvent.key == Key.DirectionUp || keyCode == android.view.KeyEvent.KEYCODE_DPAD_UP)) {
+                                                                try {
+                                                                    playButtonFocusRequester.requestFocus()
+                                                                    return@onKeyEvent true
+                                                                } catch (_: Exception) {}
+                                                            }
+                                                        }
+                                                        false
+                                                    }
                                                     .tvClickable(shape = RoundedCornerShape(8.dp), onFocusChange = { isFocused = it }) {
                                                         val finalDrmScheme = selectedSeriesItem?.drmScheme
                                                         val finalDrmLicenseUrl = selectedSeriesItem?.drmLicenseUrl
-                                                        val pl = activePl
-                                                        
-                                                        if (pl != null && pl.type.lowercase() in listOf("stalker", "mac")) {
-                                                            scope.launch {
-                                                                isLoadingEpisodes = true
-                                                                try {
-                                                                    val resolved = viewModel.resolveStalkerPlayUrl(episode.category, "series")
-                                                                    // selectedSeriesItem = null
-                                                                    onPlay(resolved, "${seriesTitle} - ${currentSeason.name} - ${episode.title}", finalDrmScheme, finalDrmLicenseUrl)
-                                                                } catch (e: Exception) {
-                                                                    e.printStackTrace()
-                                                                } finally {
-                                                                    isLoadingEpisodes = false
+                                                        scope.launch {
+                                                            isLoadingEpisodes = true
+                                                            try {
+                                                                val resolved = viewModel.resolveEpisodePlayUrl(episode)
+                                                                if (resolved.isNotBlank()) {
+                                                                    val sNum = episode.seasonNum.toIntOrNull() ?: com.example.motor.tmdb.TmdbService.extractSeasonEpisode(currentSeason.name)?.season ?: (selectedSeasonIndex + 1)
+                                                                    val eNum = episode.episodeNum.toIntOrNull() ?: com.example.motor.tmdb.TmdbService.extractSeasonEpisode(episode.title)?.episode ?: 1
+                                                                    onPlay(resolved, "${seriesTitle} - ${currentSeason.name} - ${episode.title}", finalDrmScheme, finalDrmLicenseUrl, seriesTitle, sNum, eNum)
+                                                                } else {
+                                                                    android.widget.Toast.makeText(context, "No se pudo obtener la URL del episodio", android.widget.Toast.LENGTH_SHORT).show()
                                                                 }
+                                                            } catch (e: Exception) {
+                                                                e.printStackTrace()
+                                                                android.widget.Toast.makeText(context, "Error al reproducir el episodio", android.widget.Toast.LENGTH_SHORT).show()
+                                                            } finally {
+                                                                isLoadingEpisodes = false
                                                             }
-                                                        } else {
-                                                            val episodeUrl = viewModel.resolveEpisodeUrl(episode.category, pl)
-                                                            // selectedSeriesItem = null
-                                                            onPlay(episodeUrl, "${seriesTitle} - ${currentSeason.name} - ${episode.title}", finalDrmScheme, finalDrmLicenseUrl)
                                                         }
                                                     }
                                             ) {
@@ -1001,12 +1106,45 @@ fun SeriesScreen(
                                                     )
                                                     Spacer(modifier = Modifier.width(12.dp))
                                                     Column(modifier = Modifier.weight(1f)) {
-                                                        Text(
-                                                            text = episode.title,
-                                                            color = titleColor,
-                                                            fontSize = 14.sp,
-                                                            fontWeight = FontWeight.Bold
-                                                        )
+                                                        Row(
+                                                            modifier = Modifier.fillMaxWidth(),
+                                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                                            verticalAlignment = Alignment.CenterVertically
+                                                        ) {
+                                                            Text(
+                                                                text = episode.title,
+                                                                color = titleColor,
+                                                                fontSize = 14.sp,
+                                                                fontWeight = FontWeight.Bold,
+                                                                modifier = Modifier.weight(1f, fill = false)
+                                                            )
+                                                            if (watchState.status == EpisodeWatchStatus.WATCHED) {
+                                                                Spacer(modifier = Modifier.width(8.dp))
+                                                                Row(
+                                                                    verticalAlignment = Alignment.CenterVertically,
+                                                                    modifier = Modifier
+                                                                        .background(
+                                                                            color = if (isFocused) Color.White.copy(alpha = 0.2f) else parseHexColor(theme.accent).copy(alpha = 0.18f),
+                                                                            shape = RoundedCornerShape(4.dp)
+                                                                        )
+                                                                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                                                                ) {
+                                                                    Icon(
+                                                                        imageVector = Icons.Default.Check,
+                                                                        contentDescription = "Visto",
+                                                                        tint = if (isFocused) TV_FOCUSED_TEXT else parseHexColor(theme.accent),
+                                                                        modifier = Modifier.size(12.dp)
+                                                                    )
+                                                                    Spacer(modifier = Modifier.width(4.dp))
+                                                                    Text(
+                                                                        text = "VISTO",
+                                                                        color = if (isFocused) TV_FOCUSED_TEXT else parseHexColor(theme.accent),
+                                                                        fontSize = 10.sp,
+                                                                        fontWeight = FontWeight.Bold
+                                                                    )
+                                                                }
+                                                            }
+                                                        }
                                                         if (episode.desc.isNotEmpty()) {
                                                             Spacer(modifier = Modifier.height(4.dp))
                                                             Text(
@@ -1016,6 +1154,30 @@ fun SeriesScreen(
                                                                 maxLines = 2,
                                                                 overflow = TextOverflow.Ellipsis
                                                             )
+                                                        }
+                                                        if (watchState.status == EpisodeWatchStatus.IN_PROGRESS) {
+                                                            Spacer(modifier = Modifier.height(6.dp))
+                                                            Row(
+                                                                modifier = Modifier.fillMaxWidth(),
+                                                                verticalAlignment = Alignment.CenterVertically
+                                                            ) {
+                                                                LinearProgressIndicator(
+                                                                    progress = { watchState.progressPct.coerceIn(0f, 1f) },
+                                                                    modifier = Modifier
+                                                                        .weight(1f)
+                                                                        .height(4.dp)
+                                                                        .clip(RoundedCornerShape(2.dp)),
+                                                                    color = if (isFocused) TV_FOCUSED_TEXT else parseHexColor(theme.accent),
+                                                                    trackColor = Color.White.copy(alpha = 0.15f)
+                                                                )
+                                                                Spacer(modifier = Modifier.width(8.dp))
+                                                                Text(
+                                                                    text = "${(watchState.progressPct * 100).toInt()}%",
+                                                                    color = if (isFocused) TV_FOCUSED_TEXT else parseHexColor(theme.accent),
+                                                                    fontSize = 10.sp,
+                                                                    fontWeight = FontWeight.Bold
+                                                                )
+                                                            }
                                                         }
                                                     }
                                                 }

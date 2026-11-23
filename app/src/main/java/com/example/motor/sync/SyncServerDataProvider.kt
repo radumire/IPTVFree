@@ -8,4 +8,12 @@ interface SyncServerDataProvider {
     fun updatePlaylists(playlists: List<Playlist>)
     fun connectPlaylist(playlist: Playlist)
     fun getApplicationContext(): Context?
+    fun getSubtitleKeys(): Pair<String, String> = Pair("", "")
+    fun updateSubtitleKeys(openSubtitlesKey: String?, assrtToken: String?) {}
+    fun syncData(playlists: List<Playlist>, openSubtitlesKey: String?, assrtToken: String?) {
+        if (openSubtitlesKey != null || assrtToken != null) {
+            updateSubtitleKeys(openSubtitlesKey, assrtToken)
+        }
+        updatePlaylists(playlists)
+    }
 }

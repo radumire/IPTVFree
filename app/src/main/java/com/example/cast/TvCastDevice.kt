@@ -16,5 +16,6 @@ data class TvCastDevice(
     val avTransportUrl: String? = null,
     val mediaRoute: MediaRouter.RouteInfo? = null,
     val manufacturer: String? = null,
-    val modelName: String? = null
+    val modelName: String? = null,
+    val isSaved: Boolean = false
 )

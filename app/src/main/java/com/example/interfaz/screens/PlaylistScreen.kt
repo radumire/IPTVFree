@@ -1,5 +1,6 @@
 package com.example.interfaz.screens
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.*
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
@@ -34,12 +35,20 @@ import com.example.interfaz.components.TvButton
 import com.example.interfaz.components.TvIconButton
 import com.example.interfaz.components.TV_FOCUSED_BG
 import com.example.interfaz.components.TV_FOCUSED_TEXT
+import com.example.interfaz.components.rememberTvInitialFocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.platform.testTag
 
 @Composable
 fun PlaylistsScreen(
     viewModel: PlaylistViewModel,
-    theme: AppThemeColors
+    theme: AppThemeColors,
+    onBack: () -> Unit = {}
 ) {
+    // Capture back button to return to Home
+    BackHandler {
+        onBack()
+    }
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val playlistsList = uiState.playlists
     val connStatus = uiState.connectStatus
@@ -58,8 +67,10 @@ fun PlaylistsScreen(
     var pendingDuplicatePl by remember { mutableStateOf<Playlist?>(null) }
     var detectedDuplicateExisting by remember { mutableStateOf<Playlist?>(null) }
     var isEditDuplicate by remember { mutableStateOf(false) }
+    val initialFocusRequester = rememberTvInitialFocusRequester()
 
     val clipboardManager = androidx.compose.ui.platform.LocalClipboardManager.current
+    val context = androidx.compose.ui.platform.LocalContext.current
 
     Column(modifier = Modifier.fillMaxSize()) {
         Row(
@@ -70,7 +81,8 @@ fun PlaylistsScreen(
             
             TvButton(
                 onClick = { showSyncTvDialog = true },
-                containerColor = parseHexColor(theme.surface),
+                containerColor = parseHexColor(theme.card).copy(alpha = 0.60f),
+                focusedContainerColor = parseHexColor(theme.accent).copy(alpha = 0.35f),
                 modifier = Modifier.padding(end = 8.dp)
             ) { isFocused ->
                 Icon(
@@ -89,7 +101,9 @@ fun PlaylistsScreen(
 
             TvButton(
                 onClick = { showAddPlaylistDialog = true },
-                containerColor = parseHexColor(theme.accent)
+                containerColor = parseHexColor(theme.card).copy(alpha = 0.60f),
+                focusedContainerColor = parseHexColor(theme.accent).copy(alpha = 0.35f),
+                modifier = Modifier.focusRequester(initialFocusRequester)
             ) { isFocused ->
                 Icon(
                     imageVector = Icons.Default.Add,
@@ -119,7 +133,7 @@ fun PlaylistsScreen(
                 modifier = Modifier.weight(1f),
                 verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(10.dp)
             ) {
-                items(playlistsList) { pl ->
+                items(playlistsList, key = { it.id }) { pl ->
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -149,10 +163,16 @@ fun PlaylistsScreen(
                         ) {
                             TvButton(
                                 onClick = { viewModel.connectPlaylist(pl) },
-                                containerColor = if (pl.active) Color(0xFF3B3B48) else parseHexColor(theme.accent),
+                                modifier = Modifier
+                                    .height(36.dp)
+                                    .border(
+                                        width = 1.dp,
+                                        color = if (pl.active) parseHexColor(theme.accent).copy(alpha = 0.45f) else Color.White.copy(alpha = 0.20f),
+                                        shape = RoundedCornerShape(12.dp)
+                                    ),
+                                containerColor = if (pl.active) parseHexColor(theme.accent).copy(alpha = 0.22f) else Color.White.copy(alpha = 0.08f),
                                 shape = RoundedCornerShape(12.dp),
-                                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
-                                modifier = Modifier.height(36.dp)
+                                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
                             ) { isFocused ->
                                 Text(
                                     text = if (pl.active) "Reconectar" else "Conectar",
@@ -209,15 +229,6 @@ fun PlaylistsScreen(
             val isError = connStatus == "error"
             val isSuccess = connStatus == "ok"
 
-            LaunchedEffect(connStatus) {
-                if (connStatus == "connecting") {
-                    kotlinx.coroutines.delay(30_000L)
-                    if (connStatus == "connecting") {
-                        viewModel.dismissConnectDialog()
-                    }
-                }
-            }
-
             val stage1Status = remember(connLog, connStatus) {
                 when {
                     isError && (connLog.contains("Iniciando") || connLog.contains("Conectando") || connLog.isEmpty()) -> "error"
@@ -248,7 +259,13 @@ fun PlaylistsScreen(
             }
 
             AlertDialog(
-                onDismissRequest = { viewModel.dismissConnectDialog() },
+                onDismissRequest = {
+                    if (isConnecting) {
+                        viewModel.hideConnectDialog()
+                    } else {
+                        viewModel.dismissConnectDialog()
+                    }
+                },
                 containerColor = parseHexColor(theme.surface),
                 shape = RoundedCornerShape(20.dp),
                 modifier = Modifier
@@ -259,7 +276,7 @@ fun PlaylistsScreen(
                 confirmButton = {
                     if (isConnecting) {
                         TvButton(
-                            onClick = { viewModel.dismissConnectDialog() },
+                            onClick = { viewModel.hideConnectDialog() },
                             containerColor = Color.White.copy(alpha = 0.15f),
                             shape = RoundedCornerShape(12.dp),
                             modifier = Modifier
@@ -284,11 +301,19 @@ fun PlaylistsScreen(
                         TvButton(
                             onClick = { viewModel.dismissConnectDialog() },
                             containerColor = if (isError) Color(0xFFD32F2F) else parseHexColor(theme.accent),
-                            shape = RoundedCornerShape(12.dp),
+                            shape = RoundedCornerShape(10.dp),
+                            contentPadding = PaddingValues(horizontal = 20.dp, vertical = 10.dp),
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(horizontal = 12.dp, vertical = 2.dp)
+                                .padding(horizontal = 12.dp, vertical = 4.dp)
                         ) { isFocused ->
+                            Icon(
+                                imageVector = if (isError) Icons.Default.Close else Icons.Default.Check,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp),
+                                tint = if (isFocused) TV_FOCUSED_TEXT else Color.White
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
                             Text(
                                 text = if (isError) "Cerrar" else "Aceptar y Continuar",
                                 color = if (isFocused) TV_FOCUSED_TEXT else Color.White,
@@ -461,11 +486,16 @@ fun PlaylistsScreen(
         }
 
         if (showSyncTvDialog) {
+            val profileLang = remember(uiState.currentProfile?.settingsJson) {
+                uiState.currentProfile?.settingsJson?.let {
+                    com.example.motor.config.JsonUtils.settingsFromJson(it).lang
+                } ?: "es"
+            }
             SyncTvDialog(
                 onDismiss = { showSyncTvDialog = false },
                 viewModel = viewModel,
                 theme = theme,
-                lang = "es"
+                lang = profileLang
             )
         }
 
@@ -791,20 +821,32 @@ fun PlaylistsScreen(
                                     TextField(
                                         value = plMacTfv,
                                         onValueChange = { tfv ->
-                                            val formatted = formatMacAddress(tfv.text)
-                                            plMac = formatted
-                                            plMacTfv = androidx.compose.ui.text.input.TextFieldValue(
-                                                text = formatted,
-                                                selection = androidx.compose.ui.text.TextRange(formatted.length)
-                                            )
+                                            if (tfv.text != plMac) {
+                                                val formatted = formatMacAddress(tfv.text)
+                                                plMac = formatted
+                                                plMacTfv = androidx.compose.ui.text.input.TextFieldValue(
+                                                    text = formatted,
+                                                    selection = androidx.compose.ui.text.TextRange(formatted.length)
+                                                )
+                                            } else {
+                                                plMacTfv = tfv
+                                            }
                                         },
                                         label = { Text("Dirección MAC") },
                                         placeholder = { Text("00:1A:79:XX:XX:XX") },
                                         trailingIcon = {
                                             IconButton(onClick = {
-                                                val clipText = clipboardManager?.getText()?.text ?: ""
-                                                if (clipText.isNotEmpty()) {
-                                                    val formatted = formatMacAddress(clipText)
+                                                val clipText = clipboardManager?.getText()?.text?.trim() ?: ""
+                                                val textToPaste = if (clipText.isNotEmpty()) {
+                                                    clipText
+                                                } else {
+                                                    try {
+                                                        val sysClipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+                                                        sysClipboard?.primaryClip?.getItemAt(0)?.text?.toString()?.trim() ?: ""
+                                                    } catch (e: Exception) { "" }
+                                                }
+                                                if (textToPaste.isNotEmpty()) {
+                                                    val formatted = formatMacAddress(textToPaste)
                                                     plMac = formatted
                                                     plMacTfv = androidx.compose.ui.text.input.TextFieldValue(text = formatted, selection = androidx.compose.ui.text.TextRange(formatted.length))
                                                 }
@@ -812,6 +854,9 @@ fun PlaylistsScreen(
                                                 Icon(imageVector = Icons.Default.ContentPaste, contentDescription = "Pegar", tint = Color.LightGray)
                                             }
                                         },
+                                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                                            keyboardType = androidx.compose.ui.text.input.KeyboardType.Ascii
+                                        ),
                                         colors = TextFieldDefaults.colors(
                                             focusedContainerColor = parseHexColor(theme.bg),
                                             unfocusedContainerColor = parseHexColor(theme.bg),
@@ -842,7 +887,7 @@ fun PlaylistsScreen(
                             var finalPass = plPass.trim()
 
                             if (plType == "m3u" && plUrl.isNotBlank()) {
-                                val creds = com.example.motor.parser.XtreamParser.parseXtreamCredentialsDirect(plUrl.trim())
+                                val creds = viewModel.parseXtreamCredentialsDirect(plUrl.trim())
                                 if (creds != null) {
                                     finalHost = creds.host
                                     finalPort = creds.port
@@ -881,7 +926,8 @@ fun PlaylistsScreen(
                             }
                         },
                         containerColor = parseHexColor(theme.accent),
-                        shape = RoundedCornerShape(8.dp)
+                        shape = RoundedCornerShape(8.dp),
+                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
                     ) { isFocused ->
                         Icon(
                             imageVector = Icons.Default.Check,
@@ -900,13 +946,21 @@ fun PlaylistsScreen(
                 dismissButton = {
                     TvButton(
                         onClick = { showAddPlaylistDialog = false },
-                        containerColor = Color.Transparent,
-                        shape = RoundedCornerShape(8.dp)
+                        containerColor = Color.White.copy(alpha = 0.12f),
+                        shape = RoundedCornerShape(8.dp),
+                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
                     ) { isFocused ->
+                        Icon(
+                            imageVector = Icons.Default.Close,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp),
+                            tint = if (isFocused) TV_FOCUSED_TEXT else Color.White
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
                         Text(
                             text = "Cancelar",
-                            color = if (isFocused) TV_FOCUSED_TEXT else Color.LightGray,
-                            fontWeight = if (isFocused) FontWeight.ExtraBold else FontWeight.Normal
+                            color = if (isFocused) TV_FOCUSED_TEXT else Color.White,
+                            fontWeight = if (isFocused) FontWeight.ExtraBold else FontWeight.Bold
                         )
                     }
                 }
@@ -1149,7 +1203,12 @@ fun PlaylistsScreen(
                                             val macRegex = Regex("(?i)\\b([0-9A-F]{2}[:-][0-9A-F]{2}[:-][0-9A-F]{2}[:-][0-9A-F]{2}[:-][0-9A-F]{2}[:-][0-9A-F]{2})\\b")
                                             val match = macRegex.find(input)
                                             if (match != null) {
-                                                editMac = match.value.replace("-", ":").uppercase()
+                                                val formattedMac = formatMacAddress(match.value)
+                                                editMac = formattedMac
+                                                editMacTfv = androidx.compose.ui.text.input.TextFieldValue(
+                                                    text = formattedMac,
+                                                    selection = androidx.compose.ui.text.TextRange(formattedMac.length)
+                                                )
                                                 editHost = input.replace(match.value, "").replace(",", "").trim()
                                             } else {
                                                 editHost = input
@@ -1163,7 +1222,12 @@ fun PlaylistsScreen(
                                                     val macRegex = Regex("(?i)\\b([0-9A-F]{2}[:-][0-9A-F]{2}[:-][0-9A-F]{2}[:-][0-9A-F]{2}[:-][0-9A-F]{2}[:-][0-9A-F]{2})\\b")
                                                     val match = macRegex.find(clipText)
                                                     if (match != null) {
-                                                        editMac = match.value.replace("-", ":").uppercase()
+                                                        val formattedMac = formatMacAddress(match.value)
+                                                        editMac = formattedMac
+                                                        editMacTfv = androidx.compose.ui.text.input.TextFieldValue(
+                                                            text = formattedMac,
+                                                            selection = androidx.compose.ui.text.TextRange(formattedMac.length)
+                                                        )
                                                         editHost = clipText.replace(match.value, "").replace(",", "").trim()
                                                     } else {
                                                         editHost = clipText
@@ -1187,19 +1251,31 @@ fun PlaylistsScreen(
                                     TextField(
                                         value = editMacTfv,
                                         onValueChange = { tfv ->
-                                            val formatted = formatMacAddress(tfv.text)
-                                            editMac = formatted
-                                            editMacTfv = androidx.compose.ui.text.input.TextFieldValue(
-                                                text = formatted,
-                                                selection = androidx.compose.ui.text.TextRange(formatted.length)
-                                            )
+                                            if (tfv.text != editMac) {
+                                                val formatted = formatMacAddress(tfv.text)
+                                                editMac = formatted
+                                                editMacTfv = androidx.compose.ui.text.input.TextFieldValue(
+                                                    text = formatted,
+                                                    selection = androidx.compose.ui.text.TextRange(formatted.length)
+                                                )
+                                            } else {
+                                                editMacTfv = tfv
+                                            }
                                         },
                                         label = { Text("Dirección MAC") },
                                         trailingIcon = {
                                             IconButton(onClick = {
-                                                val clipText = clipboardManager?.getText()?.text ?: ""
-                                                if (clipText.isNotEmpty()) {
-                                                    val formatted = formatMacAddress(clipText)
+                                                val clipText = clipboardManager?.getText()?.text?.trim() ?: ""
+                                                val textToPaste = if (clipText.isNotEmpty()) {
+                                                    clipText
+                                                } else {
+                                                    try {
+                                                        val sysClipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+                                                        sysClipboard?.primaryClip?.getItemAt(0)?.text?.toString()?.trim() ?: ""
+                                                    } catch (e: Exception) { "" }
+                                                }
+                                                if (textToPaste.isNotEmpty()) {
+                                                    val formatted = formatMacAddress(textToPaste)
                                                     editMac = formatted
                                                     editMacTfv = androidx.compose.ui.text.input.TextFieldValue(text = formatted, selection = androidx.compose.ui.text.TextRange(formatted.length))
                                                 }
@@ -1207,6 +1283,9 @@ fun PlaylistsScreen(
                                                 Icon(imageVector = Icons.Default.ContentPaste, contentDescription = "Pegar", tint = Color.LightGray)
                                             }
                                         },
+                                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                                            keyboardType = androidx.compose.ui.text.input.KeyboardType.Ascii
+                                        ),
                                         colors = TextFieldDefaults.colors(
                                             focusedContainerColor = parseHexColor(theme.bg),
                                             unfocusedContainerColor = parseHexColor(theme.bg),
@@ -1234,7 +1313,7 @@ fun PlaylistsScreen(
                             var finalPass = editPass.trim()
 
                             if (editType == "m3u" && editUrl.isNotBlank()) {
-                                val creds = com.example.motor.parser.XtreamParser.parseXtreamCredentialsDirect(editUrl.trim())
+                                val creds = viewModel.parseXtreamCredentialsDirect(editUrl.trim())
                                 if (creds != null) {
                                     finalHost = creds.host
                                     finalPort = creds.port
@@ -1269,7 +1348,8 @@ fun PlaylistsScreen(
                             }
                         },
                         containerColor = parseHexColor(theme.accent),
-                        shape = RoundedCornerShape(8.dp)
+                        shape = RoundedCornerShape(8.dp),
+                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
                     ) { isFocused ->
                         Icon(imageVector = Icons.Default.Check, contentDescription = null, modifier = Modifier.size(16.dp), tint = if (isFocused) TV_FOCUSED_TEXT else Color.White)
                         Spacer(modifier = Modifier.width(6.dp))
@@ -1279,10 +1359,13 @@ fun PlaylistsScreen(
                 dismissButton = {
                     TvButton(
                         onClick = { showEditPlaylistDialog = false; editingPlaylist = null },
-                        containerColor = Color.Transparent,
-                        shape = RoundedCornerShape(8.dp)
+                        containerColor = Color.White.copy(alpha = 0.12f),
+                        shape = RoundedCornerShape(8.dp),
+                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
                     ) { isFocused ->
-                        Text("Cancelar", color = if (isFocused) TV_FOCUSED_TEXT else Color.LightGray, fontWeight = if (isFocused) FontWeight.ExtraBold else FontWeight.Normal)
+                        Icon(imageVector = Icons.Default.Close, contentDescription = null, modifier = Modifier.size(16.dp), tint = if (isFocused) TV_FOCUSED_TEXT else Color.White)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Cancelar", color = if (isFocused) TV_FOCUSED_TEXT else Color.White, fontWeight = if (isFocused) FontWeight.ExtraBold else FontWeight.Bold)
                     }
                 }
             )
@@ -1425,9 +1508,10 @@ fun PlaylistsScreen(
                                 detectedDuplicateExisting = null
                             },
                             shape = RoundedCornerShape(8.dp),
-                            containerColor = Color.Transparent
+                            containerColor = Color.White.copy(alpha = 0.12f),
+                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
                         ) { isFocused ->
-                            Text(if (isEditDuplicate) "Guardar de todos modos" else "Añadir de todos modos", fontSize = 11.sp, color = if (isFocused) TV_FOCUSED_TEXT else Color.LightGray, fontWeight = if (isFocused) FontWeight.ExtraBold else FontWeight.Normal)
+                            Text(if (isEditDuplicate) "Guardar de todos modos" else "Añadir de todos modos", fontSize = 11.sp, color = if (isFocused) TV_FOCUSED_TEXT else Color.White, fontWeight = if (isFocused) FontWeight.ExtraBold else FontWeight.Bold)
                         }
 
                         TvButton(
@@ -1440,7 +1524,7 @@ fun PlaylistsScreen(
                                 pendingDuplicatePl = null
                                 detectedDuplicateExisting = null
                             },
-                            containerColor = parseHexColor(theme.accent),
+                            containerColor = parseHexColor(theme.surface),
                             shape = RoundedCornerShape(8.dp)
                         ) { isFocused ->
                             Icon(imageVector = Icons.Default.Close, contentDescription = null, modifier = Modifier.size(16.dp), tint = if (isFocused) TV_FOCUSED_TEXT else Color.White)
@@ -1454,59 +1538,139 @@ fun PlaylistsScreen(
 
         // Delete Confirmation Dialog
         if (showDeleteConfirmDialog && playlistToDelete != null) {
-            AlertDialog(
+            val targetPl = playlistToDelete!!
+            val cancelDeleteFocusRequester = com.example.interfaz.components.rememberTvInitialFocusRequester(delayMs = 100L)
+            androidx.compose.ui.window.Dialog(
                 onDismissRequest = { showDeleteConfirmDialog = false; playlistToDelete = null },
-                containerColor = parseHexColor(theme.surface),
-                shape = RoundedCornerShape(16.dp),
-                title = {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
-                        Icon(
-                            imageVector = Icons.Default.Warning,
-                            contentDescription = null,
-                            tint = Color.Red,
-                            modifier = Modifier.size(40.dp)
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text("¿Eliminar Lista?", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
-                    }
-                },
-                text = {
-                    Text(
-                        "¿Estás seguro de que deseas eliminar la lista \"${playlistToDelete!!.name}\"? Esta acción no se puede deshacer.",
-                        color = Color.LightGray,
-                        fontSize = 13.sp,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                },
-                confirmButton = {
-                    TvButton(
-                        onClick = {
-                            val idToDelete = playlistToDelete?.id
-                            if (idToDelete != null) {
-                                viewModel.deletePlaylist(idToDelete)
+                properties = androidx.compose.ui.window.DialogProperties(
+                    usePlatformDefaultWidth = false,
+                    dismissOnBackPress = true,
+                    dismissOnClickOutside = true
+                )
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = 0.78f))
+                        .testTag("delete_playlist_dialog"),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Surface(
+                        shape = RoundedCornerShape(18.dp),
+                        color = parseHexColor(theme.surface),
+                        modifier = Modifier
+                            .widthIn(min = 320.dp, max = 460.dp)
+                            .fillMaxWidth(0.85f)
+                            .border(1.5.dp, Color.Red.copy(alpha = 0.55f), RoundedCornerShape(18.dp))
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(horizontal = 24.dp, vertical = 22.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(14.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(52.dp)
+                                    .clip(androidx.compose.foundation.shape.CircleShape)
+                                    .background(Color.Red.copy(alpha = 0.18f))
+                                    .border(1.dp, Color.Red.copy(alpha = 0.45f), androidx.compose.foundation.shape.CircleShape),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Warning,
+                                    contentDescription = "Eliminar lista",
+                                    tint = Color(0xFFFF6B6B),
+                                    modifier = Modifier.size(30.dp)
+                                )
                             }
-                            showDeleteConfirmDialog = false
-                            playlistToDelete = null
-                        },
-                        containerColor = Color.Red,
-                        focusedContainerColor = Color(0xFFFF5252),
-                        focusedContentColor = Color.White,
-                        shape = RoundedCornerShape(8.dp)
-                    ) { isFocused ->
-                        Text("Eliminar", color = Color.White, fontWeight = FontWeight.Bold)
-                    }
-                },
-                dismissButton = {
-                    TvButton(
-                        onClick = { showDeleteConfirmDialog = false; playlistToDelete = null },
-                        containerColor = Color.Transparent,
-                        shape = RoundedCornerShape(8.dp)
-                    ) { isFocused ->
-                        Text("Cancelar", color = if (isFocused) TV_FOCUSED_TEXT else Color.LightGray, fontWeight = if (isFocused) FontWeight.ExtraBold else FontWeight.Normal)
+
+                            Text(
+                                text = "¿Eliminar Lista?",
+                                color = Color.White,
+                                fontSize = 19.sp,
+                                fontWeight = FontWeight.Bold,
+                                textAlign = TextAlign.Center
+                            )
+
+                            Text(
+                                text = "¿Estás seguro de que deseas eliminar la lista \"${targetPl.name}\"? Esta acción no se puede deshacer.",
+                                color = Color.LightGray,
+                                fontSize = 13.sp,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(top = 6.dp),
+                                horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(14.dp, Alignment.CenterHorizontally),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                TvButton(
+                                    onClick = { showDeleteConfirmDialog = false; playlistToDelete = null },
+                                    focusRequester = cancelDeleteFocusRequester,
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(44.dp)
+                                        .testTag("delete_playlist_cancel_button"),
+                                    containerColor = Color.White.copy(alpha = 0.12f),
+                                    focusedContainerColor = TV_FOCUSED_BG,
+                                    focusedBorderColor = parseHexColor(theme.accent),
+                                    shape = RoundedCornerShape(10.dp),
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
+                                ) { isFocused ->
+                                    Icon(
+                                        imageVector = Icons.Default.Close,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp),
+                                        tint = if (isFocused) TV_FOCUSED_TEXT else Color.White
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = "Cancelar",
+                                        color = if (isFocused) TV_FOCUSED_TEXT else Color.White,
+                                        fontWeight = if (isFocused) FontWeight.ExtraBold else FontWeight.Bold
+                                    )
+                                }
+
+                                TvButton(
+                                    onClick = {
+                                        viewModel.deletePlaylist(targetPl.id)
+                                        showDeleteConfirmDialog = false
+                                        playlistToDelete = null
+                                    },
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(44.dp)
+                                        .testTag("delete_playlist_confirm_button"),
+                                    containerColor = Color(0x38EF4444),
+                                    unfocusedBorderColor = Color(0x88EF4444),
+                                    focusedContainerColor = Color(0xFFE53935),
+                                    focusedContentColor = Color.White,
+                                    focusedBorderColor = Color.White,
+                                    focusedBorderWidth = 2.dp,
+                                    shape = RoundedCornerShape(10.dp),
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
+                                ) { isFocused ->
+                                    Icon(
+                                        imageVector = Icons.Default.Delete,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp),
+                                        tint = Color.White
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = "Eliminar",
+                                        color = Color.White,
+                                        fontWeight = if (isFocused) FontWeight.ExtraBold else FontWeight.SemiBold
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
-            )
+            }
         }
     }
 }

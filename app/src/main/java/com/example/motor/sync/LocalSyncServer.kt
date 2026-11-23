@@ -10,6 +10,7 @@ import com.squareup.moshi.Types
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import java.io.BufferedReader
 import java.io.InputStreamReader
@@ -84,45 +85,7 @@ object LocalSyncServer {
 
     fun getPhysicalWifiIp(context: Context? = null): String? {
         val ctx = context ?: dataProvider?.getApplicationContext() ?: return null
-        try {
-            val cm = ctx.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return null
-            // Check through allNetworks for non-VPN physical Wi-Fi/Ethernet network
-            for (network in cm.allNetworks) {
-                val caps = cm.getNetworkCapabilities(network) ?: continue
-                if ((caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) || caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) &&
-                    !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
-                    val linkProps = cm.getLinkProperties(network) ?: continue
-                    for (linkAddr in linkProps.linkAddresses) {
-                        val addr = linkAddr.address
-                        if (addr is Inet4Address && !addr.isLoopbackAddress) {
-                            val host = addr.hostAddress
-                            if (!host.isNullOrBlank() && isValidLanIp(host)) {
-                                return host
-                            }
-                        }
-                    }
-                }
-            }
-            // Secondary check: any Wi-Fi/Ethernet network
-            for (network in cm.allNetworks) {
-                val caps = cm.getNetworkCapabilities(network) ?: continue
-                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) || caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) {
-                    val linkProps = cm.getLinkProperties(network) ?: continue
-                    for (linkAddr in linkProps.linkAddresses) {
-                        val addr = linkAddr.address
-                        if (addr is Inet4Address && !addr.isLoopbackAddress) {
-                            val host = addr.hostAddress
-                            if (!host.isNullOrBlank() && isValidLanIp(host)) {
-                                return host
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (e: Throwable) {
-            Log.w(TAG, "Error getting physical Wi-Fi IP via ConnectivityManager: ${e.message}")
-        }
-        return null
+        return NetworkIpUtils.getPhysicalWifiIp(ctx)
     }
 
     fun start(provider: SyncServerDataProvider, port: Int = 9999): Boolean {
@@ -191,21 +154,9 @@ object LocalSyncServer {
         return net?.socketFactory
     }
 
-    private fun isClassBPrivate(ip: String): Boolean {
-        val parts = ip.split(".")
-        if (parts.size >= 2) {
-            val second = parts[1].toIntOrNull() ?: return false
-            return second in 16..31
-        }
-        return false
-    }
+    private fun isClassBPrivate(ip: String): Boolean = NetworkIpUtils.isClassBPrivate(ip)
 
-    private fun isValidLanIp(ip: String): Boolean {
-        if (ip.isBlank() || ip == "127.0.0.1" || ip == "0.0.0.0" || ip.startsWith("169.254.")) return false
-        return ip.startsWith("192.168.") ||
-                ip.startsWith("10.") ||
-                (ip.startsWith("172.") && isClassBPrivate(ip))
-    }
+    private fun isValidLanIp(ip: String): Boolean = NetworkIpUtils.isValidLanIp(ip)
 
     private fun getIpPriorityScore(ip: String): Int {
         return when {
@@ -328,30 +279,55 @@ object LocalSyncServer {
         return all.firstOrNull()
     }
 
-    private fun handleClientSocket(socket: Socket) {
+    private fun readHttpLine(input: java.io.InputStream): String? {
+        val baos = java.io.ByteArrayOutputStream()
+        var b = input.read()
+        if (b == -1) return null
+        while (b != -1) {
+            if (b == '\n'.code) break
+            if (b != '\r'.code) {
+                baos.write(b)
+            }
+            b = input.read()
+        }
+        return String(baos.toByteArray(), Charsets.UTF_8)
+    }
+
+    private suspend fun handleClientSocket(socket: Socket) {
         val clientIp = socket.inetAddress?.hostAddress ?: "desconocida"
+        Log.i("SYNC_DIAG", "accepted socket remote=$clientIp")
+
         try {
-            // CRITICAL FOR VPN BYPASS:
-            // Explicitly bind the accepted client socket to the physical Wi-Fi/LAN network.
-            // On Android, when a VPN is active, the default route directs all standard socket traffic
-            // through the VPN tunnel (tun0). Binding to the physical Wi-Fi network ensures that
-            // HTTP responses (including the playlists JSON) are routed directly across the physical Wi-Fi
-            // to the TV on the local LAN, bypassing the VPN.
-            val physicalNetwork = getPhysicalWifiOrLanNetwork(dataProvider?.getApplicationContext())
+            val ctx = dataProvider?.getApplicationContext()
+            val cm = ctx?.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            val physicalNetwork = getPhysicalWifiOrLanNetwork(ctx)
+            val caps = if (physicalNetwork != null && cm != null) {
+                try {
+                    cm.getNetworkCapabilities(physicalNetwork)
+                } catch (_: Throwable) {
+                    null
+                }
+            } else null
+
+            Log.i("SYNC_DIAG", "physical network=$physicalNetwork")
+            Log.i("SYNC_DIAG", "physical network capabilities=$caps")
+
             if (physicalNetwork != null) {
+                Log.i("SYNC_DIAG", "attempting socket bind")
                 try {
                     physicalNetwork.bindSocket(socket)
+                    Log.i("SYNC_DIAG", "socket bind SUCCESS")
                 } catch (e: Throwable) {
-                    Log.w(TAG, "Could not bind client socket to physical network: ${e.message}")
+                    Log.w("SYNC_DIAG", "socket bind FAILED: ${e.message}")
+                    // Non-fatal: continue processing request normally over accepted socket
                 }
             }
 
             socket.soTimeout = 10000
-            val input = socket.getInputStream()
+            val input = java.io.BufferedInputStream(socket.getInputStream())
             val output = socket.getOutputStream()
 
-            val reader = BufferedReader(InputStreamReader(input, Charsets.UTF_8))
-            val requestLine = reader.readLine() ?: return socket.close()
+            val requestLine = readHttpLine(input) ?: return socket.close()
 
             val parts = requestLine.split(" ")
             if (parts.size < 2) return socket.close()
@@ -361,89 +337,91 @@ object LocalSyncServer {
             val path = rawPath.substringBefore("?").trimEnd('/')
 
             var contentLength = 0
-            var line: String?
-            while (reader.readLine().also { line = it } != null) {
-                if (line.isNullOrBlank()) break
-                if (line!!.lowercase().startsWith("content-length:")) {
-                    contentLength = line!!.substringAfter(":").trim().toIntOrNull() ?: 0
+            while (true) {
+                val hLine = readHttpLine(input) ?: break
+                if (hLine.isEmpty()) break
+                if (hLine.lowercase().startsWith("content-length:")) {
+                    contentLength = hLine.substringAfter(":").trim().toIntOrNull() ?: 0
                 }
             }
 
             val body = if (contentLength > 0) {
-                val charArray = CharArray(contentLength)
-                var read = 0
-                while (read < contentLength) {
-                    val r = reader.read(charArray, read, contentLength - read)
+                val maxBytes = minOf(contentLength, 16 * 1024 * 1024)
+                val bodyBytes = ByteArray(maxBytes)
+                var totalRead = 0
+                while (totalRead < maxBytes) {
+                    val r = input.read(bodyBytes, totalRead, maxBytes - totalRead)
                     if (r <= 0) break
-                    read += r
+                    totalRead += r
                 }
-                String(charArray, 0, read)
+                String(bodyBytes, 0, totalRead, Charsets.UTF_8)
             } else ""
 
             if (method == "OPTIONS") {
+                Log.i("SYNC_DIAG", "endpoint requested=$rawPath")
+                Log.i("SYNC_DIAG", "response=200")
+                Log.i("SYNC_DIAG", "playlists sent=0")
                 sendHttpResponse(output, 200, "application/json", """{"status":"ok"}""")
                 return
             }
 
             when {
                 path == "/api/ping" -> {
-                    Log.i("SYNC_DIAG", "petición recibida desde IP $clientIp")
-                    Log.i("SYNC_DIAG", "endpoint solicitado: $rawPath (GET ping)")
-                    Log.i("SYNC_DIAG", "respuesta HTTP: 200 OK")
-                    Log.i("SYNC_DIAG", "número de playlists enviadas: 0")
+                    Log.i("SYNC_DIAG", "endpoint requested=$rawPath")
+                    Log.i("SYNC_DIAG", "response=200")
+                    Log.i("SYNC_DIAG", "playlists sent=0")
                     sendHttpResponse(output, 200, "application/json", """{"status":"ok","deviceName":"IPTV App Sync Service"}""")
                 }
                 path == "/api/playlists" -> {
                     val provider = dataProvider
                     if (provider == null) {
-                        Log.e("SYNC_DIAG", "petición recibida desde IP $clientIp")
-                        Log.e("SYNC_DIAG", "endpoint solicitado: $rawPath")
-                        Log.e("SYNC_DIAG", "respuesta HTTP: 500 Error - Sync provider not initialized")
-                        Log.e("SYNC_DIAG", "número de playlists enviadas: 0")
+                        Log.e("SYNC_DIAG", "endpoint requested=$rawPath")
+                        Log.e("SYNC_DIAG", "response=500")
+                        Log.e("SYNC_DIAG", "playlists sent=0")
                         sendHttpResponse(output, 500, "application/json", """{"error":"Sync provider not initialized"}""")
                     } else if (method == "GET") {
                         val plList = provider.getPlaylists()
-                        Log.i("SYNC_DIAG", "petición recibida desde IP $clientIp")
-                        Log.i("SYNC_DIAG", "endpoint solicitado: $rawPath")
-                        Log.i("SYNC_DIAG", "respuesta HTTP: 200 OK")
-                        Log.i("SYNC_DIAG", "número de playlists enviadas: ${plList.size}")
+                        Log.i("SYNC_DIAG", "endpoint requested=$rawPath")
+                        Log.i("SYNC_DIAG", "response=200")
+                        Log.i("SYNC_DIAG", "playlists sent=${plList.size}")
                         val json = JsonUtils.playlistsToJson(plList)
                         sendHttpResponse(output, 200, "application/json", json)
                     } else if (method == "POST") {
-                        Log.i("SYNC_DIAG", "petición recibida desde IP $clientIp")
-                        Log.i("SYNC_DIAG", "endpoint solicitado: $rawPath (POST)")
+                        Log.i("SYNC_DIAG", "endpoint requested=$rawPath")
                         processSyncRequest(provider, body, output, clientIp)
                     } else {
-                        Log.w("SYNC_DIAG", "petición recibida desde IP $clientIp: 405 Method Not Allowed ($method)")
+                        Log.w("SYNC_DIAG", "endpoint requested=$rawPath")
+                        Log.w("SYNC_DIAG", "response=405")
+                        Log.w("SYNC_DIAG", "playlists sent=0")
                         sendHttpResponse(output, 405, "application/json", """{"error":"Method Not Allowed"}""")
                     }
                 }
                 path == "/api/sync" -> {
                     val provider = dataProvider
                     if (provider == null) {
-                        Log.e("SYNC_DIAG", "petición recibida desde IP $clientIp")
-                        Log.e("SYNC_DIAG", "endpoint solicitado: $rawPath")
-                        Log.e("SYNC_DIAG", "respuesta HTTP: 500 Error - Sync provider not initialized")
-                        Log.e("SYNC_DIAG", "número de playlists enviadas: 0")
+                        Log.e("SYNC_DIAG", "endpoint requested=$rawPath")
+                        Log.e("SYNC_DIAG", "response=500")
+                        Log.e("SYNC_DIAG", "playlists sent=0")
                         sendHttpResponse(output, 500, "application/json", """{"error":"Sync provider not initialized"}""")
                     } else if (method == "POST") {
-                        Log.i("SYNC_DIAG", "petición recibida desde IP $clientIp")
-                        Log.i("SYNC_DIAG", "endpoint solicitado: $rawPath (POST)")
+                        Log.i("SYNC_DIAG", "endpoint requested=$rawPath")
                         processSyncRequest(provider, body, output, clientIp)
                     } else if (method == "GET") {
                         val plList = provider.getPlaylists()
-                        Log.i("SYNC_DIAG", "petición recibida desde IP $clientIp")
-                        Log.i("SYNC_DIAG", "endpoint solicitado: $rawPath (GET)")
-                        Log.i("SYNC_DIAG", "respuesta HTTP: 200 OK")
-                        Log.i("SYNC_DIAG", "número de playlists enviadas: ${plList.size}")
+                        Log.i("SYNC_DIAG", "endpoint requested=$rawPath")
+                        Log.i("SYNC_DIAG", "response=200")
+                        Log.i("SYNC_DIAG", "playlists sent=${plList.size}")
                         val json = JsonUtils.playlistsToJson(plList)
                         sendHttpResponse(output, 200, "application/json", json)
                     } else {
-                        Log.w("SYNC_DIAG", "petición recibida desde IP $clientIp: 405 Method Not Allowed ($method)")
+                        Log.w("SYNC_DIAG", "endpoint requested=$rawPath")
+                        Log.w("SYNC_DIAG", "response=405")
+                        Log.w("SYNC_DIAG", "playlists sent=0")
                         sendHttpResponse(output, 405, "application/json", """{"error":"Method Not Allowed"}""")
                     }
                 }
                 path == "/api/add" -> {
+                    Log.i("SYNC_DIAG", "endpoint requested=$rawPath")
                     val provider = dataProvider
                     if (provider == null) {
                         sendHttpResponse(output, 500, "application/json", """{"error":"Sync provider not initialized"}""")
@@ -454,6 +432,7 @@ object LocalSyncServer {
                     }
                 }
                 path == "/api/delete" -> {
+                    Log.i("SYNC_DIAG", "endpoint requested=$rawPath")
                     val provider = dataProvider
                     if (provider == null) {
                         sendHttpResponse(output, 500, "application/json", """{"error":"Sync provider not initialized"}""")
@@ -463,7 +442,28 @@ object LocalSyncServer {
                         sendHttpResponse(output, 405, "application/json", """{"error":"Method Not Allowed"}""")
                     }
                 }
+                path == "/api/subtitles" -> {
+                    Log.i("SYNC_DIAG", "endpoint requested=$rawPath")
+                    val provider = dataProvider
+                    if (provider == null) {
+                        sendHttpResponse(output, 500, "application/json", """{"error":"Sync provider not initialized"}""")
+                    } else if (method == "POST") {
+                        processSubtitlesRequest(provider, body, output)
+                    } else if (method == "GET") {
+                        val (osKey, assrt) = provider.getSubtitleKeys()
+                        val res = org.json.JSONObject().apply {
+                            put("openSubtitlesKey", osKey)
+                            put("assrtToken", assrt)
+                        }
+                        sendHttpResponse(output, 200, "application/json", res.toString())
+                    } else {
+                        sendHttpResponse(output, 405, "application/json", """{"error":"Method Not Allowed"}""")
+                    }
+                }
                 else -> {
+                    Log.i("SYNC_DIAG", "endpoint requested=$rawPath")
+                    Log.i("SYNC_DIAG", "response=200")
+                    Log.i("SYNC_DIAG", "playlists sent=0")
                     sendHttpResponse(output, 200, "text/html", getWebPortalHtml())
                 }
             }
@@ -474,18 +474,35 @@ object LocalSyncServer {
         }
     }
 
-    private fun processSyncRequest(provider: SyncServerDataProvider, body: String, output: OutputStream, clientIp: String = "desconocida") {
+    private suspend fun processSyncRequest(provider: SyncServerDataProvider, body: String, output: OutputStream, clientIp: String = "desconocida") {
         try {
-            Log.d(TAG, "Received playlists payload for sync: $body")
-            val incomingPlaylists = JsonUtils.playlistsFromJson(body)
-            if (incomingPlaylists.isEmpty() && !body.contains("[]")) {
-                Log.e("SYNC_DIAG", "respuesta HTTP: 400 Bad Request - Invalid playlists format")
-                Log.e("SYNC_DIAG", "número de playlists enviadas: 0")
-                sendHttpResponse(output, 400, "application/json", """{"error":"Invalid playlists format"}""")
+            Log.d(TAG, "Received payload for sync: $body")
+            val trimmedBody = body.trim()
+            val incomingPlaylists: List<Playlist>
+            var syncOpenSubtitlesKey: String? = null
+            var syncAssrtToken: String? = null
+
+            if (trimmedBody.startsWith("{")) {
+                val jsonObject = org.json.JSONObject(trimmedBody)
+                val playlistsArr = jsonObject.optJSONArray("playlists")
+                incomingPlaylists = if (playlistsArr != null) {
+                    JsonUtils.playlistsFromJson(playlistsArr.toString())
+                } else emptyList()
+
+                syncOpenSubtitlesKey = jsonObject.optString("openSubtitlesKey", "").takeIf { it.isNotBlank() }
+                syncAssrtToken = jsonObject.optString("assrtToken", "").takeIf { it.isNotBlank() }
+            } else {
+                incomingPlaylists = JsonUtils.playlistsFromJson(body)
+            }
+
+            if (incomingPlaylists.isEmpty() && !body.contains("[]") && syncOpenSubtitlesKey == null && syncAssrtToken == null) {
+                Log.e("SYNC_DIAG", "response=400")
+                Log.e("SYNC_DIAG", "playlists sent=0")
+                sendHttpResponse(output, 400, "application/json", """{"error":"Invalid payload format"}""")
                 return
             }
 
-            scope.launch(Dispatchers.Main) {
+            withContext(Dispatchers.Main) {
                 val existingPlaylists = provider.getPlaylists().toMutableList()
                 var addedCount = 0
                 incomingPlaylists.forEach { pl ->
@@ -513,79 +530,90 @@ object LocalSyncServer {
                     existingPlaylists[0] = existingPlaylists[0].copy(active = true)
                 }
 
-                provider.updatePlaylists(existingPlaylists)
-
-                val activePl = existingPlaylists.find { it.active }
-                if (activePl != null) {
-                    provider.connectPlaylist(activePl)
+                // Sincronización atómica de listas Y claves de subtítulos en una única transacción Room DB
+                provider.syncData(existingPlaylists, syncOpenSubtitlesKey, syncAssrtToken)
+                if (syncOpenSubtitlesKey != null || syncAssrtToken != null) {
+                    Log.i(TAG, "Claves de subtítulos sincronizadas en la TV de forma atómica: OpenSubtitles=${syncOpenSubtitlesKey != null}, Assrt=${syncAssrtToken != null}")
                 }
             }
 
-            Log.i("SYNC_DIAG", "respuesta HTTP: 200 OK (Sync exitoso)")
-            Log.i("SYNC_DIAG", "número de playlists enviadas: ${incomingPlaylists.size}")
+            Log.i("SYNC_DIAG", "response=200")
+            Log.i("SYNC_DIAG", "playlists sent=${incomingPlaylists.size}")
             sendHttpResponse(output, 200, "application/json", """{"status":"success","message":"Playlists synchronized successfully"}""")
         } catch (e: Exception) {
             Log.e(TAG, "Error handling sync POST", e)
-            Log.e("SYNC_DIAG", "respuesta HTTP: 500 Error - ${e.message}")
-            Log.e("SYNC_DIAG", "número de playlists enviadas: 0")
+            Log.e("SYNC_DIAG", "response=500")
+            Log.e("SYNC_DIAG", "playlists sent=0")
             sendHttpResponse(output, 500, "application/json", """{"error":"${e.message}"}""")
         }
     }
 
-    private fun processAddRequest(provider: SyncServerDataProvider, body: String, output: OutputStream) {
+    private suspend fun processAddRequest(provider: SyncServerDataProvider, body: String, output: OutputStream) {
         try {
-            val playlist = JsonUtils.moshi.adapter(Playlist::class.java).fromJson(body)
+            val playlist = try {
+                JsonUtils.moshi.adapter(Playlist::class.java).fromJson(body)
+            } catch (e: Exception) {
+                // Fallback parsing via JSONObject in case of any deserialization issues
+                val json = org.json.JSONObject(body)
+                Playlist(
+                    id = json.optLong("id", System.currentTimeMillis()),
+                    type = json.optString("type", "m3u"),
+                    name = json.optString("name", ""),
+                    url = json.optString("url", ""),
+                    host = json.optString("host", ""),
+                    user = json.optString("user", ""),
+                    pass = json.optString("pass", ""),
+                    port = json.optString("port", "80"),
+                    mac = json.optString("mac", "")
+                )
+            }
             if (playlist == null || playlist.name.isBlank()) {
-                sendHttpResponse(output, 400, "application/json", """{"error":"Invalid playlist data"}""")
+                sendHttpResponse(output, 400, "application/json", """{"error":"El nombre de la lista es obligatorio"}""")
                 return
             }
 
-            scope.launch(Dispatchers.Main) {
-                val existingPlaylists = provider.getPlaylists().toMutableList()
-                var cleanHost = playlist.host.trim()
-                var cleanMac = playlist.mac.trim()
-                if (playlist.type == "stalker") {
-                    val macRegex = Regex("(?i)\\b([0-9A-F]{2}[:-][0-9A-F]{2}[:-][0-9A-F]{2}[:-][0-9A-F]{2}[:-][0-9A-F]{2}[:-][0-9A-F]{2})\\b")
-                    val match = macRegex.find(cleanHost)
-                    if (match != null) {
-                        cleanMac = match.value.replace("-", ":").uppercase()
-                        cleanHost = cleanHost.replace(match.value, "").replace(",", "").trim()
-                    } else {
-                        val matchMac = macRegex.find(cleanMac)
-                        if (matchMac != null) {
-                            cleanMac = matchMac.value.replace("-", ":").uppercase()
-                        }
+            val existingPlaylists = provider.getPlaylists().toMutableList()
+            var cleanHost = playlist.host.trim()
+            var cleanMac = playlist.mac.trim()
+            if (playlist.type == "stalker") {
+                val macRegex = Regex("(?i)\\b([0-9A-F]{2}[:-][0-9A-F]{2}[:-][0-9A-F]{2}[:-][0-9A-F]{2}[:-][0-9A-F]{2}[:-][0-9A-F]{2})\\b")
+                val match = macRegex.find(cleanHost)
+                if (match != null) {
+                    cleanMac = match.value.replace("-", ":").uppercase()
+                    cleanHost = cleanHost.replace(match.value, "").replace(",", "").trim()
+                } else {
+                    val matchMac = macRegex.find(cleanMac)
+                    if (matchMac != null) {
+                        cleanMac = matchMac.value.replace("-", ":").uppercase()
                     }
                 }
-                val shouldBeActive = existingPlaylists.isEmpty()
-                val newPlaylist = playlist.copy(
-                    id = System.currentTimeMillis(),
-                    host = cleanHost,
-                    mac = cleanMac,
-                    active = shouldBeActive
-                )
-
-                val duplicate = findDuplicatePlaylist(newPlaylist, existingPlaylists)
-                if (duplicate != null) {
-                    sendHttpResponse(output, 409, "application/json", """{"error":"La lista ya existe en la aplicación (${duplicate.name})"}""")
-                    return@launch
-                }
-
-                existingPlaylists.add(newPlaylist)
-                provider.updatePlaylists(existingPlaylists)
-
-                if (shouldBeActive) {
-                    provider.connectPlaylist(newPlaylist)
-                }
-                sendHttpResponse(output, 200, "application/json", """{"status":"success","message":"Playlist added successfully"}""")
             }
+            val shouldBeActive = existingPlaylists.isEmpty()
+            val newPlaylist = playlist.copy(
+                id = System.currentTimeMillis(),
+                host = cleanHost,
+                mac = cleanMac,
+                active = shouldBeActive
+            )
+
+            val duplicate = findDuplicatePlaylist(newPlaylist, existingPlaylists)
+            if (duplicate != null) {
+                sendHttpResponse(output, 409, "application/json", """{"error":"La lista ya existe en la aplicación (${duplicate.name})"}""")
+                return
+            }
+
+            existingPlaylists.add(newPlaylist)
+            withContext(Dispatchers.Main) {
+                provider.updatePlaylists(existingPlaylists)
+            }
+            sendHttpResponse(output, 200, "application/json", """{"status":"success","message":"Playlist added successfully"}""")
         } catch (e: Exception) {
             Log.e(TAG, "Error adding playlist", e)
             sendHttpResponse(output, 500, "application/json", """{"error":"${e.message}"}""")
         }
     }
 
-    private fun processDeleteRequest(provider: SyncServerDataProvider, body: String, output: OutputStream) {
+    private suspend fun processDeleteRequest(provider: SyncServerDataProvider, body: String, output: OutputStream) {
         try {
             val jsonMapType = Types.newParameterizedType(Map::class.java, String::class.java, Any::class.java)
             val adapter = JsonUtils.moshi.adapter<Map<String, Any>>(jsonMapType)
@@ -599,7 +627,7 @@ object LocalSyncServer {
                 return
             }
 
-            scope.launch(Dispatchers.Main) {
+            withContext(Dispatchers.Main) {
                 val existingPlaylists = provider.getPlaylists().filter { it.id != idLong }
                 provider.updatePlaylists(existingPlaylists)
             }
@@ -612,18 +640,22 @@ object LocalSyncServer {
     }
 
     private fun sendHttpResponse(output: OutputStream, status: Int, contentType: String, body: String) {
-        val bytes = body.toByteArray(Charsets.UTF_8)
-        val statusText = if (status == 200) "OK" else if (status == 400) "Bad Request" else if (status == 405) "Method Not Allowed" else "Error"
-        val header = "HTTP/1.1 $status $statusText\r\n" +
-                "Content-Type: $contentType; charset=utf-8\r\n" +
-                "Content-Length: ${bytes.size}\r\n" +
-                "Access-Control-Allow-Origin: *\r\n" +
-                "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n" +
-                "Access-Control-Allow-Headers: Content-Type, Authorization, *\r\n" +
-                "Connection: close\r\n\r\n"
-        output.write(header.toByteArray(Charsets.UTF_8))
-        output.write(bytes)
-        output.flush()
+        try {
+            val bytes = body.toByteArray(Charsets.UTF_8)
+            val statusText = if (status == 200) "OK" else if (status == 400) "Bad Request" else if (status == 405) "Method Not Allowed" else "Error"
+            val header = "HTTP/1.1 $status $statusText\r\n" +
+                    "Content-Type: $contentType; charset=utf-8\r\n" +
+                    "Content-Length: ${bytes.size}\r\n" +
+                    "Access-Control-Allow-Origin: *\r\n" +
+                    "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n" +
+                    "Access-Control-Allow-Headers: Content-Type, Authorization, *\r\n" +
+                    "Connection: close\r\n\r\n"
+            output.write(header.toByteArray(Charsets.UTF_8))
+            output.write(bytes)
+            output.flush()
+        } catch (e: Throwable) {
+            Log.w(TAG, "sendHttpResponse error: ${e.message}")
+        }
     }
 
     fun parseQrSyncTarget(qrData: String): SyncTarget? {
@@ -712,6 +744,8 @@ object LocalSyncServer {
     fun syncPlaylistsWithTv(
         qrOrAddress: String,
         playlists: List<Playlist>,
+        openSubtitlesKey: String? = null,
+        assrtToken: String? = null,
         context: Context? = null,
         onSuccess: (String) -> Unit,
         onError: (String) -> Unit
@@ -730,26 +764,34 @@ object LocalSyncServer {
                 val port = target.port
 
                 // Prepare clients:
-                // 1. Direct Wi-Fi/LAN client (bypasses active VPN!)
+                // 1. Direct Wi-Fi/LAN client (bypasses active VPN if supported)
                 // 2. Default OkHttpClient (standard routing)
-                val wifiSocketFactory = getWifiOrLanSocketFactory(context ?: dataProvider?.getApplicationContext())
+                val effectiveContext = context ?: dataProvider?.getApplicationContext()
+                val isVpn = isVpnActive(effectiveContext)
+                val wifiSocketFactory = getWifiOrLanSocketFactory(effectiveContext)
 
                 val directWifiClient = if (wifiSocketFactory != null) {
                     okhttp3.OkHttpClient.Builder()
                         .socketFactory(wifiSocketFactory)
-                        .connectTimeout(2500, java.util.concurrent.TimeUnit.MILLISECONDS)
+                        .connectTimeout(4000, java.util.concurrent.TimeUnit.MILLISECONDS)
                         .readTimeout(8000, java.util.concurrent.TimeUnit.MILLISECONDS)
                         .writeTimeout(8000, java.util.concurrent.TimeUnit.MILLISECONDS)
                         .build()
                 } else null
 
                 val defaultClient = okhttp3.OkHttpClient.Builder()
-                    .connectTimeout(2500, java.util.concurrent.TimeUnit.MILLISECONDS)
+                    .connectTimeout(4000, java.util.concurrent.TimeUnit.MILLISECONDS)
                     .readTimeout(8000, java.util.concurrent.TimeUnit.MILLISECONDS)
                     .writeTimeout(8000, java.util.concurrent.TimeUnit.MILLISECONDS)
                     .build()
 
-                val clientsToTry = listOfNotNull(directWifiClient, defaultClient)
+                // If VPN is active on THIS device, directWifiClient is tried first to bypass VPN tunnel.
+                // If VPN is not active (e.g. Android TV), defaultClient is used first without risk of EPERM.
+                val clientsToTry = if (isVpn) {
+                    listOfNotNull(directWifiClient, defaultClient)
+                } else {
+                    listOfNotNull(defaultClient, directWifiClient)
+                }
 
                 var workingClient: okhttp3.OkHttpClient? = null
                 var workingHost: String? = null
@@ -799,9 +841,22 @@ object LocalSyncServer {
 
                 // POST /api/sync with verified working connection
                 val syncUrl = "http://$activeHost:$port/api/sync"
-                val json = JsonUtils.playlistsToJson(playlists)
+                val jsonPayload = if (!openSubtitlesKey.isNullOrBlank() || !assrtToken.isNullOrBlank()) {
+                    val root = org.json.JSONObject()
+                    root.put("playlists", org.json.JSONArray(JsonUtils.playlistsToJson(playlists)))
+                    if (!openSubtitlesKey.isNullOrBlank()) {
+                        root.put("openSubtitlesKey", openSubtitlesKey.trim())
+                    }
+                    if (!assrtToken.isNullOrBlank()) {
+                        root.put("assrtToken", assrtToken.trim())
+                    }
+                    root.toString()
+                } else {
+                    JsonUtils.playlistsToJson(playlists)
+                }
+
                 val mediaType = "application/json; charset=utf-8".toMediaTypeOrNull()
-                val requestBody = okhttp3.RequestBody.create(mediaType, json)
+                val requestBody = okhttp3.RequestBody.create(mediaType, jsonPayload)
 
                 val syncRequest = okhttp3.Request.Builder()
                     .url(syncUrl)
@@ -812,8 +867,12 @@ object LocalSyncServer {
                     val responseBody = response.body?.string() ?: ""
                     if (response.isSuccessful) {
                         Log.i(TAG_QR, "resultado de /api/sync: Exitoso (HTTP ${response.code} - $responseBody)")
+                        val keysInfo = mutableListOf<String>()
+                        if (!openSubtitlesKey.isNullOrBlank()) keysInfo.add("OpenSubtitles")
+                        if (!assrtToken.isNullOrBlank()) keysInfo.add("Assrt")
+                        val extraMsg = if (keysInfo.isNotEmpty()) " y claves (${keysInfo.joinToString(", ")})" else ""
                         launch(Dispatchers.Main) {
-                            onSuccess("¡Sincronización exitosa! ${playlists.size} listas enviadas al otro dispositivo.")
+                            onSuccess("¡Sincronización exitosa! ${playlists.size} listas$extraMsg enviadas a la TV.")
                         }
                     } else {
                         val errMsg = "Error en el receptor al guardar listas (HTTP ${response.code}): $responseBody"
@@ -833,10 +892,35 @@ object LocalSyncServer {
         }
     }
 
-    fun sendPlaylistsToDevice(targetIpAndPort: String, playlists: List<Playlist>, context: Context? = null, onSuccess: () -> Unit, onError: (String) -> Unit) {
+    private suspend fun processSubtitlesRequest(provider: SyncServerDataProvider, body: String, output: OutputStream) {
+        try {
+            val json = org.json.JSONObject(body)
+            val osKey = json.optString("openSubtitlesKey", "").takeIf { it.isNotBlank() }
+            val assrtToken = json.optString("assrtToken", "").takeIf { it.isNotBlank() }
+            withContext(Dispatchers.Main) {
+                provider.updateSubtitleKeys(osKey, assrtToken)
+            }
+            sendHttpResponse(output, 200, "application/json", """{"status":"success","message":"Subtitle keys saved on TV"}""")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error saving subtitle keys", e)
+            sendHttpResponse(output, 500, "application/json", """{"error":"${e.message}"}""")
+        }
+    }
+
+    fun sendPlaylistsToDevice(
+        targetIpAndPort: String,
+        playlists: List<Playlist>,
+        openSubtitlesKey: String? = null,
+        assrtToken: String? = null,
+        context: Context? = null,
+        onSuccess: () -> Unit,
+        onError: (String) -> Unit
+    ) {
         syncPlaylistsWithTv(
             qrOrAddress = targetIpAndPort,
             playlists = playlists,
+            openSubtitlesKey = openSubtitlesKey,
+            assrtToken = assrtToken,
             context = context,
             onSuccess = { onSuccess() },
             onError = onError
@@ -1084,6 +1168,29 @@ object LocalSyncServer {
                             </form>
                         </div>
                     </div>
+
+                    <div class="card" style="margin-top: 24px;">
+                        <div class="card-title">
+                            <i class="fa-solid fa-closed-captioning"></i>
+                            Claves de API de Subtítulos
+                        </div>
+                        <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">
+                            Introduce o actualiza tus claves de OpenSubtitles y Assrt para que la Smart TV busque y descargue subtítulos automáticamente.
+                        </p>
+                        <form id="subtitles-form" onsubmit="handleSaveSubtitles(event)">
+                            <div class="form-group">
+                                <label><i class="fa-solid fa-key"></i> OpenSubtitles.com API Key</label>
+                                <input type="text" id="sub-opensubtitles" placeholder="Pega tu API Key de OpenSubtitles.com">
+                            </div>
+                            <div class="form-group">
+                                <label><i class="fa-solid fa-shield-halved"></i> ASSRT.net API Token</label>
+                                <input type="text" id="sub-assrt" placeholder="Pega tu Token de Assrt.net">
+                            </div>
+                            <button type="submit" style="margin-top: 6px;">
+                                <i class="fa-solid fa-floppy-disk"></i> Guardar Claves de Subtítulos en la TV
+                            </button>
+                        </form>
+                    </div>
                 </div>
 
                 <script>
@@ -1129,7 +1236,7 @@ object LocalSyncServer {
                         e.preventDefault();
                         const name = document.getElementById('pl-name').value;
                         const type = currentType;
-                        let payload = { name, type };
+                        let payload = { id: Date.now(), name, type };
 
                         if (type === 'm3u') {
                             payload.url = document.getElementById('pl-url').value;
@@ -1188,7 +1295,46 @@ object LocalSyncServer {
                         }, 5000);
                     }
 
+                    async function loadSubtitles() {
+                        try {
+                            const res = await fetch('/api/subtitles');
+                            if (res.ok) {
+                                const data = await res.json();
+                                if (data.openSubtitlesKey) {
+                                    document.getElementById('sub-opensubtitles').value = data.openSubtitlesKey;
+                                }
+                                if (data.assrtToken) {
+                                    document.getElementById('sub-assrt').value = data.assrtToken;
+                                }
+                            }
+                        } catch (e) {
+                            console.error(e);
+                        }
+                    }
+
+                    async function handleSaveSubtitles(e) {
+                        e.preventDefault();
+                        const openSubtitlesKey = document.getElementById('sub-opensubtitles').value.trim();
+                        const assrtToken = document.getElementById('sub-assrt').value.trim();
+                        try {
+                            const res = await fetch('/api/subtitles', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ openSubtitlesKey, assrtToken })
+                            });
+                            const result = await res.json();
+                            if (res.ok) {
+                                showAlert('alert-box', '¡Claves de subtítulos guardadas con éxito en la Smart TV!', 'success');
+                            } else {
+                                showAlert('alert-box', result.error || 'Error al guardar claves de subtítulos', 'error');
+                            }
+                        } catch (err) {
+                            showAlert('alert-box', 'Error de conexión con la Smart TV', 'error');
+                        }
+                    }
+
                     loadPlaylists();
+                    loadSubtitles();
                 </script>
             </body>
             </html>

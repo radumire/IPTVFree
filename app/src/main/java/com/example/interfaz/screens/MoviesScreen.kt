@@ -1,10 +1,12 @@
 package com.example.interfaz.screens
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.lazy.items
@@ -27,20 +29,20 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.TextStyle
-import com.example.Translator
 import com.example.parseHexColor
-import com.example.motor.db.*
-import com.example.motor.config.*
+import com.example.motor.db.IptvItem
 import com.example.interfaz.AppThemeColors
 import kotlinx.coroutines.launch
 import com.example.interfaz.viewmodel.MoviesViewModel
 import com.example.interfaz.components.MovieDetailFullScreen
-import com.example.interfaz.components.MovieDetailModal
 import com.example.interfaz.components.TmdbPosterImage
 import com.example.interfaz.components.tvClickable
+import com.example.interfaz.components.tvCardFocusable
 import com.example.interfaz.components.TvIconButton
 import com.example.interfaz.components.TV_FOCUSED_BG
 import com.example.interfaz.components.TV_FOCUSED_TEXT
+import com.example.interfaz.components.TV_FOCUSED_BORDER
+import com.example.interfaz.components.rememberTvInitialFocusRequester
 
 @Composable
 fun MoviesScreen(
@@ -50,8 +52,6 @@ fun MoviesScreen(
     theme: AppThemeColors
 ) {
     val precomputedData by viewModel.precomputedMoviesData.collectAsStateWithLifecycle()
-    val activePl by viewModel.activePlaylist.collectAsStateWithLifecycle()
-    val rawMoviesMap by viewModel.movies.collectAsStateWithLifecycle()
     val settingsObj by viewModel.settings.collectAsStateWithLifecycle()
     var searchQuery by remember { mutableStateOf("") }
     var debouncedSearchQuery by remember { mutableStateOf("") }
@@ -61,16 +61,38 @@ fun MoviesScreen(
         debouncedSearchQuery = searchQuery
     }
 
-    var selectedGroup by remember { mutableStateOf("") }
+    val selectedGroup by viewModel.selectedCategoryFlow.collectAsStateWithLifecycle()
     val favoritesList by viewModel.favoritesList.collectAsStateWithLifecycle()
+    val pendingMovie by viewModel.pendingSelectedMovie.collectAsStateWithLifecycle()
     var selectedMovieItem by remember { mutableStateOf<IptvItem?>(null) }
+    var openedFromHome by remember { mutableStateOf(false) }
+    val initialFocusRequester = rememberTvInitialFocusRequester()
 
     val scope = rememberCoroutineScope()
     var isResolving by remember { mutableStateOf(false) }
 
-    if (precomputedData == null && rawMoviesMap.isNotEmpty()) {
+    LaunchedEffect(pendingMovie) {
+        pendingMovie?.let {
+            selectedMovieItem = it
+            openedFromHome = true
+            viewModel.pendingSelectedMovie.value = null
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        viewModel.ensureMoviesLoaded()
+    }
+
+    // Capture back button to return to Home when no movie modal is open
+    BackHandler(enabled = selectedMovieItem == null) {
+        onBack()
+    }
+
+    if (selectedMovieItem == null && precomputedData == null) {
         Box(
-            modifier = Modifier.fillMaxSize(),
+            modifier = Modifier
+                .fillMaxSize()
+                .background(parseHexColor(theme.bg)),
             contentAlignment = Alignment.Center
         ) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -87,39 +109,59 @@ fun MoviesScreen(
         baseGroups.filter { it == "Todos" || it == "Favoritos" || it !in settingsObj.hiddenMovieCategories }
     }
 
-    val movieFavCount = remember(favoritesList) {
-        favoritesList.count { it.type == "movie" }
-    }
-
-    val favMovieKeys = remember(favoritesList) {
-        favoritesList.filter { it.type == "movie" }.flatMap { listOfNotNull(it.id, it.url, it.title) }.toSet()
-    }
-
     LaunchedEffect(groups) {
         if ((selectedGroup.isEmpty() || selectedGroup !in groups) && groups.isNotEmpty()) {
-            selectedGroup = groups.first()
+            viewModel.selectedCategoryFlow.value = groups.first()
         }
     }
 
     val allMovies = precomputedData?.allMovies ?: emptyList()
     val movieMap = precomputedData?.groupToMovies ?: emptyMap()
 
-    val activeMovies = remember(selectedGroup, debouncedSearchQuery, precomputedData, favoritesList) {
+    val favMovieKeys = remember(favoritesList) {
+        favoritesList.filter { it.type == "movie" }.flatMap { listOfNotNull(it.id, it.url, it.title) }.toSet()
+    }
+
+    val hidden = settingsObj.hiddenMovieCategories
+    val visibleMovies = remember(allMovies, hidden) {
+        if (hidden.isNotEmpty()) {
+            allMovies.filter { it.group !in hidden }
+        } else {
+            allMovies
+        }
+    }
+
+    val favoriteMovies = remember(visibleMovies, favMovieKeys) {
+        visibleMovies.filter { it.name in favMovieKeys || (it.url != null && it.url in favMovieKeys) }
+    }
+
+    val movieFavCount = remember(favoriteMovies) {
+        favoriteMovies.size
+    }
+
+    val activeMovies = remember(selectedGroup, debouncedSearchQuery, visibleMovies, favoriteMovies, movieMap, hidden) {
         if (debouncedSearchQuery.isNotBlank()) {
-            allMovies.filter { it.name.contains(debouncedSearchQuery, ignoreCase = true) }
+            visibleMovies.filter { it.name.contains(debouncedSearchQuery, ignoreCase = true) }
         } else {
             when (selectedGroup) {
-                "Todos" -> allMovies
-                "Favoritos" -> {
-                    val favIds = favoritesList.filter { it.type == "movie" }.map { it.id }.toSet()
-                    allMovies.filter { favIds.contains(it.name) || (it.url != null && favIds.contains(it.url)) }
+                "Todos" -> visibleMovies
+                "Favoritos" -> favoriteMovies
+                else -> {
+                    if (selectedGroup in hidden) emptyList() else movieMap[selectedGroup] ?: emptyList()
                 }
-                else -> movieMap[selectedGroup] ?: emptyList()
             }
         }
     }
 
-    if (selectedMovieItem == null) {
+    LaunchedEffect(debouncedSearchQuery) {
+        if (debouncedSearchQuery.isNotBlank()) {
+            try {
+                viewModel.moviesGridState.scrollToItem(0)
+            } catch (_: Exception) {}
+        }
+    }
+
+    Box(modifier = Modifier.fillMaxSize()) {
         Column(modifier = Modifier.fillMaxSize()) {
             // TOP BAR with Search and Back Button
         Row(
@@ -222,28 +264,44 @@ fun MoviesScreen(
                 )
                 LazyColumn(
                     modifier = Modifier.fillMaxSize(),
-                    verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(4.dp)
+                    verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(6.dp)
                 ) {
-                    items(groups, key = { it }) { group ->
+                    items(groups.size, key = { idx -> groups[idx] }) { index ->
+                        val group = groups[index]
                         val isSel = group == selectedGroup && searchQuery.isEmpty()
                         val count = when (group) {
-                            "Todos" -> allMovies.size
+                            "Todos" -> visibleMovies.size
                             "Favoritos" -> movieFavCount
                             else -> precomputedData?.categoryCounts?.get(group) ?: movieMap[group]?.size ?: 0
                         }
                         var isFocused by remember { mutableStateOf(false) }
-                        val bg = if (isFocused) TV_FOCUSED_BG else if (isSel) parseHexColor(theme.accent) else Color.Transparent
+                        val bg = if (isFocused) parseHexColor(theme.cardHover) else if (isSel) parseHexColor(theme.accent).copy(alpha = 0.65f) else parseHexColor(theme.surface)
+                        val borderCol = if (isFocused) parseHexColor(theme.accent) else if (isSel) parseHexColor(theme.accentLight).copy(alpha = 0.8f) else Color.White.copy(alpha = 0.12f)
                         val tc = if (isFocused) TV_FOCUSED_TEXT else if (isSel) Color.White else Color.LightGray
 
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clip(RoundedCornerShape(8.dp))
-                                .background(bg)
-                                .tvClickable(shape = RoundedCornerShape(8.dp), onFocusChange = { isFocused = it }) {
-                                    searchQuery = "" // Reset search to show group content
-                                    selectedGroup = group
-                                }
+                                .tvCardFocusable(
+                                    shape = RoundedCornerShape(8.dp),
+                                    unfocusedBackgroundColor = if (isSel) parseHexColor(theme.accent).copy(alpha = 0.60f) else parseHexColor(theme.card).copy(alpha = 0.55f),
+                                    focusedBackgroundColor = parseHexColor(theme.accent).copy(alpha = 0.35f),
+                                    unfocusedBorderColor = if (isSel) parseHexColor(theme.accentLight).copy(alpha = 0.8f) else Color.White.copy(alpha = 0.12f),
+                                    focusedBorderColor = parseHexColor(theme.accent),
+                                    focusRequester = if (index == 0) initialFocusRequester else null,
+                                    onFocusChange = { isFocused = it },
+                                    onClick = {
+                                        searchQuery = "" // Reset search to show group content
+                                        if (viewModel.selectedCategoryFlow.value != group) {
+                                            viewModel.selectedCategoryFlow.value = group
+                                            scope.launch {
+                                                try {
+                                                    viewModel.moviesGridState.scrollToItem(0)
+                                                } catch (_: Exception) {}
+                                            }
+                                        }
+                                    }
+                                )
                                 .padding(horizontal = 12.dp, vertical = 10.dp)
                         ) {
                             Text(
@@ -291,6 +349,7 @@ fun MoviesScreen(
                     }
                 } else {
                     LazyVerticalGrid(
+                        state = viewModel.moviesGridState,
                         columns = GridCells.Adaptive(minSize = 120.dp),
                         modifier = Modifier.fillMaxSize(),
                         horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(12.dp),
@@ -309,18 +368,21 @@ fun MoviesScreen(
                                 mutableStateOf(cachedYear ?: item.year ?: cleanedInfo.year)
                             }
                             var isFocused by remember { mutableStateOf(false) }
-                            val cardBg = if (isFocused) TV_FOCUSED_BG else parseHexColor(theme.surface)
+                            val cardBg = if (isFocused) parseHexColor(theme.cardHover) else parseHexColor(theme.surface)
                             val titleColor = if (isFocused) TV_FOCUSED_TEXT else Color.White
                             val subtitleColor = if (isFocused) TV_FOCUSED_TEXT else Color.Gray
 
                             Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .clip(RoundedCornerShape(10.dp))
-                                    .background(cardBg)
-                                    .tvClickable(shape = RoundedCornerShape(10.dp), onFocusChange = { isFocused = it }) {
-                                        selectedMovieItem = item
-                                    }
+                                    .tvCardFocusable(
+                                        shape = RoundedCornerShape(10.dp),
+                                        unfocusedBackgroundColor = parseHexColor(theme.card).copy(alpha = 0.55f),
+                                        focusedBackgroundColor = parseHexColor(theme.accent).copy(alpha = 0.35f),
+                                        focusedBorderColor = parseHexColor(theme.accent),
+                                        onFocusChange = { isFocused = it },
+                                        onClick = { selectedMovieItem = item }
+                                    )
                                     .padding(8.dp),
                                 horizontalAlignment = Alignment.CenterHorizontally
                             ) {
@@ -334,6 +396,9 @@ fun MoviesScreen(
                                             .clip(RoundedCornerShape(6.dp)),
                                         onYearResolved = { resolvedYear ->
                                             displayYear = resolvedYear
+                                        },
+                                        fetchPosterAndYear = { title, isSeries ->
+                                            viewModel.fetchPosterAndYear(title, isSeries)
                                         }
                                     )
 
@@ -395,35 +460,32 @@ fun MoviesScreen(
             }
         }
     }
-    } else {
+
+    if (selectedMovieItem != null) {
         val movie = selectedMovieItem!!
-        val isFav = favoritesList.any { it.id == movie.name || it.url == movie.url }
-        MovieDetailFullScreen(
-            movie = movie,
-            isFav = isFav,
-            onToggleFavorite = {
-                if (isFav) {
-                    viewModel.removeFavorite(movie.name)
-                    movie.url?.let { viewModel.removeFavorite(it) }
-                } else {
-                    viewModel.addFavorite(
-                        id = movie.name,
-                        title = movie.name,
-                        type = "movie",
-                        url = movie.url ?: "",
-                        logo = movie.logo
-                    )
-                }
-            },
-            onPlay = {
-                scope.launch {
-                    if (movie.url != null && !movie.url.startsWith("http://localhost") && movie.stalkerCmd.isNullOrEmpty()) {
-                        onPlay(movie.url, movie.name, movie.drmScheme, movie.drmLicenseUrl)
+            val isFav = favoritesList.any { it.id == movie.name || (movie.url != null && it.url == movie.url) || it.title == movie.name }
+            MovieDetailFullScreen(
+                movie = movie,
+                isFav = isFav,
+                onToggleFavorite = {
+                    if (isFav) {
+                        viewModel.removeFavorite(movie.name)
+                        movie.url?.let { viewModel.removeFavorite(it) }
                     } else {
+                        viewModel.addFavorite(
+                            id = movie.name,
+                            title = movie.name,
+                            type = "movie",
+                            url = movie.url ?: "",
+                            logo = movie.logo
+                        )
+                    }
+                },
+                onPlay = {
+                    scope.launch {
                         isResolving = true
                         try {
-                            val resolved = viewModel.resolvePlayUrl(movie)
-                            val finalUrl = resolved.ifBlank { movie.url ?: "" }
+                            val finalUrl = viewModel.resolvePlayUrl(movie)
                             onPlay(finalUrl, movie.name, movie.drmScheme, movie.drmLicenseUrl)
                         } catch (e: Exception) {
                             e.printStackTrace()
@@ -432,12 +494,20 @@ fun MoviesScreen(
                             isResolving = false
                         }
                     }
-                }
-            },
-            onBack = { selectedMovieItem = null },
-            theme = theme,
-            activePlaylist = activePl
-        )
+                },
+                onBack = {
+                    selectedMovieItem = null
+                    if (openedFromHome) {
+                        openedFromHome = false
+                        onBack()
+                    }
+                },
+                theme = theme,
+                onFetchDetails = { item -> viewModel.fetchMovieDetails(item) },
+                onSearchSubtitles = { title -> viewModel.searchMovieSubtitles(title) },
+                onGetCachedYear = { title -> viewModel.getCachedYear(title) }
+            )
+        }
     }
 
     if (isResolving) {

@@ -35,7 +35,6 @@ data class LiveTvState(
     val channels: List<IptvItem> = emptyList(),
     val filteredChannels: List<IptvItem> = emptyList(),
     val selectedChannel: IptvItem? = null,
-    val epgMap: Map<String, EpgChannelData> = emptyMap(),
     val favoriteIds: Set<String> = emptySet(),
     val searchQuery: String = "",
     val selectedFilter: String = "ALL", // "ALL", "FAVORITES", "RECENT"
@@ -66,7 +65,7 @@ data class SeriesState(
     val seriesList: List<IptvItem> = emptyList(),
     val filteredSeries: List<IptvItem> = emptyList(),
     val selectedSeries: IptvItem? = null,
-    val episodes: List<EpgChannelData> = emptyList(),
+    val episodes: List<SeriesSeason> = emptyList(),
     val favoriteIds: Set<String> = emptySet(),
     val searchQuery: String = "",
     val tmdbBackdrop: String? = null,

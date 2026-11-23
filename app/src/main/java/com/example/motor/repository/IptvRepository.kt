@@ -6,15 +6,27 @@ import com.example.motor.config.JsonUtils
 import com.example.motor.config.Playlist
 import com.example.motor.config.StalkerDevice
 import com.example.motor.db.*
-import com.example.motor.parser.StalkerParser
-import com.example.motor.parser.XtreamParser
+import com.example.motor.parser.BaseEngine
+import com.example.motor.parser.XtreamCredentials
+import com.example.motor.source.IptvSourceType
+import com.example.motor.source.M3uSource
+import com.example.motor.source.StalkerSource
+import com.example.motor.source.XtreamSource
+import com.example.motor.tmdb.TmdbService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
+import com.squareup.moshi.Types
+import okio.buffer
+import okio.sink
+import okio.source
 
 class IptvRepository private constructor(
     private val application: Application,
@@ -27,10 +39,15 @@ class IptvRepository private constructor(
 
     private val mediaCacheRepo = MediaCacheRepository.getInstance(application)
 
-    // Memory cache for series episodes
-    private val seriesEpisodesCache = ConcurrentHashMap<String, List<EpgChannelData>>()
+    // Isolated IPTV Source Handlers
+    val stalkerSource = StalkerSource(sessionRepo)
+    val xtreamSource = XtreamSource()
+    val m3uSource = M3uSource(xtreamSource)
 
-    fun getCachedEpisodes(key: String): List<EpgChannelData>? {
+    // Memory cache for series episodes
+    private val seriesEpisodesCache = ConcurrentHashMap<String, List<SeriesSeason>>()
+
+    fun getCachedEpisodes(key: String): List<SeriesSeason>? {
         seriesEpisodesCache[key]?.let { return it }
         return kotlinx.coroutines.runBlocking(Dispatchers.IO) {
             val roomResult = mediaCacheRepo.getEpisodesCache(key)
@@ -41,7 +58,7 @@ class IptvRepository private constructor(
         }
     }
 
-    fun cacheEpisodes(key: String, episodes: List<EpgChannelData>) {
+    fun cacheEpisodes(key: String, episodes: List<SeriesSeason>) {
         seriesEpisodesCache[key] = episodes
         kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
             mediaCacheRepo.saveEpisodesCache(key, "", episodes)
@@ -51,35 +68,108 @@ class IptvRepository private constructor(
     fun clearEpisodesCache() { seriesEpisodesCache.clear() }
 
     // Favorites & History Flows
-    val favoriteItems: Flow<List<FavoriteItem>> = favoriteDao.getAllFavoritesFlow()
-    val recentHistory: Flow<List<PlaybackHistory>> = historyDao.getAllHistoryFlow()
+    @OptIn(ExperimentalCoroutinesApi::class)
+    val favoriteItems: Flow<List<FavoriteItem>> = sessionRepo.activePlaylist
+        .flatMapLatest { activePl ->
+            val plId = activePl?.id
+            if (plId != null && plId > 0) {
+                favoriteDao.getFavoritesForPlaylistFlow(plId)
+            } else {
+                flowOf(emptyList())
+            }
+        }
 
-    suspend fun addFavorite(id: String, title: String, type: String, url: String, logo: String?) = withContext(Dispatchers.IO) {
-        val fav = FavoriteItem(id, title, type, url, logo, System.currentTimeMillis())
+    fun getFavoritesForPlaylist(playlistId: Long): Flow<List<FavoriteItem>> {
+        return favoriteDao.getFavoritesForPlaylistFlow(playlistId)
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    val recentHistory: Flow<List<PlaybackHistory>> = sessionRepo.activePlaylist
+        .flatMapLatest { activePl ->
+            val plId = activePl?.id
+            if (plId != null && plId > 0) {
+                historyDao.getHistoryForPlaylistFlow(plId)
+            } else {
+                flowOf(emptyList())
+            }
+        }
+
+    fun getHistoryForPlaylist(playlistId: Long): Flow<List<PlaybackHistory>> {
+        return historyDao.getHistoryForPlaylistFlow(playlistId)
+    }
+
+    suspend fun addFavorite(
+        id: String,
+        title: String,
+        type: String,
+        url: String,
+        logo: String?,
+        playlistId: Long? = null
+    ) = withContext(Dispatchers.IO) {
+        val targetPlId = playlistId ?: sessionRepo.activePlaylist.value?.id ?: 0L
+        val fav = FavoriteItem(id, title, type, url, logo, System.currentTimeMillis(), targetPlId)
         favoriteDao.insert(fav)
     }
 
-    suspend fun removeFavorite(id: String) = withContext(Dispatchers.IO) {
-        favoriteDao.deleteById(id)
+    suspend fun removeFavorite(id: String, playlistId: Long? = null) = withContext(Dispatchers.IO) {
+        val targetPlId = playlistId ?: sessionRepo.activePlaylist.value?.id
+        if (targetPlId != null && targetPlId > 0) {
+            favoriteDao.deleteByAnyKeyAndPlaylist(id, targetPlId)
+            favoriteDao.deleteByIdAndPlaylist(id, targetPlId)
+        } else {
+            favoriteDao.deleteById(id)
+        }
     }
 
-    suspend fun isFavorite(id: String): Boolean = withContext(Dispatchers.IO) {
-        favoriteDao.getById(id) != null
+    suspend fun isFavorite(id: String, playlistId: Long? = null): Boolean = withContext(Dispatchers.IO) {
+        val targetPlId = playlistId ?: sessionRepo.activePlaylist.value?.id
+        if (targetPlId != null && targetPlId > 0) {
+            favoriteDao.getByIdAndPlaylist(id, targetPlId) != null
+        } else {
+            favoriteDao.getById(id) != null
+        }
     }
 
-    suspend fun recordPlayback(url: String, title: String, position: Long, duration: Long, type: String) = withContext(Dispatchers.IO) {
+    suspend fun clearAllFavorites(playlistId: Long? = null) = withContext(Dispatchers.IO) {
+        val targetPlId = playlistId ?: sessionRepo.activePlaylist.value?.id
+        if (targetPlId != null && targetPlId > 0) {
+            favoriteDao.clearForPlaylist(targetPlId)
+        } else {
+            favoriteDao.clearAll()
+        }
+    }
+
+    suspend fun recordPlayback(
+        url: String,
+        title: String,
+        position: Long,
+        duration: Long,
+        type: String,
+        playlistId: Long? = null
+    ) = withContext(Dispatchers.IO) {
         if (url.isBlank() || title.isBlank()) return@withContext
+        val targetPlId = playlistId ?: sessionRepo.activePlaylist.value?.id ?: 0L
         val pct = if (duration > 0) (position.toFloat() / duration.toFloat()) else 0f
-        val item = PlaybackHistory(url, title, position, duration, pct, type, System.currentTimeMillis())
+        val item = PlaybackHistory(url, title, position, duration, pct, type, System.currentTimeMillis(), targetPlId)
         historyDao.insert(item)
     }
 
-    suspend fun deletePlaybackHistory(src: String) = withContext(Dispatchers.IO) {
-        historyDao.deleteBySrc(src)
+    suspend fun deletePlaybackHistory(src: String, playlistId: Long? = null) = withContext(Dispatchers.IO) {
+        val targetPlId = playlistId ?: sessionRepo.activePlaylist.value?.id
+        if (targetPlId != null && targetPlId > 0) {
+            historyDao.deleteBySrcAndPlaylist(src, targetPlId)
+        } else {
+            historyDao.deleteBySrc(src)
+        }
     }
 
-    suspend fun clearAllPlaybackHistory() = withContext(Dispatchers.IO) {
-        historyDao.clearAll()
+    suspend fun clearAllPlaybackHistory(playlistId: Long? = null) = withContext(Dispatchers.IO) {
+        val targetPlId = playlistId ?: sessionRepo.activePlaylist.value?.id
+        if (targetPlId != null && targetPlId > 0) {
+            historyDao.clearForPlaylist(targetPlId)
+        } else {
+            historyDao.clearAll()
+        }
     }
 
     // ─── FILE CACHE MANAGEMENT ──────────────────────────────────────────
@@ -91,10 +181,18 @@ class IptvRepository private constructor(
 
     suspend fun loadCachedData(playlistIdStr: String, type: String): Map<String, List<IptvItem>> = withContext(Dispatchers.IO) {
         val file = getCacheFile(playlistIdStr, type)
-        if (!file.exists()) return@withContext emptyMap()
+        if (!file.exists() || file.length() == 0L) return@withContext emptyMap()
         try {
-            val json = file.readText()
-            JsonUtils.iptvItemsMapFromJson(json)
+            file.source().buffer().use { source ->
+                val typeAdapter = JsonUtils.moshi.adapter<Map<String, List<IptvItem>>>(
+                    Types.newParameterizedType(
+                        Map::class.java,
+                        String::class.java,
+                        Types.newParameterizedType(List::class.java, IptvItem::class.java)
+                    )
+                )
+                typeAdapter.fromJson(source) ?: emptyMap()
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Error reading file cache for $type", e)
             emptyMap()
@@ -104,8 +202,16 @@ class IptvRepository private constructor(
     suspend fun saveCachedData(playlistIdStr: String, type: String, data: Map<String, List<IptvItem>>) = withContext(Dispatchers.IO) {
         val file = getCacheFile(playlistIdStr, type)
         try {
-            val json = JsonUtils.moshi.adapter(Any::class.java).toJson(data)
-            file.writeText(json)
+            file.sink().buffer().use { sink ->
+                val typeAdapter = JsonUtils.moshi.adapter<Map<String, List<IptvItem>>>(
+                    Types.newParameterizedType(
+                        Map::class.java,
+                        String::class.java,
+                        Types.newParameterizedType(List::class.java, IptvItem::class.java)
+                    )
+                )
+                typeAdapter.toJson(sink, data)
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Error saving file cache for $type", e)
         }
@@ -117,213 +223,212 @@ class IptvRepository private constructor(
         }
     }
 
-    // ─── IPTV DATA FETCHING ─────────────────────────────────────────────
+    // ─── IPTV DATA FETCHING (FACADE DELEGATION) ─────────────────────────
 
     suspend fun loadLiveCategories(playlist: Playlist): Map<String, List<IptvItem>> = withContext(Dispatchers.IO) {
-        when (playlist.type.lowercase()) {
-            "mac", "stalker" -> loadStalkerLiveCategories(playlist)
-            "xtream", "m3u" -> loadXtreamLiveCategories(playlist)
-            else -> emptyMap()
-        }
-    }
-
-    private suspend fun loadStalkerLiveCategories(playlist: Playlist): Map<String, List<IptvItem>> = withContext(Dispatchers.IO) {
         val plIdStr = playlist.id.toString()
-        var session = sessionRepo.getStalkerSession(plIdStr)
-        if (session == null || (session["token"] as? String).isNullOrEmpty()) {
-            sessionRepo.reconnectActivePlaylistSilently()
-            session = sessionRepo.getStalkerSession(plIdStr)
+        val result = when (IptvSourceType.fromPlaylist(playlist)) {
+            IptvSourceType.STALKER -> stalkerSource.loadLiveCategories(playlist)
+            IptvSourceType.XTREAM -> xtreamSource.loadLiveCategories(playlist)
+            IptvSourceType.M3U -> m3uSource.loadLiveCategories(playlist)
+            IptvSourceType.UNKNOWN -> emptyMap()
         }
-
-        val device = if (playlist.stalkerDeviceJson.isNotBlank()) JsonUtils.stalkerDeviceFromJson(playlist.stalkerDeviceJson) else StalkerDevice()
-        val result = mutableMapOf<String, List<IptvItem>>()
-
-        try {
-            val catalogMap = StalkerParser.fetchStalkerCatalog(
-                host = playlist.host,
-                mac = playlist.mac,
-                device = device,
-                onProgress = {}
-            )
-            @Suppress("UNCHECKED_CAST")
-            val channels = (catalogMap["tv"] as? List<IptvItem>) ?: emptyList()
-
-            if (channels.isNotEmpty()) {
-                result["Todos"] = channels
-            }
-
-            val grouped = channels.groupBy { if (it.group.isBlank()) "General" else it.group }
-            grouped.forEach { (catName, items) ->
-                if (catName.isNotBlank() && items.isNotEmpty()) {
-                    result[catName] = items
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error fetching Stalker live channels", e)
+        if (result.isNotEmpty()) {
+            saveCachedData(plIdStr, "tv", result)
         }
-
-        saveCachedData(plIdStr, "tv", result)
-        result
-    }
-
-    private suspend fun loadXtreamLiveCategories(playlist: Playlist): Map<String, List<IptvItem>> = withContext(Dispatchers.IO) {
-        val plIdStr = playlist.id.toString()
-        val result = mutableMapOf<String, List<IptvItem>>()
-        try {
-            var host = playlist.host
-            var port = playlist.port
-            var user = playlist.user
-            var pass = playlist.pass
-
-            if (user.isEmpty() || pass.isEmpty() || host.isEmpty()) {
-                val inputUrl = playlist.url.ifEmpty { playlist.host }
-                val creds = XtreamParser.resolveXtreamCredentials(inputUrl)
-                if (creds != null) {
-                    host = creds.host
-                    port = creds.port
-                    user = creds.user
-                    pass = creds.pass
-                }
-            }
-
-            val catalog = XtreamParser.fetchXtreamCatalog(host, port, user, pass) { }
-            val channels = catalog["tv"] ?: emptyList()
-
-            if (channels.isNotEmpty()) {
-                result["Todos"] = channels
-            }
-
-            val grouped = channels.groupBy { if (it.group.isBlank()) "General" else it.group }
-            grouped.forEach { (catName, items) ->
-                if (catName.isNotBlank() && items.isNotEmpty()) {
-                    result[catName] = items
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error fetching Xtream live channels", e)
-        }
-
-        saveCachedData(plIdStr, "tv", result)
         result
     }
 
     // ─── SERIES EPISODES FETCHING ────────────────────────────────────────
 
-    suspend fun fetchXtreamSeriesEpisodes(playlist: Playlist, seriesId: String): List<EpgChannelData> = withContext(Dispatchers.IO) {
-        try {
-            var host = playlist.host
-            var port = playlist.port.ifEmpty { "80" }
-            var user = playlist.user
-            var pass = playlist.pass
-
-            if (host.isBlank() || user.isBlank() || pass.isBlank()) {
-                val creds = XtreamParser.resolveXtreamCredentials(playlist.url.ifEmpty { playlist.host })
-                if (creds != null) {
-                    host = creds.host
-                    port = creds.port
-                    user = creds.user
-                    pass = creds.pass
-                }
-            }
-
-            if (host.isNotBlank() && user.isNotBlank() && pass.isNotBlank()) {
-                XtreamParser.fetchXtreamSeriesEpisodes(
-                    host = host,
-                    port = port,
-                    user = user,
-                    pass = pass,
-                    seriesId = seriesId
-                )
-            } else emptyList()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error fetching Xtream series episodes", e)
-            emptyList()
+    suspend fun fetchSeriesEpisodes(playlist: Playlist, seriesId: String, seriesCmd: String? = null): List<SeriesSeason> = withContext(Dispatchers.IO) {
+        when (IptvSourceType.fromPlaylist(playlist)) {
+            IptvSourceType.STALKER -> stalkerSource.fetchSeriesEpisodes(playlist, seriesId, seriesCmd)
+            IptvSourceType.XTREAM -> xtreamSource.fetchSeriesEpisodes(playlist, seriesId)
+            IptvSourceType.M3U -> m3uSource.fetchSeriesEpisodes(playlist, seriesId)
+            IptvSourceType.UNKNOWN -> emptyList()
         }
     }
 
-    suspend fun fetchStalkerSeriesEpisodes(playlist: Playlist, seriesId: String): List<EpgChannelData> = withContext(Dispatchers.IO) {
-        val plIdStr = playlist.id.toString()
-        var session = sessionRepo.getStalkerSession(plIdStr)
-        if (session == null || (session["token"] as? String).isNullOrEmpty()) {
-            sessionRepo.reconnectActivePlaylistSilently()
-            session = sessionRepo.getStalkerSession(plIdStr)
-        }
+    suspend fun fetchXtreamSeriesEpisodes(playlist: Playlist, seriesId: String): List<SeriesSeason> = withContext(Dispatchers.IO) {
+        xtreamSource.fetchSeriesEpisodes(playlist, seriesId)
+    }
 
-        if (session == null) return@withContext emptyList()
-        val portalUrl = session["portalUrl"] as? String ?: return@withContext emptyList()
-        val mac = session["mac"] as? String ?: return@withContext emptyList()
-        val token = session["token"] as? String ?: ""
-        val device = session["device"] as? StalkerDevice ?: return@withContext emptyList()
+    suspend fun fetchStalkerSeriesEpisodes(playlist: Playlist, seriesId: String, seriesCmd: String? = null): List<SeriesSeason> = withContext(Dispatchers.IO) {
+        stalkerSource.fetchSeriesEpisodes(playlist, seriesId, seriesCmd)
+    }
 
-        try {
-            StalkerParser.fetchStalkerSeriesEpisodes(portalUrl, mac, seriesId, token, device)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error fetching Stalker series episodes", e)
-            emptyList()
+    // ─── STREAM & PLAY URL RESOLUTION ───────────────────────────────────
+
+    suspend fun resolvePlayUrl(playlist: Playlist, cmdOrUrl: String, mediaType: String = "series"): String = withContext(Dispatchers.IO) {
+        val resolved = when (IptvSourceType.fromPlaylist(playlist)) {
+            IptvSourceType.STALKER -> stalkerSource.resolvePlayUrl(playlist, cmdOrUrl, mediaType)
+            else -> cmdOrUrl
         }
+        if (IptvSourceType.fromPlaylist(playlist) == IptvSourceType.STALKER && resolved.isNotBlank()) {
+            com.example.motor.player.PlayerRepository.registerStreamReResolver(resolved) {
+                val freshUrl = stalkerSource.resolvePlayUrl(playlist, cmdOrUrl, mediaType)
+                Pair(freshUrl, stalkerSource.buildHeaders(playlist))
+            }
+        }
+        resolved
     }
 
     suspend fun resolveStalkerPlayUrl(playlist: Playlist, cmd: String, mediaType: String = "series"): String = withContext(Dispatchers.IO) {
-        val plIdStr = playlist.id.toString()
-        var session = sessionRepo.getStalkerSession(plIdStr)
-        if (session == null || (session["token"] as? String).isNullOrEmpty()) {
-            sessionRepo.reconnectActivePlaylistSilently()
-            session = sessionRepo.getStalkerSession(plIdStr)
+        val resolved = stalkerSource.resolvePlayUrl(playlist, cmd, mediaType)
+        if (resolved.isNotBlank()) {
+            com.example.motor.player.PlayerRepository.registerStreamReResolver(resolved) {
+                val freshUrl = stalkerSource.resolvePlayUrl(playlist, cmd, mediaType)
+                Pair(freshUrl, stalkerSource.buildHeaders(playlist))
+            }
         }
-        if (session == null) return@withContext cmd
-        try {
-            StalkerParser.resolveStalkerPlayLink(session, cmd, mediaType)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error resolving Stalker play link", e)
-            cmd
-        }
+        resolved
     }
 
-    // ─── STREAM LINK RESOLUTION ─────────────────────────────────────────
+    fun getStreamHeaders(playlist: Playlist? = null): Map<String, String> {
+        val targetPl = playlist ?: sessionRepo.activePlaylist.value
+        if (targetPl == null) {
+            return mapOf("User-Agent" to "IPTVSmartersPro/3.1.5 (Linux; Android 11)")
+        }
+        return when (IptvSourceType.fromPlaylist(targetPl)) {
+            IptvSourceType.STALKER -> stalkerSource.buildHeaders(targetPl)
+            IptvSourceType.M3U -> m3uSource.getStreamHeaders(targetPl)
+            IptvSourceType.XTREAM -> mapOf("User-Agent" to "IPTVSmartersPro/3.1.5 (Linux; Android 11)")
+            else -> mapOf("User-Agent" to "IPTVSmartersPro/3.1.5 (Linux; Android 11)")
+        }
+    }
 
     suspend fun resolveStreamUrl(playlist: Playlist, item: IptvItem, mediaType: String = "live"): Pair<String, Map<String, String>> = withContext(Dispatchers.IO) {
-        when (playlist.type.lowercase()) {
-            "mac", "stalker" -> resolveStalkerStreamUrl(playlist, item, mediaType)
-            else -> Pair(item.url ?: "", emptyMap())
+        val result = when (IptvSourceType.fromPlaylist(playlist)) {
+            IptvSourceType.STALKER -> stalkerSource.resolveStreamUrl(playlist, item, mediaType)
+            IptvSourceType.XTREAM -> Pair(item.url ?: "", getStreamHeaders(playlist))
+            IptvSourceType.M3U -> m3uSource.resolveStreamUrl(playlist, item)
+            IptvSourceType.UNKNOWN -> Pair(item.url ?: "", getStreamHeaders(playlist))
         }
+        if (result.first.isNotBlank()) {
+            com.example.motor.player.PlayerRepository.registerStreamReResolver(result.first) {
+                when (IptvSourceType.fromPlaylist(playlist)) {
+                    IptvSourceType.STALKER -> stalkerSource.resolveStreamUrl(playlist, item, mediaType)
+                    IptvSourceType.XTREAM -> Pair(item.url ?: "", getStreamHeaders(playlist))
+                    IptvSourceType.M3U -> m3uSource.resolveStreamUrl(playlist, item)
+                    IptvSourceType.UNKNOWN -> Pair(item.url ?: "", getStreamHeaders(playlist))
+                }
+            }
+        }
+        result
     }
 
-    private suspend fun resolveStalkerStreamUrl(playlist: Playlist, item: IptvItem, mediaType: String): Pair<String, Map<String, String>> = withContext(Dispatchers.IO) {
-        val plIdStr = playlist.id.toString()
-        var session = sessionRepo.getStalkerSession(plIdStr)
-        if (session == null || (session["token"] as? String).isNullOrEmpty()) {
-            sessionRepo.reconnectActivePlaylistSilently()
-            session = sessionRepo.getStalkerSession(plIdStr)
-        }
+    // ─── CATALOG FETCHING & CREDENTIAL RESOLUTION ───────────────────────
 
-        if (session == null) {
-            return@withContext Pair(item.url ?: "", emptyMap())
-        }
+    fun parseXtreamCredentialsDirect(rawInput: String): XtreamCredentials? {
+        return xtreamSource.parseCredentialsDirect(rawInput)
+    }
 
-        val cmd = item.stalkerCmd ?: item.url ?: ""
-        val resolvedUrl = StalkerParser.resolveStalkerPlayLink(session, cmd, if (mediaType == "live") "itv" else mediaType)
+    suspend fun resolveXtreamCredentials(rawInput: String): XtreamCredentials? = withContext(Dispatchers.IO) {
+        xtreamSource.resolveCredentials(rawInput)
+    }
 
-        val macClean = playlist.mac.trim().uppercase()
-        val device = if (playlist.stalkerDeviceJson.isNotBlank()) JsonUtils.stalkerDeviceFromJson(playlist.stalkerDeviceJson) else StalkerDevice()
-        val token = (session["token"] as? String) ?: ""
-        val userAgent = if (device.userAgent.isNotBlank()) device.userAgent else "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 (KHTML, like Gecko) MAG200 stbapp ver: 2 rev: 250 Safari/533.3"
-        val cookieHeader = if (token.isNotEmpty()) "mac=$macClean; stb_lang=en; timezone=Europe/Madrid; token=$token;" else "mac=$macClean; stb_lang=en; timezone=Europe/Madrid;"
+    suspend fun fetchXtreamCatalog(
+        host: String,
+        port: String,
+        user: String,
+        pass: String,
+        onProgress: (String) -> Unit
+    ): Map<String, List<IptvItem>> = withContext(Dispatchers.IO) {
+        xtreamSource.fetchCatalog(host, port, user, pass, onProgress)
+    }
 
-        val portalUrl = (session["portalUrl"] as? String) ?: playlist.host
-        val portalBase = portalUrl.substringBefore("/c/").substringBefore("/portal").substringBefore("/server").removeSuffix("/")
+    suspend fun fetchM3uCatalog(
+        playlist: Playlist,
+        onProgress: (String) -> Unit
+    ): Map<String, List<IptvItem>> = withContext(Dispatchers.IO) {
+        m3uSource.fetchCatalog(playlist, onProgress)
+    }
 
-        val headers = mutableMapOf(
-            "User-Agent" to userAgent,
-            "Cookie" to cookieHeader,
-            "X-User-Agent" to (if (device.xUserAgent.isNotBlank()) device.xUserAgent else "Model: MAG254; Link: Ethernet"),
-            "Accept" to "*/*"
+    suspend fun fetchStalkerCatalog(
+        host: String,
+        mac: String,
+        device: StalkerDevice,
+        onProgress: (String) -> Unit,
+        onPartialUpdate: (String, List<IptvItem>) -> Unit,
+        onSessionReady: (Map<String, Any>) -> Unit,
+        playlistId: Long? = null
+    ): Map<String, Any> = withContext(Dispatchers.IO) {
+        stalkerSource.fetchCatalog(
+            host = host,
+            mac = mac,
+            device = device,
+            onProgress = onProgress,
+            onPartialUpdate = onPartialUpdate,
+            onSessionReady = onSessionReady,
+            playlistId = playlistId
         )
-        if (portalBase.isNotBlank()) {
-            headers["Referer"] = "$portalBase/c/"
-        }
-
-        Pair(resolvedUrl, headers)
     }
+
+    suspend fun performStalkerHandshake(
+        host: String,
+        mac: String,
+        device: StalkerDevice,
+        playlistId: Long? = null
+    ): Map<String, Any> = withContext(Dispatchers.IO) {
+        stalkerSource.performHandshake(host, mac, device, playlistId)
+    }
+
+    suspend fun fetchStalkerTv(
+        host: String,
+        mac: String,
+        device: StalkerDevice,
+        onProgress: (String) -> Unit = {},
+        onPartialUpdate: ((type: String, items: List<IptvItem>) -> Unit)? = null,
+        existingSession: Map<String, Any>? = null
+    ): List<IptvItem> = withContext(Dispatchers.IO) {
+        stalkerSource.fetchTv(host, mac, device, onProgress, onPartialUpdate, existingSession)
+    }
+
+    suspend fun fetchStalkerVod(
+        host: String,
+        mac: String,
+        device: StalkerDevice,
+        onProgress: (String) -> Unit = {},
+        onPartialUpdate: ((type: String, items: List<IptvItem>) -> Unit)? = null,
+        existingSession: Map<String, Any>? = null
+    ): List<IptvItem> = withContext(Dispatchers.IO) {
+        stalkerSource.fetchVod(host, mac, device, onProgress, onPartialUpdate, existingSession)
+    }
+
+    suspend fun fetchStalkerSeries(
+        host: String,
+        mac: String,
+        device: StalkerDevice,
+        onProgress: (String) -> Unit = {},
+        onPartialUpdate: ((type: String, items: List<IptvItem>) -> Unit)? = null,
+        existingSession: Map<String, Any>? = null
+    ): List<IptvItem> = withContext(Dispatchers.IO) {
+        stalkerSource.fetchSeries(host, mac, device, onProgress, onPartialUpdate, existingSession)
+    }
+
+    // ─── MEDIA METADATA FETCHING (XTREAM / VOD) ──────────────────────────
+
+    suspend fun fetchXtreamVodInfo(
+        host: String,
+        port: String,
+        user: String,
+        pass: String,
+        vodId: String
+    ): Map<String, Any?>? = withContext(Dispatchers.IO) {
+        xtreamSource.fetchVodInfo(host, port, user, pass, vodId)
+    }
+
+    suspend fun fetchXtreamSeriesInfo(
+        host: String,
+        port: String,
+        user: String,
+        pass: String,
+        seriesId: String
+    ): Map<String, Any?>? = withContext(Dispatchers.IO) {
+        xtreamSource.fetchSeriesInfo(host, port, user, pass, seriesId)
+    }
+
 
     companion object {
         @Volatile
@@ -333,6 +438,14 @@ class IptvRepository private constructor(
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: IptvRepository(application, sessionRepo).also { INSTANCE = it }
             }
+        }
+
+        fun isDividerOrHeader(name: String): Boolean {
+            return BaseEngine.isDividerOrHeader(name)
+        }
+
+        fun cleanTitleAndExtractYear(rawTitle: String): TmdbService.CleanedTitle {
+            return TmdbRepository.getInstance().cleanTitleAndExtractYear(rawTitle)
         }
     }
 }

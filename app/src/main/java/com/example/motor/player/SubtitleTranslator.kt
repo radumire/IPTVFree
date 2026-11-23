@@ -5,23 +5,22 @@ import android.util.Log
 import com.example.motor.parser.BaseEngine
 import com.example.motor.tmdb.TmdbService
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.net.URLEncoder
+import java.util.concurrent.TimeUnit
 
 object SubtitleTranslator {
     private const val TAG = "SubtitleTranslator"
 
-    private val LINGVA_INSTANCES = listOf(
-        "https://lingva.ml/api/v1",
-        "https://translate.lingva.ml/api/v1",
-        "https://lingva.thedaviddelta.com/api/v1",
-        "https://lingva.lunar.icu/api/v1",
-        "https://lingva.garudalinux.org/api/v1",
-        "https://lingva.pussthecat.org/api/v1"
-    )
+    private const val ANDROID_TRANSLATE_UA = "AndroidTranslate/5.3.0.RC02.130475354-53000263 5.1 phone TRANSLATE_OPM5_TEST_1"
 
     private val BROWSER_HEADERS = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -29,10 +28,17 @@ object SubtitleTranslator {
         "Referer" to "https://www.subtitlecat.com/"
     )
 
+    private val LINGVA_INSTANCES = listOf(
+        "https://lingva.ml/api/v1",
+        "https://translate.lingva.ml/api/v1",
+        "https://lingva.thedaviddelta.com/api/v1"
+    )
+
     suspend fun translateSubtitleUrl(
         context: Context,
         subUrl: String,
-        targetLanguage: String // "es" or "ro"
+        targetLanguage: String, // "es" or "ro"
+        onProgressiveReady: ((String) -> Unit)? = null
     ): String? = withContext(Dispatchers.IO) {
         try {
             Log.d(TAG, "Starting subtitle translation for: $subUrl -> $targetLanguage")
@@ -43,19 +49,36 @@ object SubtitleTranslator {
             }
 
             Log.d(TAG, "Original subtitle fetched (${originalContent.length} chars). Translating dialogue...")
-            val translatedContent = translateSubtitleContent(originalContent, targetLanguage)
+
+            val isVtt = originalContent.trimStart().startsWith("WEBVTT", ignoreCase = true) ||
+                    subUrl.contains(".vtt", ignoreCase = true)
+            val ext = if (isVtt) "vtt" else "srt"
+            val cacheDir = context.cacheDir
+            val filename = "translated_${System.currentTimeMillis()}_${targetLanguage}.$ext"
+            val file = File(cacheDir, filename)
+
+            val translatedContent = translateSubtitleContent(
+                content = originalContent,
+                targetLang = targetLanguage,
+                onInitialBatchDone = { partialContent ->
+                    try {
+                        file.writeText(partialContent, Charsets.UTF_8)
+                        Log.d(TAG, "Progressive subtitle saved to: ${file.absolutePath}")
+                        onProgressiveReady?.invoke(file.absolutePath)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to write progressive subtitle", e)
+                    }
+                }
+            )
+
             if (translatedContent.isNullOrBlank()) {
                 Log.e(TAG, "Translation produced empty content")
                 return@withContext null
             }
 
-            // Save the translated file locally in the cache directory
-            val cacheDir = context.cacheDir
-            val filename = "translated_${System.currentTimeMillis()}_${targetLanguage}.srt"
-            val file = File(cacheDir, filename)
+            // Save the complete translated file locally in the cache directory
             file.writeText(translatedContent, Charsets.UTF_8)
-
-            Log.d(TAG, "Translated subtitle saved locally to: ${file.absolutePath}")
+            Log.d(TAG, "Complete translated subtitle saved to: ${file.absolutePath}")
             return@withContext file.absolutePath
         } catch (e: Exception) {
             Log.e(TAG, "Error during subtitle translation", e)
@@ -96,7 +119,7 @@ object SubtitleTranslator {
                 }
 
                 // If it's HTML, resolve direct link from page (e.g. SubtitleCat download links)
-                val directLink = TmdbService.extractDirectSubtitleLinkFromHtml(response, currentUrl)
+                val directLink = com.example.motor.subtitles.SubtitleResolver.extractDirectSubtitleLinkFromHtml(response, currentUrl)
                 if (directLink != null && directLink != currentUrl) {
                     Log.d(TAG, "Resolved direct subtitle link from HTML: $directLink")
                     currentUrl = directLink
@@ -113,7 +136,11 @@ object SubtitleTranslator {
         }
     }
 
-    private suspend fun translateSubtitleContent(content: String, targetLang: String): String? {
+    private suspend fun translateSubtitleContent(
+        content: String,
+        targetLang: String,
+        onInitialBatchDone: ((String) -> Unit)? = null
+    ): String? = coroutineScope {
         val lines = content.split(Regex("\\r?\\n"))
         val translatedLines = lines.toMutableList()
 
@@ -148,80 +175,185 @@ object SubtitleTranslator {
         }
 
         if (textsToTranslate.isEmpty()) {
-            return content
+            return@coroutineScope content
         }
 
         Log.d(TAG, "Found ${textsToTranslate.size} dialogue lines to translate to $targetLang")
 
-        // Batch translate in chunks of 20 lines or ~700 characters
-        val batchLimit = 700
-        var currentBatchText = StringBuilder()
-        val currentBatchIndices = mutableListOf<Int>()
+        // Group into batches of ~35 lines or ~1800 chars
+        val batchLimitChars = 1800
+        val batchLimitLines = 35
+
+        data class Batch(val text: String, val indices: List<Int>)
+        val batches = mutableListOf<Batch>()
+
+        var curText = StringBuilder()
+        val curIndices = mutableListOf<Int>()
 
         for (i in textsToTranslate.indices) {
             val text = textsToTranslate[i]
             val indexInLines = textIndices[i]
 
-            if (currentBatchText.length + text.length + 1 > batchLimit && currentBatchText.isNotEmpty()) {
-                translateAndApplyBatch(currentBatchText.toString(), currentBatchIndices, translatedLines, targetLang)
-                currentBatchText = StringBuilder()
-                currentBatchIndices.clear()
+            if ((curIndices.size >= batchLimitLines || curText.length + text.length + 1 > batchLimitChars) && curIndices.isNotEmpty()) {
+                batches.add(Batch(curText.toString(), curIndices.toList()))
+                curText = StringBuilder()
+                curIndices.clear()
             }
 
-            if (currentBatchText.isNotEmpty()) {
-                currentBatchText.append("\n")
+            if (curText.isNotEmpty()) {
+                curText.append("\n")
             }
-            currentBatchText.append(text)
-            currentBatchIndices.add(indexInLines)
+            curText.append(text)
+            curIndices.add(indexInLines)
         }
 
-        if (currentBatchText.isNotEmpty()) {
-            translateAndApplyBatch(currentBatchText.toString(), currentBatchIndices, translatedLines, targetLang)
+        if (curIndices.isNotEmpty()) {
+            batches.add(Batch(curText.toString(), curIndices.toList()))
         }
 
-        return translatedLines.joinToString("\n")
-    }
+        Log.d(TAG, "Split dialogue into ${batches.size} batches for parallel translation")
 
-    private suspend fun translateAndApplyBatch(
-        batchText: String,
-        indices: List<Int>,
-        translatedLines: MutableList<String>,
-        targetLang: String
-    ) {
-        if (batchText.isBlank() || indices.isEmpty()) return
+        // Concurrency limiter to avoid network flooding
+        val semaphore = Semaphore(4)
+        var initialReported = false
 
-        try {
-            val translatedBatch = translateTextWithLingvaOrFallbacks(batchText, targetLang)
-            if (translatedBatch.isNullOrBlank()) {
-                Log.w(TAG, "Batch translation returned empty, retaining original lines")
-                return
-            }
+        // Translate in parallel
+        val deferreds = batches.mapIndexed { batchIdx, batch ->
+            async(Dispatchers.IO) {
+                val translatedSegments = semaphore.withPermit {
+                    translateBatchLines(batch.text, batch.indices.size, targetLang)
+                }
 
-            val translatedSegments = translatedBatch.split(Regex("\\r?\\n"))
-            for (j in indices.indices) {
-                if (j < translatedSegments.size) {
-                    val originalIndex = indices[j]
-                    var segment = translatedSegments[j].trim()
+                synchronized(translatedLines) {
+                    applyTranslatedSegments(translatedSegments, batch.indices, translatedLines)
+                }
 
-                    // Fix distorted HTML tags
-                    segment = segment
-                        .replace("< i >", "<i>")
-                        .replace("< / i >", "</i>")
-                        .replace("< b >", "<b>")
-                        .replace("< / b >", "</b>")
-                        .replace("< u >", "<u>")
-                        .replace("< / u >", "</u>")
-                        .replace("< font color = ", "<font color=")
-                        .replace("< / font >", "</font>")
-                        .replace("< /font>", "</font>")
-
-                    if (segment.isNotEmpty()) {
-                        translatedLines[originalIndex] = segment
+                // If batch 0 completes, optionally trigger progressive callback
+                if (batchIdx == 0 && !initialReported) {
+                    initialReported = true
+                    try {
+                        val snapshot = synchronized(translatedLines) { translatedLines.joinToString("\n") }
+                        onInitialBatchDone?.invoke(snapshot)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Initial batch callback error: ${e.message}")
                     }
                 }
             }
+        }
+
+        deferreds.awaitAll()
+
+        return@coroutineScope translatedLines.joinToString("\n")
+    }
+
+    private fun applyTranslatedSegments(
+        segments: List<String>?,
+        indices: List<Int>,
+        translatedLines: MutableList<String>
+    ) {
+        if (segments == null || segments.isEmpty()) return
+        for (j in indices.indices) {
+            val lineIdx = indices[j]
+            if (j < segments.size) {
+                val cleaned = cleanHtmlTags(segments[j].trim())
+                if (cleaned.isNotBlank()) {
+                    translatedLines[lineIdx] = cleaned
+                }
+            }
+        }
+    }
+
+    private suspend fun translateBatchLines(
+        batchText: String,
+        expectedLineCount: Int,
+        targetLang: String
+    ): List<String>? = withContext(Dispatchers.IO) {
+        if (batchText.isBlank()) return@withContext null
+
+        // 1. Official Google Translate Android Client (Fast POST, handles newlines & paragraphs)
+        val gAndroid = translateChunkViaGoogleAndroid(batchText, targetLang)
+        if (gAndroid != null && gAndroid.isNotBlank()) {
+            val lines = gAndroid.split(Regex("\\r?\\n")).map { it.trim() }
+            if (lines.isNotEmpty()) {
+                return@withContext lines
+            }
+        }
+
+        // 2. Google Translate Chrome Extension Client
+        val gChrome = translateChunkViaChromeEx(batchText, targetLang)
+        if (gChrome != null && gChrome.isNotBlank()) {
+            val lines = gChrome.split(Regex("\\r?\\n")).map { it.trim() }
+            if (lines.isNotEmpty()) {
+                return@withContext lines
+            }
+        }
+
+        // 3. Fallback Lingva / MyMemory
+        val lingva = translateTextWithLingvaOrFallbacks(batchText, targetLang)
+        if (lingva != null && lingva.isNotBlank()) {
+            val lines = lingva.split(Regex("\\r?\\n")).map { it.trim() }
+            if (lines.isNotEmpty()) {
+                return@withContext lines
+            }
+        }
+
+        null
+    }
+
+    private fun translateChunkViaGoogleAndroid(text: String, targetLang: String): String? {
+        return try {
+            val url = "https://translate.google.com/translate_a/single?client=at&sl=auto&tl=$targetLang&dt=t"
+            val body = okhttp3.FormBody.Builder(Charsets.UTF_8)
+                .add("q", text)
+                .build()
+            val request = okhttp3.Request.Builder()
+                .url(url)
+                .post(body)
+                .header("User-Agent", ANDROID_TRANSLATE_UA)
+                .header("Accept", "*/*")
+                .build()
+            val okClient = BaseEngine.client.newBuilder()
+                .connectTimeout(8, TimeUnit.SECONDS)
+                .readTimeout(12, TimeUnit.SECONDS)
+                .build()
+            okClient.newCall(request).execute().use { response ->
+                if (response.isSuccessful) {
+                    val responseStr = response.body?.string().orEmpty()
+                    parseGoogleTranslateResponse(responseStr)
+                } else {
+                    Log.w(TAG, "Google Translate Android HTTP ${response.code}")
+                    null
+                }
+            }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to apply translated batch", e)
+            Log.w(TAG, "Google Translate Android error: ${e.message}")
+            null
+        }
+    }
+
+    private fun translateChunkViaChromeEx(text: String, targetLang: String): String? {
+        return try {
+            val encoded = URLEncoder.encode(text, "UTF-8")
+            val url = "https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=auto&tl=$targetLang&q=$encoded"
+            val request = okhttp3.Request.Builder()
+                .url(url)
+                .get()
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+                .build()
+            val okClient = BaseEngine.client.newBuilder()
+                .connectTimeout(8, TimeUnit.SECONDS)
+                .readTimeout(10, TimeUnit.SECONDS)
+                .build()
+            okClient.newCall(request).execute().use { response ->
+                if (response.isSuccessful) {
+                    val resp = response.body?.string().orEmpty()
+                    val arr = JSONArray(resp)
+                    val first = arr.optJSONArray(0)
+                    first?.optString(0, "")
+                } else null
+            }
+        } catch (e: Exception) {
+            null
         }
     }
 
@@ -232,7 +364,7 @@ object SubtitleTranslator {
             return null
         }
 
-        // 1. Try Lingva public instances
+        // Try Lingva public instances
         for (instance in LINGVA_INSTANCES) {
             try {
                 val url = "$instance/auto/$targetLang/$encodedText"
@@ -249,19 +381,7 @@ object SubtitleTranslator {
             }
         }
 
-        // 2. Fallback to Google Translate GTX endpoint (Free / SubStudio compatible)
-        try {
-            val gtxUrl = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=$targetLang&dt=t&q=$encodedText"
-            val response = BaseEngine.executeGetRequest(gtxUrl, BROWSER_HEADERS)
-            val parsed = parseGoogleTranslateResponse(response)
-            if (parsed.isNotBlank()) {
-                return parsed
-            }
-        } catch (e: Exception) {
-            Log.d(TAG, "Google GTX fallback failed: ${e.message}")
-        }
-
-        // 3. Fallback to MyMemory Free Translation API
+        // Fallback to MyMemory Free Translation API
         try {
             val myMemoryUrl = "https://api.mymemory.translated.net/get?q=$encodedText&langpair=autodetect|$targetLang"
             val response = BaseEngine.executeGetRequest(myMemoryUrl, BROWSER_HEADERS)
@@ -297,8 +417,27 @@ object SubtitleTranslator {
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to parse Google Translate GTX response", e)
+            Log.e(TAG, "Failed to parse Google Translate response", e)
         }
         return result.toString()
+    }
+
+    private fun cleanHtmlTags(str: String): String {
+        return str
+            .replace("< i >", "<i>", ignoreCase = true)
+            .replace("< / i >", "</i>", ignoreCase = true)
+            .replace("< /i >", "</i>", ignoreCase = true)
+            .replace("< /i>", "</i>", ignoreCase = true)
+            .replace("< b >", "<b>", ignoreCase = true)
+            .replace("< / b >", "</b>", ignoreCase = true)
+            .replace("< /b >", "</b>", ignoreCase = true)
+            .replace("< /b>", "</b>", ignoreCase = true)
+            .replace("< u >", "<u>", ignoreCase = true)
+            .replace("< / u >", "</u>", ignoreCase = true)
+            .replace("< /u >", "</u>", ignoreCase = true)
+            .replace("< /u>", "</u>", ignoreCase = true)
+            .replace("< font color = ", "<font color=", ignoreCase = true)
+            .replace("< / font >", "</font>", ignoreCase = true)
+            .replace("< /font>", "</font>", ignoreCase = true)
     }
 }

@@ -31,7 +31,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import android.app.UiModeManager
 import android.content.Context
 import android.content.pm.PackageManager
@@ -44,7 +43,6 @@ import com.example.interfaz.components.TvIconButton
 import com.example.interfaz.components.TV_FOCUSED_BG
 import com.example.interfaz.components.TV_FOCUSED_TEXT
 import com.example.motor.db.IptvItem
-import com.example.motor.repository.TmdbRepository
 import com.example.motor.repository.MediaDetails
 import com.example.parseHexColor
 
@@ -56,7 +54,9 @@ fun MovieDetailFullScreen(
     onPlay: () -> Unit,
     onBack: () -> Unit,
     theme: AppThemeColors,
-    activePlaylist: com.example.motor.config.Playlist? = null
+    onFetchDetails: (suspend (IptvItem) -> MediaDetails?)? = null,
+    onSearchSubtitles: (suspend (String) -> Unit)? = null,
+    onGetCachedYear: ((String) -> Int?)? = null
 ) {
     var details by remember(movie.name) { mutableStateOf<MediaDetails?>(null) }
     var isLoading by remember(movie.name) { mutableStateOf(true) }
@@ -69,28 +69,18 @@ fun MovieDetailFullScreen(
         val isTvMode = uiModeManager?.currentModeType == Configuration.UI_MODE_TYPE_TELEVISION
         isLeanback || isTvMode
     }
-    val sessionRepo = remember(context) {
-        com.example.motor.repository.PortalSessionRepository.getInstance(context.applicationContext as android.app.Application)
-    }
-    val currentActivePlaylist by sessionRepo.activePlaylist.collectAsStateWithLifecycle()
-    val resolvedPlaylist = activePlaylist ?: currentActivePlaylist
 
-    LaunchedEffect(movie.name, resolvedPlaylist?.id) {
+    LaunchedEffect(movie.name) {
         isLoading = true
         try {
-            val result = TmdbRepository.getInstance().fetchXtreamMediaDetails(
-                item = movie,
-                activePlaylist = resolvedPlaylist,
-                isSeries = false
-            )
-            details = result
+            details = onFetchDetails?.invoke(movie)
         } catch (e: Exception) {
             e.printStackTrace()
         } finally {
             isLoading = false
         }
         try {
-            TmdbRepository.getInstance().searchSubtitles(rawTitle = movie.name, isSeries = false)
+            onSearchSubtitles?.invoke(movie.name)
         } catch (_: Exception) {}
     }
 
@@ -314,7 +304,7 @@ fun MovieDetailFullScreen(
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                                 modifier = Modifier.fillMaxWidth()
                             ) {
-                                val year = details?.year ?: TmdbRepository.getInstance().getCachedYear(movie.name, isSeries = false) ?: movie.year
+                                val year = details?.year ?: onGetCachedYear?.invoke(movie.name) ?: movie.year
                                 if (year != null && year > 0) {
                                     Surface(
                                         color = Color.White.copy(alpha = 0.12f),
@@ -387,7 +377,7 @@ fun MovieDetailFullScreen(
                                     .clip(RoundedCornerShape(10.dp))
                                     .background(surfaceColor.copy(alpha = 0.6f))
                                     .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(10.dp))
-                                    .clickable {
+                                    .tvClickable(shape = RoundedCornerShape(10.dp)) {
                                         val curOverview = details?.overview?.trim() ?: ""
                                         if (curOverview.isNotBlank() && curOverview != "Sin sinopsis disponible para este contenido." && curOverview != "Sin sinopsis disponible.") {
                                             showFullSynopsisDialog = true
@@ -490,7 +480,7 @@ fun MovieDetailFullScreen(
                                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                                     modifier = Modifier.fillMaxWidth()
                                 ) {
-                                    val year = details?.year ?: TmdbRepository.getInstance().getCachedYear(movie.name, isSeries = false) ?: movie.year
+                                    val year = details?.year ?: onGetCachedYear?.invoke(movie.name) ?: movie.year
                                     if (year != null && year > 0) {
                                         Surface(
                                             color = Color.White.copy(alpha = 0.12f),
@@ -617,7 +607,7 @@ fun MovieDetailFullScreen(
                                 .clip(RoundedCornerShape(8.dp))
                                 .background(surfaceColor.copy(alpha = 0.6f))
                                 .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(8.dp))
-                                .clickable {
+                                .tvClickable(shape = RoundedCornerShape(8.dp)) {
                                     val curOverview = details?.overview?.trim() ?: ""
                                     if (curOverview.isNotBlank() && curOverview != "Sin sinopsis disponible para este contenido." && curOverview != "Sin sinopsis disponible.") {
                                         showFullSynopsisDialog = true
@@ -775,35 +765,26 @@ fun MovieDetailModal(
     onPlay: () -> Unit,
     onDismiss: () -> Unit,
     theme: AppThemeColors,
-    activePlaylist: com.example.motor.config.Playlist? = null
+    activePlaylist: com.example.motor.config.Playlist? = null,
+    onFetchDetails: (suspend (IptvItem) -> MediaDetails?)? = null,
+    onSearchSubtitles: (suspend (String) -> Unit)? = null,
+    onGetCachedYear: ((String) -> Int?)? = null
 ) {
     var details by remember { mutableStateOf<MediaDetails?>(null) }
     var isLoading by remember { mutableStateOf(true) }
     var showFullSynopsisDialog by remember { mutableStateOf(false) }
 
-    val context = androidx.compose.ui.platform.LocalContext.current
-    val sessionRepo = remember(context) {
-        com.example.motor.repository.PortalSessionRepository.getInstance(context.applicationContext as android.app.Application)
-    }
-    val currentActivePlaylist by sessionRepo.activePlaylist.collectAsStateWithLifecycle()
-    val resolvedPlaylist = activePlaylist ?: currentActivePlaylist
-
-    LaunchedEffect(movie.name, resolvedPlaylist?.id) {
+    LaunchedEffect(movie.name, activePlaylist?.id) {
         isLoading = true
         try {
-            val result = TmdbRepository.getInstance().fetchXtreamMediaDetails(
-                item = movie,
-                activePlaylist = resolvedPlaylist,
-                isSeries = false
-            )
-            details = result
+            details = onFetchDetails?.invoke(movie)
         } catch (e: Exception) {
             e.printStackTrace()
         } finally {
             isLoading = false
         }
         try {
-            TmdbRepository.getInstance().searchSubtitles(rawTitle = movie.name, isSeries = false)
+            onSearchSubtitles?.invoke(movie.name)
         } catch (_: Exception) {}
     }
 
@@ -1016,7 +997,7 @@ fun MovieDetailModal(
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                                 modifier = Modifier.fillMaxWidth()
                             ) {
-                                val year = details?.year ?: TmdbRepository.getInstance().getCachedYear(movie.name, isSeries = false) ?: movie.year
+                                val year = details?.year ?: onGetCachedYear?.invoke(movie.name) ?: movie.year
                                 if (year != null && year > 0) {
                                     Surface(
                                         color = Color.White.copy(alpha = 0.12f),
@@ -1088,7 +1069,7 @@ fun MovieDetailModal(
                                     .fillMaxWidth()
                                     .clip(RoundedCornerShape(12.dp))
                                     .background(Color.Black.copy(alpha = 0.25f))
-                                    .clickable {
+                                    .tvClickable(shape = RoundedCornerShape(12.dp)) {
                                         val curOverview = details?.overview?.trim() ?: ""
                                         if (curOverview.isNotBlank() && curOverview != "Sin sinopsis disponible para este contenido." && curOverview != "Sin sinopsis disponible.") {
                                             showFullSynopsisDialog = true
@@ -1192,7 +1173,7 @@ fun MovieDetailModal(
                                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                                     modifier = Modifier.fillMaxWidth()
                                 ) {
-                                    val year = details?.year ?: TmdbRepository.getInstance().getCachedYear(movie.name, isSeries = false) ?: movie.year
+                                    val year = details?.year ?: onGetCachedYear?.invoke(movie.name) ?: movie.year
                                     if (year != null && year > 0) {
                                         Surface(
                                             color = Color.White.copy(alpha = 0.12f),
@@ -1266,7 +1247,7 @@ fun MovieDetailModal(
                                 .heightIn(min = 90.dp, max = 180.dp)
                                 .clip(RoundedCornerShape(10.dp))
                                 .background(Color.Black.copy(alpha = 0.2f))
-                                .clickable {
+                                .tvClickable(shape = RoundedCornerShape(10.dp)) {
                                     val curOverview = details?.overview?.trim() ?: ""
                                     if (curOverview.isNotBlank() && curOverview != "Sin sinopsis disponible para este contenido." && curOverview != "Sin sinopsis disponible.") {
                                         showFullSynopsisDialog = true

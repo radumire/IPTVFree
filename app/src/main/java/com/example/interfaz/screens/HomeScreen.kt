@@ -33,77 +33,33 @@ import com.example.interfaz.viewmodel.HomeViewModel
 import com.example.interfaz.state.HomeState
 import com.example.interfaz.components.MovieDetailModal
 import com.example.interfaz.components.tvClickable
+import com.example.interfaz.components.tvCardFocusable
 import com.example.interfaz.components.TvButton
 import com.example.interfaz.components.TvIconButton
 import com.example.interfaz.components.TV_FOCUSED_BG
 import com.example.interfaz.components.TV_FOCUSED_TEXT
+import com.example.interfaz.components.rememberTvInitialFocusRequester
+import androidx.compose.ui.focus.FocusRequester
 
 @Composable
 fun HomeScreen(
     viewModel: HomeViewModel,
     onNavigate: (String) -> Unit,
-    onPlay: (src: String, title: String, type: String, drmScheme: String?, drmLicenseUrl: String?) -> Unit,
+    onPlay: (src: String, title: String, type: String, drmScheme: String?, drmLicenseUrl: String?, headers: Map<String, String>) -> Unit,
+    onOpenSeries: (IptvItem) -> Unit = {},
     theme: AppThemeColors
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     var selectedMovieItem by remember { mutableStateOf<IptvItem?>(null) }
     val scope = rememberCoroutineScope()
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val initialFocusRequester = rememberTvInitialFocusRequester()
 
     Box(modifier = Modifier.fillMaxSize()) {
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
             verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(24.dp)
         ) {
-            // Welcome Banner with direct Settings button
-            item {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(parseHexColor(theme.accent).copy(alpha = 0.15f))
-                        .padding(20.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = androidx.compose.foundation.layout.Arrangement.SpaceBetween
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "¡Hola de nuevo, ${uiState.activeProfile?.name ?: uiState.activeProfileName}!",
-                            color = Color.White,
-                            fontSize = 22.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Text(
-                            text = if (uiState.activePlaylistName.isNotEmpty()) "Lista activa: ${uiState.activePlaylistName}" else "No hay listas activas",
-                            color = Color.LightGray,
-                            fontSize = 13.sp,
-                            modifier = Modifier.padding(top = 4.dp)
-                        )
-                    }
-
-                    // Directly visible "Ajustes" button
-                    TvButton(
-                        onClick = { onNavigate("settings") },
-                        containerColor = parseHexColor(theme.accent),
-                        shape = RoundedCornerShape(8.dp),
-                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp)
-                    ) { isFocused ->
-                        Icon(
-                            imageVector = Icons.Default.Settings,
-                            contentDescription = "Ajustes",
-                            tint = if (isFocused) TV_FOCUSED_TEXT else Color.White,
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "Ajustes",
-                            color = if (isFocused) TV_FOCUSED_TEXT else Color.White,
-                            fontSize = 13.sp,
-                            fontWeight = if (isFocused) FontWeight.ExtraBold else FontWeight.Bold
-                        )
-                    }
-                }
-            }
-
             // Live Real-Time Background Download Counter Panel (Stalker/MAC)
             if (uiState.isStalkerDownloading) {
                 item {
@@ -171,11 +127,14 @@ fun HomeScreen(
             item {
                 Row(
                     horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(16.dp),
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(IntrinsicSize.Max)
                 ) {
-                    MetricCard(title = "Canales de TV", count = uiState.totalLiveCount, icon = Icons.Default.Tv, onClick = { onNavigate("live_tv") }, theme = theme, modifier = Modifier.weight(1f))
-                    MetricCard(title = "Películas VOD", count = uiState.totalMoviesCount, icon = Icons.Default.Movie, onClick = { onNavigate("movies") }, theme = theme, modifier = Modifier.weight(1f))
-                    MetricCard(title = "Series", count = uiState.totalSeriesCount, icon = Icons.Default.VideoLibrary, onClick = { onNavigate("series") }, theme = theme, modifier = Modifier.weight(1f))
+                    MetricCard(title = "Canales de TV", count = uiState.totalLiveCount, icon = Icons.Default.Tv, onClick = { onNavigate("live_tv") }, theme = theme, modifier = Modifier.weight(1f).fillMaxHeight(), focusRequester = initialFocusRequester)
+                    MetricCard(title = "Películas VOD", count = uiState.totalMoviesCount, icon = Icons.Default.Movie, onClick = { onNavigate("movies") }, theme = theme, modifier = Modifier.weight(1f).fillMaxHeight())
+                    MetricCard(title = "Series", count = uiState.totalSeriesCount, icon = Icons.Default.VideoLibrary, onClick = { onNavigate("series") }, theme = theme, modifier = Modifier.weight(1f).fillMaxHeight())
+                    MetricCard(title = "Deportes", countText = "Agenda", icon = Icons.Default.SportsSoccer, onClick = { onNavigate("sports") }, theme = theme, modifier = Modifier.weight(1f).fillMaxHeight())
                 }
             }
 
@@ -201,13 +160,14 @@ fun HomeScreen(
                                 Column(
                                     modifier = Modifier
                                         .width(110.dp)
-                                        .clip(RoundedCornerShape(8.dp))
-                                        .tvClickable(
-                                            focusedBackgroundColor = TV_FOCUSED_BG,
-                                            unfocusedBackgroundColor = parseHexColor(theme.surface),
+                                        .tvCardFocusable(
+                                            shape = RoundedCornerShape(8.dp),
+                                            scaleFocused = 1.05f,
+                                            elevationFocused = 4.dp,
                                             onFocusChange = { isFocused = it },
                                             onClick = { selectedMovieItem = movie }
                                         )
+                                        .background(if (isFocused) TV_FOCUSED_BG else parseHexColor(theme.surface))
                                         .padding(6.dp),
                                     horizontalAlignment = Alignment.CenterHorizontally
                                 ) {
@@ -320,7 +280,8 @@ fun HomeScreen(
                             Text("Seguir Viendo", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
                             TvButton(
                                 onClick = { viewModel.clearAllPlaybackHistory() },
-                                containerColor = parseHexColor(theme.surface),
+                                containerColor = parseHexColor(theme.card).copy(alpha = 0.60f),
+                                focusedContainerColor = parseHexColor(theme.accent).copy(alpha = 0.35f),
                                 shape = RoundedCornerShape(6.dp),
                                 contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
                             ) { isFocused ->
@@ -343,7 +304,7 @@ fun HomeScreen(
                             horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(12.dp),
                             modifier = Modifier.fillMaxWidth()
                         ) {
-                            items(continueWatching.take(10), key = { it.src + it.title }) { hist ->
+                            items(continueWatching.take(10), key = { "${it.playlistId}_${it.src}_${it.title}" }) { hist ->
                                 var isFocused by remember { mutableStateOf(false) }
                                 Box(
                                     modifier = Modifier
@@ -351,9 +312,13 @@ fun HomeScreen(
                                         .clip(RoundedCornerShape(8.dp))
                                         .tvClickable(
                                             focusedBackgroundColor = TV_FOCUSED_BG,
-                                            unfocusedBackgroundColor = parseHexColor(theme.surface),
+                                            unfocusedBackgroundColor = parseHexColor(theme.card).copy(alpha = 0.60f),
                                             onFocusChange = { isFocused = it },
-                                            onClick = { onPlay(hist.src, hist.title, hist.type, null, null) }
+                                            onClick = {
+                                                if (viewModel.canPlayHistoryItem(hist)) {
+                                                    onPlay(hist.src, hist.title, hist.type, null, null, emptyMap())
+                                                }
+                                            }
                                         )
                                         .padding(10.dp)
                                 ) {
@@ -372,14 +337,14 @@ fun HomeScreen(
                                                 overflow = TextOverflow.Ellipsis,
                                                 modifier = Modifier.weight(1f)
                                             )
-                                            IconButton(
+                                            TvIconButton(
                                                 onClick = { viewModel.deletePlaybackHistory(hist.src) },
                                                 modifier = Modifier.size(22.dp)
-                                            ) {
+                                            ) { isCloseBtnFocused ->
                                                 Icon(
                                                     imageVector = Icons.Default.Close,
                                                     contentDescription = "Eliminar de seguir viendo",
-                                                    tint = if (isFocused) TV_FOCUSED_TEXT else Color.LightGray,
+                                                    tint = if (isCloseBtnFocused) TV_FOCUSED_TEXT else (if (isFocused) Color.White else Color.LightGray),
                                                     modifier = Modifier.size(16.dp)
                                                 )
                                             }
@@ -410,7 +375,7 @@ fun HomeScreen(
                             horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(12.dp),
                             modifier = Modifier.fillMaxWidth()
                         ) {
-                            items(favsList.take(6), key = { it.id + it.type }) { fav ->
+                            items(favsList.take(6), key = { "${it.playlistId}_${it.id}_${it.type}" }) { fav ->
                                 var isFocused by remember { mutableStateOf(false) }
                                 Box(
                                     modifier = Modifier
@@ -418,9 +383,28 @@ fun HomeScreen(
                                         .clip(RoundedCornerShape(8.dp))
                                         .tvClickable(
                                             focusedBackgroundColor = TV_FOCUSED_BG,
-                                            unfocusedBackgroundColor = parseHexColor(theme.surface),
+                                            unfocusedBackgroundColor = parseHexColor(theme.card).copy(alpha = 0.60f),
                                             onFocusChange = { isFocused = it },
-                                            onClick = { onPlay(fav.url, fav.title, fav.type, null, null) }
+                                            onClick = {
+                                                scope.launch {
+                                                    viewModel.setResolvingMovie(true)
+                                                    try {
+                                                        when (val res = viewModel.resolveFavorite(fav)) {
+                                                            is HomeViewModel.FavoriteResolution.PlayStream -> {
+                                                                onPlay(res.url, res.title, res.type, res.drmScheme, res.drmLicenseUrl, res.headers)
+                                                            }
+                                                            is HomeViewModel.FavoriteResolution.OpenSeries -> {
+                                                                onOpenSeries(res.seriesItem)
+                                                            }
+                                                            is HomeViewModel.FavoriteResolution.Error -> {
+                                                                android.widget.Toast.makeText(context, res.message, android.widget.Toast.LENGTH_SHORT).show()
+                                                            }
+                                                        }
+                                                    } finally {
+                                                        viewModel.setResolvingMovie(false)
+                                                    }
+                                                }
+                                            }
                                         )
                                         .padding(8.dp),
                                     contentAlignment = Alignment.Center
@@ -456,7 +440,7 @@ fun HomeScreen(
     }
 
     selectedMovieItem?.let { movie ->
-        val isFav = uiState.favorites.any { it.id == movie.name || it.url == movie.url }
+        val isFav = uiState.favorites.any { it.id == movie.name || (movie.url != null && it.url == movie.url) || it.title == movie.name }
         MovieDetailModal(
             movie = movie,
             isFav = isFav,
@@ -476,13 +460,13 @@ fun HomeScreen(
             },
             onPlay = {
                 if (!movie.url.isNullOrEmpty()) {
-                    onPlay(movie.url, movie.name, "movie", movie.drmScheme, movie.drmLicenseUrl)
+                    onPlay(movie.url, movie.name, "movie", movie.drmScheme, movie.drmLicenseUrl, emptyMap())
                 } else if (!movie.stalkerCmd.isNullOrEmpty()) {
                     scope.launch {
                         viewModel.setResolvingMovie(true)
                         try {
                             val resolved = viewModel.resolveStalkerPlayUrl(movie.stalkerCmd, "vod")
-                            onPlay(resolved, movie.name, "movie", movie.drmScheme, movie.drmLicenseUrl)
+                            onPlay(resolved, movie.name, "movie", movie.drmScheme, movie.drmLicenseUrl, emptyMap())
                         } catch (e: Exception) {
                             e.printStackTrace()
                         } finally {
@@ -493,7 +477,10 @@ fun HomeScreen(
             },
             onDismiss = { selectedMovieItem = null },
             theme = theme,
-            activePlaylist = uiState.activePlaylist
+            activePlaylist = uiState.activePlaylist,
+            onFetchDetails = { item -> viewModel.fetchXtreamMediaDetails(item, uiState.activePlaylist) },
+            onSearchSubtitles = { title -> viewModel.searchMovieSubtitles(title) },
+            onGetCachedYear = { title -> viewModel.getCachedYear(title) }
         )
     }
 
@@ -512,40 +499,47 @@ fun HomeScreen(
 @Composable
 fun MetricCard(
     title: String,
-    count: Int,
+    count: Int? = null,
+    countText: String? = null,
     icon: ImageVector,
     onClick: () -> Unit,
     theme: AppThemeColors,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    focusRequester: FocusRequester? = null
 ) {
     var isFocused by remember { mutableStateOf(false) }
     Card(
         colors = CardDefaults.cardColors(
-            containerColor = if (isFocused) TV_FOCUSED_BG else parseHexColor(theme.surface)
+            containerColor = parseHexColor(theme.surface)
         ),
         modifier = modifier
-            .clip(CardDefaults.shape)
-            .tvClickable(
-                focusedBackgroundColor = TV_FOCUSED_BG,
-                unfocusedBackgroundColor = parseHexColor(theme.surface),
+            .fillMaxHeight()
+            .tvCardFocusable(
+                shape = CardDefaults.shape,
+                scaleFocused = 1.04f,
+                elevationFocused = 6.dp,
+                focusRequester = focusRequester,
                 onFocusChange = { isFocused = it },
                 onClick = onClick
             )
     ) {
         Row(
-            modifier = Modifier.padding(16.dp).fillMaxWidth(),
+            modifier = Modifier
+                .padding(16.dp)
+                .fillMaxWidth()
+                .fillMaxHeight(),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(
                     text = title,
-                    color = if (isFocused) TV_FOCUSED_TEXT.copy(alpha = 0.8f) else Color.LightGray,
+                    color = if (isFocused) Color.White else Color.LightGray,
                     fontSize = 11.sp,
                     fontWeight = if (isFocused) FontWeight.Bold else FontWeight.Normal
                 )
                 Text(
-                    text = count.toString(),
-                    color = if (isFocused) TV_FOCUSED_TEXT else Color.White,
+                    text = countText ?: (count?.toString() ?: "•"),
+                    color = Color.White,
                     fontSize = 18.sp,
                     fontWeight = FontWeight.ExtraBold,
                     modifier = Modifier.padding(top = 4.dp)
@@ -554,7 +548,7 @@ fun MetricCard(
             Icon(
                 imageVector = icon,
                 contentDescription = null,
-                tint = if (isFocused) TV_FOCUSED_TEXT else parseHexColor(theme.accent),
+                tint = if (isFocused) Color.White else parseHexColor(theme.accent),
                 modifier = Modifier.size(28.dp)
             )
         }

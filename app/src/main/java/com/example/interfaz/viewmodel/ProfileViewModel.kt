@@ -46,15 +46,24 @@ class ProfileViewModel(application: Application) : AndroidViewModel(application)
     // ─── PROFILE OPERATIONS ───────────────────────────────────────────────────
 
     fun switchProfile(profile: UserProfile) {
+        sessionRepo.selectProfile(profile)
         viewModelScope.launch {
-            sessionRepo.selectProfile(profile)
+            val fresh = profileDao.getProfileById(profile.id)
+            if (fresh != null && sessionRepo.currentProfile.value?.id == profile.id && fresh != profile) {
+                sessionRepo.selectProfile(fresh)
+            }
         }
     }
 
-    fun addProfile(name: String, avatar: String, pin: String) {
+    fun logout() {
+        com.example.motor.repository.MediaCacheRepository.getInstance(getApplication()).setActivePlaylist(-1L)
+        sessionRepo.logoutProfile()
+    }
+
+    fun addProfile(name: String, avatar: String, pin: String = "", autoSelect: Boolean = false) {
         viewModelScope.launch {
             val all = profileDao.getAllProfiles()
-            val newId = System.currentTimeMillis()
+            val newId = maxOf(System.currentTimeMillis(), (all.maxOfOrNull { it.id } ?: 1L) + 1L)
             val newProfile = UserProfile(
                 id = newId,
                 name = name,
@@ -62,17 +71,21 @@ class ProfileViewModel(application: Application) : AndroidViewModel(application)
                 colorIdx = all.size,
                 pin = pin,
                 playlistsJson = "[]",
-                settingsJson = JsonUtils.settingsToJson(PlayerSettings())
+                settingsJson = JsonUtils.settingsToJson(PlayerSettings()),
+                themeId = "purple",
+                customThemesJson = "{}"
             )
             profileDao.insertProfile(newProfile)
-            sessionRepo.selectProfile(newProfile)
+            if (autoSelect) {
+                sessionRepo.selectProfile(newProfile)
+            }
         }
     }
 
-    fun updateProfile(id: Long, name: String, avatar: String, pin: String) {
+    fun updateProfile(id: Long, name: String, avatar: String, pin: String? = null) {
         viewModelScope.launch {
             val profile = profileDao.getProfileById(id) ?: return@launch
-            val updated = profile.copy(name = name, avatar = avatar, pin = pin)
+            val updated = profile.copy(name = name, avatar = avatar, pin = pin ?: profile.pin)
             profileDao.insertProfile(updated)
             if (currentProfile.value?.id == id) {
                 sessionRepo.selectProfile(updated)
@@ -82,12 +95,51 @@ class ProfileViewModel(application: Application) : AndroidViewModel(application)
 
     fun deleteProfile(id: Long) {
         viewModelScope.launch {
+            val all = profileDao.getAllProfiles()
+            val mainId = all.firstOrNull()?.id
+            if (mainId == id) return@launch
+            val target = all.find { it.id == id }
             profileDao.deleteProfileById(id)
+
+            if (target != null) {
+                val app = getApplication<Application>()
+                val deletedPlaylistIds = com.example.motor.config.JsonUtils
+                    .playlistsFromJson(target.playlistsJson)
+                    .map { it.id }
+                    .toSet()
+                val remainingPlaylistIds = all
+                    .filter { it.id != id }
+                    .flatMap { com.example.motor.config.JsonUtils.playlistsFromJson(it.playlistsJson) }
+                    .map { it.id }
+                    .toSet()
+                val orphanPlaylistIds = deletedPlaylistIds - remainingPlaylistIds
+
+                if (orphanPlaylistIds.isNotEmpty()) {
+                    val db = AppDatabase.getDatabase(app)
+                    val mediaCacheRepo = com.example.motor.repository.MediaCacheRepository.getInstance(app)
+                    val iptvRepo = com.example.motor.repository.IptvRepository.getInstance(app, sessionRepo)
+                    for (plId in orphanPlaylistIds) {
+                        try {
+                            mediaCacheRepo.clearCategoryCache(plId)
+                            iptvRepo.clearFileCache(plId.toString())
+                            db.playbackHistoryDao().clearForPlaylist(plId)
+                            db.favoriteItemDao().clearForPlaylist(plId)
+                            com.example.motor.repository.PlaylistConnectionGuard.clearAllForPlaylist(app, plId)
+                            sessionRepo.clearStalkerSession(plId.toString())
+                            sessionRepo.clearStalkerCompatState(plId.toString())
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+            }
+
             val current = currentProfile.value
             if (current?.id == id) {
                 val remaining = profileDao.getAllProfiles()
                 if (remaining.isNotEmpty()) {
                     sessionRepo.selectProfile(remaining.first())
+                } else {
+                    sessionRepo.logoutProfile()
                 }
             }
         }

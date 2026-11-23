@@ -1,9 +1,12 @@
 package com.example.interfaz
 
 import android.content.res.Configuration
+import android.util.Log
+import kotlinx.coroutines.launch
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.*
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -33,6 +36,10 @@ import com.example.interfaz.components.tvClickable
 import com.example.interfaz.components.TvIconButton
 import com.example.interfaz.components.TV_FOCUSED_BG
 import com.example.interfaz.components.TV_FOCUSED_TEXT
+import com.example.interfaz.components.TV_FOCUSED_BORDER
+import com.example.interfaz.components.LocalTvFocusAccent
+import com.example.interfaz.components.LocalTvFocusAccentLight
+import com.example.interfaz.components.ProfileAvatarImage
 import com.example.interfaz.screens.*
 import com.example.interfaz.viewmodel.HomeViewModel
 import com.example.interfaz.viewmodel.LiveTvViewModel
@@ -42,15 +49,19 @@ import com.example.interfaz.viewmodel.PlaylistViewModel
 import com.example.interfaz.viewmodel.ProfileViewModel
 import com.example.interfaz.viewmodel.SeriesViewModel
 import com.example.interfaz.viewmodel.SettingsViewModel
+import com.example.interfaz.viewmodel.SportsViewModel
 import com.example.motor.config.PlayerSettings
+import com.example.motor.config.JsonUtils
 
 data class MenuItem(val route: String, val title: String, val icon: ImageVector)
 
 @Composable
 fun MainAppTheme(colors: AppThemeColors, content: @Composable () -> Unit) {
+    val accent = parseHexColor(colors.accent)
+    val accentLight = parseHexColor(colors.accentLight)
     val materialScheme = darkColorScheme(
-        primary = parseHexColor(colors.accent),
-        secondary = parseHexColor(colors.accentLight),
+        primary = accent,
+        secondary = accentLight,
         background = parseHexColor(colors.bg),
         surface = parseHexColor(colors.surface),
         onPrimary = Color.White,
@@ -59,10 +70,15 @@ fun MainAppTheme(colors: AppThemeColors, content: @Composable () -> Unit) {
         onSurface = Color.White
     )
 
-    MaterialTheme(
-        colorScheme = materialScheme,
-        content = content
-    )
+    CompositionLocalProvider(
+        LocalTvFocusAccent provides accent,
+        LocalTvFocusAccentLight provides accentLight
+    ) {
+        MaterialTheme(
+            colorScheme = materialScheme,
+            content = content
+        )
+    }
 }
 
 // ─── CORE MAIN APPLICATION CONTAINER ──────────────────────────────────────────
@@ -77,48 +93,24 @@ fun AppContent(viewModel: MainViewModel, theme: AppThemeColors) {
     val settingsViewModel: SettingsViewModel = androidx.lifecycle.viewmodel.compose.viewModel()
     val playlistViewModel: PlaylistViewModel = androidx.lifecycle.viewmodel.compose.viewModel()
     val profileViewModel: ProfileViewModel = androidx.lifecycle.viewmodel.compose.viewModel()
+    val sportsViewModel: SportsViewModel = androidx.lifecycle.viewmodel.compose.viewModel()
+    val coroutineScope = rememberCoroutineScope()
 
-    val liveChannelsMap by viewModel.liveChannels.collectAsStateWithLifecycle()
-    val epgDataMap by viewModel.epgData.collectAsStateWithLifecycle()
-    val moviesMap by viewModel.movies.collectAsStateWithLifecycle()
-    val precomputedMoviesData by viewModel.precomputedMoviesData.collectAsStateWithLifecycle()
-    val seriesMap by viewModel.series.collectAsStateWithLifecycle()
-    val precomputedSeriesData by viewModel.precomputedSeriesData.collectAsStateWithLifecycle()
-    val isStalkerDownloading by viewModel.stalkerDownloading.collectAsStateWithLifecycle()
-    val stalkerDownloadStats by viewModel.stalkerDownloadStats.collectAsStateWithLifecycle()
+    val isStalkerDownloading by playlistViewModel.stalkerDownloading.collectAsStateWithLifecycle()
+    val stalkerDownloadStats by playlistViewModel.stalkerDownloadStats.collectAsStateWithLifecycle()
 
-    LaunchedEffect(liveChannelsMap) {
-        liveTvViewModel.updateLiveChannels(liveChannelsMap)
-        homeViewModel.updateChannels(liveChannelsMap)
-        settingsViewModel.updateLiveChannels(liveChannelsMap)
-    }
-    LaunchedEffect(epgDataMap) {
-        liveTvViewModel.updateEpgData(epgDataMap)
-    }
-    LaunchedEffect(moviesMap) {
-        moviesViewModel.updateMovies(moviesMap)
-    }
-    LaunchedEffect(precomputedMoviesData) {
-        moviesViewModel.updatePrecomputedData(precomputedMoviesData)
-        homeViewModel.updateMoviesData(precomputedMoviesData)
-        settingsViewModel.updateMoviesData(precomputedMoviesData)
-    }
-    LaunchedEffect(seriesMap) {
-        seriesViewModel.updateSeries(seriesMap)
-    }
-    LaunchedEffect(precomputedSeriesData) {
-        seriesViewModel.updatePrecomputedData(precomputedSeriesData)
-        homeViewModel.updateSeriesData(precomputedSeriesData)
-        settingsViewModel.updateSeriesData(precomputedSeriesData)
-    }
     LaunchedEffect(isStalkerDownloading, stalkerDownloadStats) {
         homeViewModel.updateStalkerDownloadState(isStalkerDownloading, stalkerDownloadStats)
     }
 
-    val currentProfile by viewModel.currentProfile.collectAsStateWithLifecycle()
-    val profilesList by viewModel.profiles.collectAsStateWithLifecycle()
+    val profileUiState by profileViewModel.uiState.collectAsStateWithLifecycle()
+    val currentProfile = profileUiState.currentProfile
+    val profilesList = profileUiState.profiles
+    val settingsObj by viewModel.settings.collectAsStateWithLifecycle()
 
+    val context = LocalContext.current
     var currentScreen by remember { mutableStateOf("profiles") }
+    var showExitConfirmDialog by remember { mutableStateOf(false) }
     
     // Video Player overlays state
     var activePlayerSrc by remember { mutableStateOf<String?>(null) }
@@ -126,10 +118,16 @@ fun AppContent(viewModel: MainViewModel, theme: AppThemeColors) {
     var activePlayerType by remember { mutableStateOf("live") }
     var activeDrmScheme by remember { mutableStateOf<String?>(null) }
     var activeDrmLicenseUrl by remember { mutableStateOf<String?>(null) }
+    var activeStreamHeaders by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
+    var activePlayerSeriesTitle by remember { mutableStateOf<String?>(null) }
+    var activePlayerSeason by remember { mutableStateOf<Int?>(null) }
+    var activePlayerEpisode by remember { mutableStateOf<Int?>(null) }
+    var activeCategoryName by remember { mutableStateOf("") }
+    var activeCategoryChannels by remember { mutableStateOf<List<com.example.motor.db.IptvItem>>(emptyList()) }
 
     // Navigation Back Stack
     val backStack = remember { mutableStateListOf<String>() }
-    val topLevelScreens = remember { setOf("home", "live_tv", "movies", "series", "playlists", "settings", "accounts") }
+    val topLevelScreens = remember { setOf("home", "live_tv", "movies", "series", "sports", "playlists", "settings", "accounts") }
 
     fun navigateTo(screen: String) {
         if (currentScreen != screen) {
@@ -148,24 +146,69 @@ fun AppContent(viewModel: MainViewModel, theme: AppThemeColors) {
     fun navigateBack() {
         if (backStack.isNotEmpty()) {
             currentScreen = backStack.removeLast()
+        } else if (currentScreen != "home") {
+            currentScreen = "home"
         }
     }
 
-    // Capture system Back button
-    BackHandler {
-        if (activePlayerSrc != null) {
+    // Capture system Back button on remote or device:
+    // 1. If Exit Confirmation Dialog is open: Back closes the dialog safely.
+    // 2. If video player is open: Back closes the player overlay.
+    // 3. If backStack is not empty: Back navigates back in stack.
+    // 4. If currentScreen != "home" (and not on initial profile selection): Back navigates to "home".
+    // 5. If on "home": Back displays the Exit Confirmation Dialog ("¿Seguro que quieres salir?")!
+    BackHandler(enabled = true) {
+        if (showExitConfirmDialog) {
+            showExitConfirmDialog = false
+        } else if (activePlayerSrc != null) {
             activePlayerSrc = null
+            activeStreamHeaders = emptyMap()
+            if (currentScreen != "live_tv") {
+                playerViewModel.stop()
+            }
         } else if (backStack.isNotEmpty()) {
             navigateBack()
+        } else if (currentScreen != "home" && (currentScreen != "profiles" || currentProfile != null)) {
+            navigateTo("home")
+        } else {
+            showExitConfirmDialog = true
         }
     }
 
-    // Keep screens in sync when profile loads
+    // Stay on "profiles" until user explicitly picks a profile; if logged out from another screen, return to "profiles"
     LaunchedEffect(currentProfile) {
-        if (currentProfile == null) {
+        if (currentProfile == null && currentScreen != "profiles") {
+            activePlayerSrc = null
+            activeStreamHeaders = emptyMap()
+            playerViewModel.stop()
+            playlistViewModel.cancelConnection()
+            backStack.clear()
             currentScreen = "profiles"
-        } else if (currentScreen == "profiles") {
-            currentScreen = "home"
+        }
+    }
+
+    var lastHandledProfileId by remember { mutableStateOf<Long?>(null) }
+
+    LaunchedEffect(currentProfile?.id) {
+        val prof = currentProfile
+        if (prof == null) {
+            lastHandledProfileId = null
+        } else if (prof.id != lastHandledProfileId) {
+            lastHandledProfileId = prof.id
+            activePlayerSrc = null
+            activeStreamHeaders = emptyMap()
+            playerViewModel.stop()
+            playlistViewModel.cancelConnection()
+            val settingsObj = JsonUtils.settingsFromJson(prof.settingsJson)
+            val playlistsList = JsonUtils.playlistsFromJson(prof.playlistsJson)
+            val activePl = playlistViewModel.getSafeStartupPlaylist(playlistsList)
+            if (activePl != null) {
+                playlistViewModel.startupPlaylist(activePl, autoUpdate = settingsObj.autoUpdate)
+            } else {
+                com.example.motor.repository.MediaCacheRepository.getInstance(
+                    context.applicationContext as android.app.Application
+                ).setActivePlaylist(-1L)
+            }
         }
     }
 
@@ -175,14 +218,14 @@ fun AppContent(viewModel: MainViewModel, theme: AppThemeColors) {
         // APP SCREEN SWITCHER ALWAYS ACTIVE IN BACKGROUND TO RETAIN STATE
         when (currentScreen) {
             "profiles" -> ProfileSelectorScreen(
-                profiles = profilesList,
-                onProfileSelected = { p -> 
-                    viewModel.switchProfile(p)
+                viewModel = profileViewModel,
+                onProfileSelected = { p ->
+                    activePlayerSrc = null
+                    activeStreamHeaders = emptyMap()
+                    backStack.clear()
+                    profileViewModel.switchProfile(p)
                     currentScreen = "home"
                 },
-                onAddProfile = { name, avatar, pin -> viewModel.addProfile(name, avatar, pin) },
-                onDeleteProfile = { id -> viewModel.deleteProfile(id) },
-                onEditProfile = { id, name, avatar, pin -> viewModel.updateProfile(id, name, avatar, pin) },
                 theme = theme
             )
             else -> {
@@ -196,28 +239,108 @@ fun AppContent(viewModel: MainViewModel, theme: AppThemeColors) {
                     isFullScreenOverlay = isFullScreenOverlay
                 ) {
                     when (currentScreen) {
-                        "home" -> HomeScreen(
-                            viewModel = homeViewModel,
-                            onNavigate = { navigateTo(it) },
-                            onPlay = { src, title, type, dScheme, dLicense ->
-                                activePlayerSrc = src
-                                activePlayerTitle = title
-                                activePlayerType = type
-                                activeDrmScheme = dScheme
-                                activeDrmLicenseUrl = dLicense
-                            },
-                            theme = theme
-                        )
+                        "home" -> {
+                            when (settingsObj.homeLayout) {
+                                "modern" -> {
+                                    HomeScreen(
+                                        viewModel = homeViewModel,
+                                        onNavigate = { navigateTo(it) },
+                                        onPlay = { src, title, type, dScheme, dLicense, headers ->
+                                            activePlayerSrc = src
+                                            activeStreamHeaders = headers
+                                            activePlayerTitle = title
+                                            activePlayerType = type
+                                            activeDrmScheme = dScheme
+                                            activeDrmLicenseUrl = dLicense
+                                            if (type == "series") {
+                                                val se = com.example.motor.tmdb.TmdbService.extractSeasonEpisode(title)
+                                                activePlayerSeriesTitle = com.example.motor.tmdb.TmdbService.cleanSeriesName(title)
+                                                activePlayerSeason = se?.season
+                                                activePlayerEpisode = se?.episode
+                                            } else {
+                                                activePlayerSeriesTitle = null
+                                                activePlayerSeason = null
+                                                activePlayerEpisode = null
+                                            }
+                                        },
+                                        onOpenSeries = { seriesItem ->
+                                            seriesViewModel.pendingSelectedSeries.value = seriesItem
+                                            navigateTo("series")
+                                        },
+                                        theme = theme
+                                    )
+                                }
+                                "classic_tiles" -> {
+                                    com.example.interfaz.screens.ClassicTvHomeScreen(
+                                        viewModel = homeViewModel,
+                                        mainViewModel = viewModel,
+                                        onNavigate = { navigateTo(it) },
+                                        theme = theme
+                                    )
+                                }
+                                "cinema_bar" -> {
+                                    CinemaBarHomeScreen(
+                                        homeViewModel = homeViewModel,
+                                        moviesViewModel = moviesViewModel,
+                                        seriesViewModel = seriesViewModel,
+                                        sportsViewModel = sportsViewModel,
+                                        onNavigate = { navigateTo(it) },
+                                        onPlay = { src, title, type, dScheme, dLicense, headers ->
+                                            activePlayerSrc = src
+                                            activeStreamHeaders = headers
+                                            activePlayerTitle = title
+                                            activePlayerType = type
+                                            activeDrmScheme = dScheme
+                                            activeDrmLicenseUrl = dLicense
+                                            if (type == "series") {
+                                                val se = com.example.motor.tmdb.TmdbService.extractSeasonEpisode(title)
+                                                activePlayerSeriesTitle = com.example.motor.tmdb.TmdbService.cleanSeriesName(title)
+                                                activePlayerSeason = se?.season
+                                                activePlayerEpisode = se?.episode
+                                            } else {
+                                                activePlayerSeriesTitle = null
+                                                activePlayerSeason = null
+                                                activePlayerEpisode = null
+                                            }
+                                        },
+                                        onPlaySport = { src, title, dScheme, dLicense, matchChannels, matchCat, headers ->
+                                            activePlayerSrc = src
+                                            activeStreamHeaders = headers
+                                            activePlayerTitle = title
+                                            activePlayerType = "live"
+                                            activeDrmScheme = dScheme
+                                            activeDrmLicenseUrl = dLicense
+                                            activeCategoryChannels = matchChannels
+                                            activeCategoryName = matchCat ?: "Deportes"
+                                        },
+                                        onExitRequest = { showExitConfirmDialog = true },
+                                        theme = theme
+                                    )
+                                }
+                                else -> {
+                                    com.example.interfaz.screens.VivoTvHomeScreen(
+                                        viewModel = homeViewModel,
+                                        mainViewModel = viewModel,
+                                        playlistViewModel = playlistViewModel,
+                                        onNavigate = { navigateTo(it) },
+                                        onExitRequest = { showExitConfirmDialog = true },
+                                        theme = theme
+                                    )
+                                }
+                            }
+                        }
                         "live_tv" -> LiveTVScreen(
                             viewModel = liveTvViewModel,
                             playerViewModel = playerViewModel,
-                            mainViewModel = viewModel,
-                            onPlay = { src, title, dScheme, dLicense ->
+                            onPlay = { src, title, dScheme, dLicense, catName, catChannels ->
                                 activePlayerSrc = src
+                                activeStreamHeaders = emptyMap()
                                 activePlayerTitle = title
                                 activePlayerType = "live"
                                 activeDrmScheme = dScheme
                                 activeDrmLicenseUrl = dLicense
+                                activeCategoryName = catName
+                                activeCategoryChannels = catChannels
                             },
                             onBack = { navigateTo("home") },
                             theme = theme,
@@ -227,6 +350,7 @@ fun AppContent(viewModel: MainViewModel, theme: AppThemeColors) {
                             viewModel = moviesViewModel,
                             onPlay = { src, title, dScheme, dLicense ->
                                 activePlayerSrc = src
+                                activeStreamHeaders = emptyMap()
                                 activePlayerTitle = title
                                 activePlayerType = "movie"
                                 activeDrmScheme = dScheme
@@ -237,29 +361,60 @@ fun AppContent(viewModel: MainViewModel, theme: AppThemeColors) {
                         )
                         "series" -> SeriesScreen(
                             viewModel = seriesViewModel,
-                            onPlay = { src, title, dScheme, dLicense ->
+                            onPlay = { src, title, dScheme, dLicense, sTitle, sNum, eNum ->
                                 activePlayerSrc = src
+                                activeStreamHeaders = emptyMap()
                                 activePlayerTitle = title
                                 activePlayerType = "series"
                                 activeDrmScheme = dScheme
                                 activeDrmLicenseUrl = dLicense
+                                activePlayerSeriesTitle = sTitle
+                                activePlayerSeason = sNum
+                                activePlayerEpisode = eNum
                             },
                             onBack = { navigateTo("home") },
                             theme = theme
                         )
+                        "sports" -> SportsScreen(
+                            viewModel = sportsViewModel,
+                            onPlay = { src, title, dScheme, dLicense, matchChannels, matchCategoryName, headers ->
+                                activePlayerSrc = src
+                                activeStreamHeaders = headers
+                                activePlayerTitle = title
+                                activePlayerType = "live"
+                                activeDrmScheme = dScheme
+                                activeDrmLicenseUrl = dLicense
+                                activeCategoryChannels = matchChannels
+                                activeCategoryName = matchCategoryName ?: Translator.translate("sports", settingsObj.lang)
+                            },
+                            onBack = { navigateTo("home") },
+                            theme = theme,
+                            lang = settingsObj.lang
+                        )
                         "playlists" -> PlaylistsScreen(
                             viewModel = playlistViewModel,
+                            onBack = { navigateTo("home") },
                             theme = theme
                         )
                         "accounts" -> AccountsScreen(
                             viewModel = profileViewModel,
-                            onLogout = { currentScreen = "profiles" },
+                            onLogout = {
+                                activePlayerSrc = null
+                                activeStreamHeaders = emptyMap()
+                                playerViewModel.stop()
+                                playlistViewModel.cancelConnection()
+                                backStack.clear()
+                                profileViewModel.logout()
+                                currentScreen = "profiles"
+                            },
+                            onBack = { navigateTo("home") },
                             theme = theme
                         )
                         "settings" -> SettingsScreen(
                             viewModel = settingsViewModel,
                             theme = theme,
-                            onFullScreenChange = { isFullScreenOverlay = it }
+                            onFullScreenChange = { isFullScreenOverlay = it },
+                            onBack = { navigateTo("home") }
                         )
                     }
                 }
@@ -268,7 +423,9 @@ fun AppContent(viewModel: MainViewModel, theme: AppThemeColors) {
 
         if (activePlayerSrc != null) {
             val pSettings = currentProfile?.let { JsonUtils.settingsFromJson(it.settingsJson) } ?: PlayerSettings()
-            val streamHeaders = viewModel.getActiveStreamHeaders()
+            val streamHeaders = remember(activePlayerSrc, activeStreamHeaders, currentProfile?.id) {
+                if (activeStreamHeaders.isNotEmpty()) activeStreamHeaders else playerViewModel.getActiveStreamHeaders()
+            }
             val context = LocalContext.current
 
             if (pSettings.player != "Player integrado") {
@@ -407,7 +564,7 @@ fun AppContent(viewModel: MainViewModel, theme: AppThemeColors) {
                 var initialPosSec by remember(activePlayerSrc) { mutableStateOf<Long?>(null) }
                 LaunchedEffect(activePlayerSrc) {
                     if (activePlayerSrc != null) {
-                        val progress = viewModel.getPlaybackProgress(activePlayerSrc!!)
+                        val progress = playerViewModel.getPlaybackProgress(activePlayerSrc!!)
                         initialPosSec = progress?.position ?: 0L
                     }
                 }
@@ -424,17 +581,61 @@ fun AppContent(viewModel: MainViewModel, theme: AppThemeColors) {
                         subtitleColorSetting = pSettings.subtitleColor,
                         subtitleBgSetting = pSettings.subtitleBg,
                         subtitleSizeSetting = pSettings.subtitleSize,
+                        subtitleEnabledSetting = pSettings.subtitles,
                         initialPositionSec = initialPosSec!!,
                         drmScheme = activeDrmScheme,
                         drmLicenseUrl = activeDrmLicenseUrl,
                         headers = streamHeaders,
-                        onBack = { activePlayerSrc = null },
-                        onProgressUpdate = { pos, dur ->
-                            activePlayerSrc?.let { src ->
-                                viewModel.savePlaybackProgress(src, activePlayerTitle, pos, dur, activePlayerType)
+                        stopOnDispose = (currentScreen != "live_tv"),
+                        onBack = {
+                            activePlayerSrc = null
+                            activeStreamHeaders = emptyMap()
+                            activePlayerSeriesTitle = null
+                            activePlayerSeason = null
+                            activePlayerEpisode = null
+                            activeCategoryName = ""
+                            activeCategoryChannels = emptyList()
+                            if (currentScreen != "live_tv") {
+                                playerViewModel.stop()
                             }
                         },
-                        mediaType = activePlayerType
+                        onProgressUpdate = { pos, dur ->
+                            activePlayerSrc?.let { src ->
+                                playerViewModel.savePlaybackProgress(src, activePlayerTitle, pos, dur, activePlayerType)
+                            }
+                        },
+                        mediaType = activePlayerType,
+                        seriesTitle = activePlayerSeriesTitle,
+                        season = activePlayerSeason,
+                        episode = activePlayerEpisode,
+                        categoryChannels = activeCategoryChannels,
+                        categoryName = activeCategoryName,
+                        onSelectChannel = { channel ->
+                            coroutineScope.launch {
+                                try {
+                                    val (resolvedUrl, resolvedHeaders) = liveTvViewModel.resolveStream(channel)
+                                    if (resolvedUrl.isNotBlank()) {
+                                        activePlayerSrc = resolvedUrl
+                                        activeStreamHeaders = resolvedHeaders
+                                        activePlayerTitle = channel.name
+                                        activeDrmScheme = channel.drmScheme
+                                        activeDrmLicenseUrl = channel.drmLicenseUrl
+                                    } else {
+                                        android.widget.Toast.makeText(
+                                            context,
+                                            "No se pudo resolver la URL del canal",
+                                            android.widget.Toast.LENGTH_SHORT
+                                        ).show()
+                                    }
+                                } catch (e: Exception) {
+                                    android.widget.Toast.makeText(
+                                        context,
+                                        "Error al cambiar de canal: ${e.message}",
+                                        android.widget.Toast.LENGTH_SHORT
+                                    ).show()
+                                }
+                            }
+                        }
                     )
                 } else {
                     Box(
@@ -443,10 +644,26 @@ fun AppContent(viewModel: MainViewModel, theme: AppThemeColors) {
                             .background(Color.Black),
                         contentAlignment = Alignment.Center
                     ) {
-                        CircularProgressIndicator(color = parseHexColor(theme.accent))
+                        com.example.interfaz.components.OrbitalStreamingLoader(
+                            size = 68.dp,
+                            accentColor = parseHexColor(theme.accent)
+                        )
                     }
                 }
             }
+        }
+
+        if (showExitConfirmDialog) {
+            com.example.interfaz.components.ExitConfirmationDialog(
+                onConfirm = {
+                    showExitConfirmDialog = false
+                    (context as? android.app.Activity)?.finishAffinity()
+                },
+                onDismiss = {
+                    showExitConfirmDialog = false
+                },
+                theme = theme
+            )
         }
     }
 }
@@ -475,6 +692,7 @@ fun AppShell(
         MenuItem("live_tv", Translator.translate("live_tv", lang), Icons.Default.Tv),
         MenuItem("movies", Translator.translate("movies", lang), Icons.Default.Movie),
         MenuItem("series", Translator.translate("series", lang), Icons.Default.VideoLibrary),
+        MenuItem("sports", Translator.translate("sports", lang), Icons.Default.SportsSoccer),
         MenuItem("playlists", Translator.translate("playlists", lang), Icons.Default.CloudDownload),
         MenuItem("settings", Translator.translate("settings", lang), Icons.Default.Settings),
         MenuItem("accounts", Translator.translate("accounts", lang), Icons.Default.People)
@@ -485,12 +703,15 @@ fun AppShell(
         MenuItem("live_tv", Translator.translate("live_tv", lang), Icons.Default.Tv),
         MenuItem("movies", Translator.translate("movies", lang), Icons.Default.Movie),
         MenuItem("series", Translator.translate("series", lang), Icons.Default.VideoLibrary),
+        MenuItem("sports", Translator.translate("sports", lang), Icons.Default.SportsSoccer),
         MenuItem("playlists", Translator.translate("playlists", lang), Icons.Default.CloudDownload),
         MenuItem("settings", Translator.translate("settings", lang), Icons.Default.Settings)
     )
 
+    val isClassicHome = currentScreen == "home" && settingsObj.homeLayout != "modern"
+
     if (isPortrait) {
-        if (isFullScreenOverlay) {
+        if (isFullScreenOverlay || isClassicHome) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -512,19 +733,13 @@ fun AppShell(
                         .padding(horizontal = 16.dp, vertical = 12.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Box(
-                        modifier = Modifier
-                            .size(36.dp)
-                            .clip(CircleShape)
-                            .background(parseHexColor(theme.accent).copy(alpha = 0.2f))
-                            .clickable { onNavigate("accounts") },
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            text = currentProfile?.avatar ?: "👤",
-                            fontSize = 18.sp
-                        )
-                    }
+                    ProfileAvatarImage(
+                        avatarKey = currentProfile?.avatar,
+                        size = 36.dp,
+                        accentColor = parseHexColor(theme.accent),
+                        contentDescription = currentProfile?.name ?: "Perfil",
+                        modifier = Modifier.tvClickable(shape = CircleShape) { onNavigate("accounts") }
+                    )
                     Spacer(modifier = Modifier.width(10.dp))
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
@@ -533,6 +748,7 @@ fun AppShell(
                                 "live_tv" -> Translator.translate("live_tv", lang)
                                 "movies" -> Translator.translate("movies", lang)
                                 "series" -> Translator.translate("series", lang)
+                                "sports" -> Translator.translate("sports", lang)
                                 "playlists" -> Translator.translate("playlists", lang)
                                 "accounts" -> Translator.translate("accounts", lang)
                                 "settings" -> Translator.translate("settings", lang)
@@ -558,25 +774,16 @@ fun AppShell(
                         }
                     }
 
-                    IconButton(
-                        onClick = { onNavigate("settings") }
-                    ) {
+                    TvIconButton(
+                        onClick = { onNavigate("settings") },
+                        containerColor = Color.Transparent,
+                        shape = CircleShape
+                    ) { isFocused ->
                         Icon(
                             imageVector = Icons.Default.Settings,
                             contentDescription = Translator.translate("settings", lang),
-                            tint = if (currentScreen == "settings") parseHexColor(theme.accent) else Color.White,
+                            tint = if (isFocused) TV_FOCUSED_TEXT else if (currentScreen == "settings") parseHexColor(theme.accent) else Color.White,
                             modifier = Modifier.size(24.dp)
-                        )
-                    }
-
-                    IconButton(
-                        onClick = { onNavigate("profiles") }
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.PowerSettingsNew,
-                            contentDescription = Translator.translate("exit", lang),
-                            tint = Color.Red,
-                            modifier = Modifier.size(22.dp)
                         )
                     }
                 }
@@ -631,7 +838,7 @@ fun AppShell(
             }
         }
     } else {
-        val showSidebar = currentScreen !in listOf("live_tv", "movies", "series") && !isFullScreenOverlay
+        val showSidebar = currentScreen !in listOf("live_tv", "movies", "series", "sports") && !isClassicHome && !isFullScreenOverlay
         val context = LocalContext.current
         val isTvOrBox = remember(context) {
             val pm = context.packageManager
@@ -665,18 +872,12 @@ fun AppShell(
                                 .tvClickable { onNavigate("accounts") }
                                 .padding(bottom = 16.dp)
                         ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(42.dp)
-                                    .clip(CircleShape)
-                                    .background(parseHexColor(theme.accent).copy(alpha = 0.2f)),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text(
-                                    text = currentProfile?.avatar ?: "👤",
-                                    fontSize = 20.sp
-                                )
-                            }
+                            ProfileAvatarImage(
+                                avatarKey = currentProfile?.avatar,
+                                size = 44.dp,
+                                accentColor = parseHexColor(theme.accent),
+                                contentDescription = currentProfile?.name ?: "Perfil"
+                            )
                             Spacer(modifier = Modifier.width(10.dp))
                             Column {
                                 Text(
@@ -706,18 +907,24 @@ fun AppShell(
 
                         LazyColumn(
                             modifier = Modifier.weight(1f),
-                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             items(menuItems) { item ->
                                 val isSelected = currentScreen == item.route
                                 var isFocused by remember { mutableStateOf(false) }
-                                val bg = if (isFocused) TV_FOCUSED_BG else if (isSelected) parseHexColor(theme.accent) else Color.Transparent
+                                val bg = if (isFocused) parseHexColor(theme.cardHover)
+                                    else if (isSelected) parseHexColor(theme.accent).copy(alpha = 0.65f)
+                                    else parseHexColor(theme.card).copy(alpha = 0.6f)
+                                val borderCol = if (isFocused) parseHexColor(theme.accent)
+                                    else if (isSelected) parseHexColor(theme.accentLight).copy(alpha = 0.8f)
+                                    else Color.White.copy(alpha = 0.12f)
                                 val tc = if (isFocused) TV_FOCUSED_TEXT else if (isSelected) Color.White else Color.LightGray
 
                                 Row(
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .clip(RoundedCornerShape(8.dp))
+                                        .border(1.dp, borderCol, RoundedCornerShape(8.dp))
                                         .background(bg)
                                         .tvClickable(shape = RoundedCornerShape(8.dp), onFocusChange = { isFocused = it }) { onNavigate(item.route) }
                                         .padding(horizontal = 12.dp, vertical = 10.dp),
@@ -734,35 +941,10 @@ fun AppShell(
                                         text = item.title,
                                         color = tc,
                                         fontSize = 13.sp,
-                                        fontWeight = if (isFocused || isSelected) FontWeight.Bold else FontWeight.Normal
+                                        fontWeight = if (isFocused || isSelected) FontWeight.Bold else FontWeight.Medium
                                     )
                                 }
                             }
-                        }
-
-                        var isExitFocused by remember { mutableStateOf(false) }
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(8.dp))
-                                .background(if (isExitFocused) TV_FOCUSED_BG else Color.Transparent)
-                                .tvClickable(shape = RoundedCornerShape(8.dp), onFocusChange = { isExitFocused = it }) { onNavigate("profiles") }
-                                .padding(horizontal = 12.dp, vertical = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.PowerSettingsNew,
-                                contentDescription = Translator.translate("exit", lang),
-                                tint = if (isExitFocused) TV_FOCUSED_TEXT else Color.Red,
-                                modifier = Modifier.size(20.dp)
-                            )
-                            Spacer(modifier = Modifier.width(12.dp))
-                            Text(
-                                text = Translator.translate("exit", lang),
-                                color = if (isExitFocused) TV_FOCUSED_TEXT else Color.Red,
-                                fontSize = 13.sp,
-                                fontWeight = if (isExitFocused) FontWeight.Bold else FontWeight.Normal
-                            )
                         }
                     }
                 }

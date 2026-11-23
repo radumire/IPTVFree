@@ -132,10 +132,53 @@ object TmdbService {
 
     private val videoExtensionsRegex = Regex("(?i)\\.(mkv|mp4|avi|srt|ts|ts4|m3u8|flv|wmv|vob|iso)$")
     private val bracketPrefixRegex = Regex("^(?:\\[[^\\]]+\\]|\\{[^\\}]+\\}|\\((?:[a-zA-Z0-9]{1,6}|latino|castellano|español|espanol|spanish|english|french|german|sub|dual|multi|uhd|fhd|hd|4k|3d|sd)\\))\\s*")
-    private val delimitedPrefixRegex = Regex("^(?:[a-zA-Z0-9+]{1,12}\\s*[:|\\-/•]\\s*)+|^(?::[a-zA-Z0-9+]{1,6}:?\\s*)")
     private val yearRegex = Regex("\\b(19[5-9]\\d|20[0-9]\\d)\\b")
     private val seasonRegex = Regex("(?i)\\b(s\\d+e\\d+|t\\d+e\\d+|s\\d+|t\\d+|e\\d+|c\\d+|ep\\d+|cap\\d+|season\\s*\\d+|temporada\\s*\\d+|temp\\.?\\s*\\d+|capitulo\\s*\\d+|cap\\.?\\s*\\d+|episodio\\s*\\d+|\\d+x\\d+)\\b")
     private val qualityKeywordRegex = Regex("(?i)\\b(1080p|720p|2160p|4k|uhd|bluray|blu-ray|h264|h265|x264|x265|hevc|webrip|web-?dl|dvdrip|remux|bdrip|microhd|ac3|dts|dd5\\.1|hdtv|xvid|divx|vostfr|subfrench)\\b")
+
+    private val TECHNICAL_NUMBERS_STR = setOf("1920", "1080", "2160", "3840", "720", "480", "576")
+    private val PROTECTED_NUMERIC_TITLES = setOf(
+        "1917", "1984", "2001", "2010", "2012", "2049", "2077", "2000", "300",
+        "1922", "1941", "1942", "1944", "1987", "1408"
+    )
+
+    private val KNOWN_PREFIX_SET = setOf(
+        "es", "esp", "lat", "latino", "castellano", "en", "eng", "english", "spanish",
+        "fr", "fra", "french", "de", "ger", "german", "it", "ita", "italian", "pt", "por", "portuguese",
+        "ro", "ru", "rus", "ch", "cn", "chinese", "jp", "jap", "kr", "kor", "ar", "arab", "tr", "pl",
+        "mx", "us", "uk", "4k", "uhd", "fhd", "hd", "sd", "3d", "hdr", "1080p", "720p", "2160p",
+        "vod", "cine", "pelicula", "peliculas", "pelis", "movie", "movies", "serie", "series",
+        "estreno", "estrenos", "novedad", "novedades", "latest", "vip", "premium", "top"
+    )
+
+    fun stripDelimitedPrefix(text: String): String {
+        var str = text.trim()
+        var matched = true
+        var loops = 0
+        while (matched && loops < 5) {
+            loops++
+            val match = Regex("""^(?:([a-zA-Z0-9+]{1,12})\s*[:|\-/•]\s*|:([a-zA-Z0-9+]{1,6}):?\s*)""").find(str)
+            if (match != null) {
+                val tag = (match.groupValues[1].ifEmpty { match.groupValues[2] }).lowercase()
+                val isKnown = tag in KNOWN_PREFIX_SET
+                val isShortTag = tag.length in 2..3 && (match.value.contains(":") || match.value.contains("|"))
+                if (isKnown || isShortTag) {
+                    str = str.substring(match.range.last + 1).trim()
+                    continue
+                }
+            }
+            val spaceMatch = Regex("""^([a-zA-Z0-9+]{2,6})\s+""").find(str)
+            if (spaceMatch != null) {
+                val tag = spaceMatch.groupValues[1].lowercase()
+                if (tag in KNOWN_PREFIX_SET) {
+                    str = str.substring(spaceMatch.range.last + 1).trim()
+                    continue
+                }
+            }
+            matched = false
+        }
+        return str
+    }
 
     fun cleanTitleAndExtractYear(rawTitle: String?): CleanedTitle {
         if (rawTitle.isNullOrBlank()) return CleanedTitle("", null)
@@ -148,7 +191,22 @@ object TmdbService {
         // Strip trailing dots, ellipsis, spaces, hyphens, colons
         clean = clean.replace(Regex("[. :\\-_/|#+]+$"), "").trim()
 
-        // Strip bracket prefixes like [ES] [1080p], (LAT)
+        // 1. Check for explicit year enclosed in parentheses or brackets FIRST: (2017), [2017]
+        // Extracting this before stripping bracket prefixes ensures that leading years like [2024] or (2024)
+        // are preserved as years rather than mistakenly consumed as prefix tags.
+        var year: Int? = null
+        val bracketYearRegex = Regex("""(?i)[\[\(]\s*(19[5-9]\d|20[0-9]\d)\s*[\]\)]""")
+        val bracketMatches = bracketYearRegex.findAll(clean).toList()
+        if (bracketMatches.isNotEmpty()) {
+            val lastMatch = bracketMatches.last()
+            val yVal = lastMatch.groupValues[1].toIntOrNull()
+            if (yVal != null && yVal in 1900..2099) {
+                year = yVal
+                clean = clean.removeRange(lastMatch.range).trim()
+            }
+        }
+
+        // 2. Strip bracket prefixes like [ES] [1080p], (LAT)
         var matched = true
         var loops = 0
         while (matched && loops < 5) {
@@ -158,45 +216,77 @@ object TmdbService {
             matched = clean != before
         }
 
-        // Strip delimited prefixes like "ES:", "ES -", "LAT |", "4K -"
-        matched = true
-        loops = 0
-        while (matched && loops < 5) {
-            loops++
-            val before = clean
-            clean = clean.replace(delimitedPrefixRegex, "").trim()
-            matched = clean != before
-        }
+        // 3. Strip delimited prefixes like "ES:", "ES -", "LAT |", "4K -"
+        clean = stripDelimitedPrefix(clean)
 
         // Strip leading symbols (e.g. "- ", ": ", "| ")
         clean = clean.replace(Regex("^[\\s:|\\-_/•#+]+"), "").trim()
 
         // Replace dots, underscores, pipes with spaces if they are used as word separators
         var processed = clean.replace(Regex("[._|/+]"), " ")
-
-        // Extract year
-        var year: Int? = null
         var truncateIndex = processed.length
 
-        val yearMatch = yearRegex.find(processed)
-        if (yearMatch != null) {
-            val yVal = yearMatch.value.toIntOrNull()
-            if (yVal != null) {
-                year = yVal
-                if (yearMatch.range.first > 1) {
-                    truncateIndex = yearMatch.range.first
-                }
-            }
-        }
-
         val seasonMatch = seasonRegex.find(processed)
-        if (seasonMatch != null && seasonMatch.range.first > 1 && seasonMatch.range.first < truncateIndex) {
-            truncateIndex = seasonMatch.range.first
+        if (seasonMatch != null && seasonMatch.range.first > 1) {
+            truncateIndex = minOf(truncateIndex, seasonMatch.range.first)
         }
 
         val qualityMatch = qualityKeywordRegex.find(processed)
-        if (qualityMatch != null && qualityMatch.range.first > 1 && qualityMatch.range.first < truncateIndex) {
-            truncateIndex = qualityMatch.range.first
+        if (qualityMatch != null && qualityMatch.range.first > 1) {
+            truncateIndex = minOf(truncateIndex, qualityMatch.range.first)
+        }
+
+        // If no year in brackets, check if there's a release year before quality tags or in scene release
+        if (year == null) {
+            val textBeforeQuality = processed.substring(0, truncateIndex).trim()
+            val candidateYears = yearRegex.findAll(textBeforeQuality).toList()
+            if (candidateYears.isNotEmpty()) {
+                val lastYearMatch = candidateYears.last()
+                val yVal = lastYearMatch.value.toIntOrNull()
+
+                // Check technical numbers (e.g. 1920 in 1920x1080)
+                val isTechnicalNumber = lastYearMatch.value in TECHNICAL_NUMBERS_STR
+
+                // Check if this number is protected as part of the title itself (e.g. "1917", "Blade Runner 2049")
+                val isEntireTitleNumeric = textBeforeQuality.trim().equals(lastYearMatch.value, ignoreCase = true)
+                val isProtectedNumericTitle = lastYearMatch.value in PROTECTED_NUMERIC_TITLES &&
+                        (isEntireTitleNumeric ||
+                         textBeforeQuality.contains("Blade Runner", ignoreCase = true) ||
+                         textBeforeQuality.contains("Wonder Woman", ignoreCase = true) ||
+                         textBeforeQuality.contains("Space Odyssey", ignoreCase = true) ||
+                         textBeforeQuality.contains("Death Race", ignoreCase = true) ||
+                         textBeforeQuality.contains("Blues Brothers", ignoreCase = true) ||
+                         textBeforeQuality.contains("Cyberpunk", ignoreCase = true))
+
+                // Only consider it a release year if <= 2026, not technical, and not a protected numeric title
+                if (!isTechnicalNumber && !isProtectedNumericTitle && yVal != null && yVal in 1950..2026) {
+                    val isFollowedByQuality = truncateIndex < processed.length
+                    val isSceneDotted = clean.contains(".${lastYearMatch.value}.", ignoreCase = true) ||
+                            clean.contains("_${lastYearMatch.value}_", ignoreCase = true) ||
+                            clean.endsWith(".${lastYearMatch.value}", ignoreCase = true)
+                    if (isFollowedByQuality || isSceneDotted) {
+                        year = yVal
+                        if (lastYearMatch.range.first > 1) {
+                            truncateIndex = minOf(truncateIndex, lastYearMatch.range.first)
+                        }
+                    }
+                }
+            }
+
+            // Fallback: If no year before quality tags, check if a year exists in the trailing metadata (e.g. "Pelicula 1080p 2021")
+            if (year == null && truncateIndex < processed.length) {
+                val textAfterQuality = processed.substring(truncateIndex).trim()
+                val candidateYearsAfter = yearRegex.findAll(textAfterQuality).toList()
+                if (candidateYearsAfter.isNotEmpty()) {
+                    val validTrailingYears = candidateYearsAfter.filter { match ->
+                        val v = match.value.toIntOrNull()
+                        v != null && v in 1950..2026 && match.value !in TECHNICAL_NUMBERS_STR
+                    }
+                    if (validTrailingYears.isNotEmpty()) {
+                        year = validTrailingYears.last().value.toIntOrNull()
+                    }
+                }
+            }
         }
 
         var titlePart = if (truncateIndex in 1 until processed.length) {
@@ -208,7 +298,7 @@ object TmdbService {
         // Clean up remaining brackets, parentheses, unwanted characters
         titlePart = titlePart.replace(Regex("\\[.*?\\]"), " ")
         titlePart = titlePart.replace(Regex("\\(.*?\\)"), " ")
-        titlePart = titlePart.replace(Regex("[^a-zA-Z0-9áéíóúÁÉÍÓÚñÑüÜ:;\\-'!?, ]"), " ")
+        titlePart = titlePart.replace(Regex("[^\\p{L}\\p{N}:;\\-'!?, ]"), " ")
         titlePart = titlePart.replace(Regex("\\s+"), " ").replace(Regex("[. :\\-_/|#+]+$"), "").trim()
 
         // If for any reason titlePart became empty or too short, fallback to basic cleaned title
@@ -268,13 +358,15 @@ object TmdbService {
                 if (cleanedTitle.contains(":")) {
                     val prefixStr = cleanedTitle.substringBefore(":").trim()
                     if (prefixStr.length >= 3) {
-                        queryTerms.add(Pair(prefixStr, null))
+                        queryTerms.add(Pair(prefixStr, extractedYear))
+                        if (extractedYear != null) queryTerms.add(Pair(prefixStr, null))
                     }
                 }
                 if (cleanedTitle.contains(" - ")) {
                     val prefixStr = cleanedTitle.substringBefore(" - ").trim()
                     if (prefixStr.length >= 3) {
-                        queryTerms.add(Pair(prefixStr, null))
+                        queryTerms.add(Pair(prefixStr, extractedYear))
+                        if (extractedYear != null) queryTerms.add(Pair(prefixStr, null))
                     }
                 }
             }
@@ -304,24 +396,60 @@ object TmdbService {
                             val jsonObject = JSONObject(responseJson)
                             val results = jsonObject.optJSONArray("results")
                             if (results != null && results.length() > 0) {
+                                var bestPosterMatch: Pair<String?, Int?>? = null
+                                var bestScore = -100.0
+
                                 for (idx in 0 until minOf(results.length(), 8)) {
                                     val item = results.getJSONObject(idx)
                                     val posterPath = item.optString("poster_path", "")
                                     val releaseDate = item.optString("release_date", item.optString("first_air_date", ""))
                                     val itemYear = releaseDate.take(4).toIntOrNull()
-                                    
-                                    if (posterPath.isNotEmpty() && posterPath != "null") {
-                                        if (posterUrl == null) {
-                                            posterUrl = "$BASE_IMAGE_URL$posterPath"
-                                        }
-                                        if (itemYear != null && itemYear > 1900) {
-                                            realYear = itemYear
-                                        }
-                                        Log.d(TAG, "TMDb match found for query '$queryText' ($yearVal, $endpoint): poster=$posterUrl, year=$realYear")
+                                    val candMedia = item.optString("media_type", if (endpoint == "tv") "tv" else "movie")
+                                    val candTitle = if (candMedia == "tv") item.optString("name", "") else item.optString("title", "")
+                                    val origTitle = if (candMedia == "tv") item.optString("original_name", "") else item.optString("original_title", "")
+
+                                    val scoreMain = calculateMovieMatchScore(
+                                        sourceTitle = title,
+                                        cleanTitle = cleanedTitle,
+                                        candidateTitle = candTitle,
+                                        sourceYear = extractedYear,
+                                        candidateYear = itemYear,
+                                        isSeries = isSeries,
+                                        candidateMediaType = candMedia
+                                    )
+                                    val scoreOrig = if (origTitle.isNotBlank() && origTitle != candTitle) {
+                                        calculateMovieMatchScore(
+                                            sourceTitle = title,
+                                            cleanTitle = cleanedTitle,
+                                            candidateTitle = origTitle,
+                                            sourceYear = extractedYear,
+                                            candidateYear = itemYear,
+                                            isSeries = isSeries,
+                                            candidateMediaType = candMedia
+                                        )
+                                    } else 0.0
+
+                                    val candScore = maxOf(scoreMain, scoreOrig)
+                                    val hasPoster = posterPath.isNotEmpty() && posterPath != "null"
+                                    val effectiveScore = candScore + if (hasPoster) 5.0 else 0.0
+
+                                    if (effectiveScore > bestScore && candScore >= 35.0) {
+                                        bestScore = effectiveScore
+                                        val pUrl = if (hasPoster) "$BASE_IMAGE_URL$posterPath" else null
+                                        bestPosterMatch = Pair(pUrl, itemYear)
+                                    }
+                                }
+
+                                if (bestPosterMatch != null) {
+                                    if (posterUrl == null && bestPosterMatch.first != null) {
+                                        posterUrl = bestPosterMatch.first
+                                    }
+                                    if (bestPosterMatch.second != null && bestPosterMatch.second!! > 1900) {
+                                        realYear = bestPosterMatch.second
+                                    }
+                                    if (posterUrl != null || realYear != null) {
+                                        Log.d(TAG, "TMDb scored match for '$queryText' ($yearVal, $endpoint, score=$bestScore): poster=$posterUrl, year=$realYear")
                                         found = true
-                                        break
-                                    } else if (itemYear != null && itemYear > 1900 && realYear == null) {
-                                        realYear = itemYear
                                     }
                                 }
                             }
@@ -352,15 +480,30 @@ object TmdbService {
                                     val poster = meta.optString("poster", "")
                                     val cYearStr = meta.optString("year", meta.optString("releaseInfo", ""))
                                     val cYear = cYearStr.filter { it.isDigit() }.take(4).toIntOrNull()
-                                    if (poster.isNotEmpty() && poster != "null" && poster.startsWith("http") && posterUrl == null) {
-                                        posterUrl = poster
-                                    }
-                                    if (cYear != null && cYear > 1900 && realYear == null) {
-                                        realYear = cYear
-                                    }
-                                    if (posterUrl != null && realYear != null) {
-                                        Log.d(TAG, "Cinemeta match found for query '$queryText' ($cType): poster=$posterUrl, year=$realYear")
-                                        break
+                                    val metaName = meta.optString("name", "")
+                                    val metaType = meta.optString("type", if (isSeries) "series" else "movie")
+
+                                    val cScore = calculateMovieMatchScore(
+                                        sourceTitle = title,
+                                        cleanTitle = cleanedTitle,
+                                        candidateTitle = metaName,
+                                        sourceYear = extractedYear,
+                                        candidateYear = cYear,
+                                        isSeries = isSeries,
+                                        candidateMediaType = if (metaType == "series") "tv" else "movie"
+                                    )
+
+                                    if (cScore >= 35.0) {
+                                        if (poster.isNotEmpty() && poster != "null" && poster.startsWith("http") && posterUrl == null) {
+                                            posterUrl = poster
+                                        }
+                                        if (cYear != null && cYear > 1900 && realYear == null) {
+                                            realYear = cYear
+                                        }
+                                        if (posterUrl != null && realYear != null) {
+                                            Log.d(TAG, "Cinemeta match found for query '$queryText' ($cType, score=$cScore): poster=$posterUrl, year=$realYear")
+                                            break
+                                        }
                                     }
                                 }
                             }
@@ -416,18 +559,31 @@ object TmdbService {
                         if (results != null && results.length() > 0) {
                             for (idx in 0 until results.length()) {
                                 val item = results.getJSONObject(idx)
+                                val trackName = item.optString("trackName", item.optString("collectionName", ""))
                                 val artwork100 = item.optString("artworkUrl100", "")
                                 val relDate = item.optString("releaseDate", "")
                                 val itYear = relDate.take(4).toIntOrNull()
-                                if (artwork100.isNotEmpty() && posterUrl == null) {
-                                    posterUrl = artwork100.replace("100x100bb.jpg", "600x600bb.jpg")
-                                }
-                                if (itYear != null && itYear > 1900 && realYear == null) {
-                                    realYear = itYear
-                                }
-                                if (posterUrl != null && realYear != null) {
-                                    Log.d(TAG, "iTunes match found for query '$queryText': poster=$posterUrl, year=$realYear")
-                                    break
+
+                                val itScore = calculateMovieMatchScore(
+                                    sourceTitle = title,
+                                    cleanTitle = cleanedTitle,
+                                    candidateTitle = trackName,
+                                    sourceYear = extractedYear,
+                                    candidateYear = itYear,
+                                    isSeries = isSeries
+                                )
+
+                                if (itScore >= 35.0) {
+                                    if (artwork100.isNotEmpty() && posterUrl == null) {
+                                        posterUrl = artwork100.replace("100x100bb.jpg", "600x600bb.jpg")
+                                    }
+                                    if (itYear != null && itYear > 1900 && realYear == null) {
+                                        realYear = itYear
+                                    }
+                                    if (posterUrl != null && realYear != null) {
+                                        Log.d(TAG, "iTunes match found for query '$queryText' (score=$itScore): poster=$posterUrl, year=$realYear")
+                                        break
+                                    }
                                 }
                             }
                         }
@@ -454,18 +610,29 @@ object TmdbService {
                             val jsonObject = JSONObject(responseJson)
                             val responseStatus = jsonObject.optString("Response", "False")
                             if (responseStatus.equals("True", ignoreCase = true)) {
-                                val posterPath = jsonObject.optString("Poster", "")
+                                val omdbTitle = jsonObject.optString("Title", "")
                                 val omdbYear = jsonObject.optString("Year", "").filter { it.isDigit() }.take(4).toIntOrNull()
-                                if (posterPath.isNotEmpty() && posterPath != "N/A" && posterPath != "null" && posterUrl == null) {
-                                    posterUrl = posterPath
-                                }
-                                if (omdbYear != null && omdbYear > 1900 && realYear == null) {
-                                    realYear = omdbYear
-                                }
-                                if (posterUrl != null && realYear != null) {
-                                    Log.d(TAG, "OMDb match found for query '$queryText' ($yearVal): poster=$posterUrl, year=$realYear")
-                                    found = true
-                                    break
+                                val omdbScore = calculateMovieMatchScore(
+                                    sourceTitle = title,
+                                    cleanTitle = cleanedTitle,
+                                    candidateTitle = omdbTitle,
+                                    sourceYear = extractedYear,
+                                    candidateYear = omdbYear,
+                                    isSeries = isSeries
+                                )
+                                if (omdbScore >= 35.0) {
+                                    val posterPath = jsonObject.optString("Poster", "")
+                                    if (posterPath.isNotEmpty() && posterPath != "N/A" && posterPath != "null" && posterUrl == null) {
+                                        posterUrl = posterPath
+                                    }
+                                    if (omdbYear != null && omdbYear > 1900 && realYear == null) {
+                                        realYear = omdbYear
+                                    }
+                                    if (posterUrl != null && realYear != null) {
+                                        Log.d(TAG, "OMDb match found for query '$queryText' ($yearVal, score=$omdbScore): poster=$posterUrl, year=$realYear")
+                                        found = true
+                                        break
+                                    }
                                 }
                             }
                         }
@@ -577,15 +744,15 @@ object TmdbService {
             }
         }
 
-        // Year score & penalty (si el título coincide exactamente, no penalizar excesivamente por discrepancias de listas IPTV)
+        // Year score & penalty: exact year (+30), ±1 year (+15), >= 2 years penalized
         var yearScore = 0.0
         if (sourceYear != null && candidateYear != null && sourceYear > 1900 && candidateYear > 1900) {
             val yearDiff = kotlin.math.abs(sourceYear - candidateYear)
             when (yearDiff) {
                 0 -> yearScore = 30.0
                 1 -> yearScore = 15.0
-                2 -> yearScore = if (isExactMatch) 0.0 else -15.0
-                else -> yearScore = if (isExactMatch) -10.0 else -50.0
+                2 -> yearScore = if (isExactMatch) -5.0 else -20.0
+                else -> yearScore = if (isExactMatch) -35.0 else -60.0
             }
         }
 
@@ -617,7 +784,8 @@ object TmdbService {
         val numberOfSeasons: Int? = null,
         val tmdbId: Int? = null,
         val cast: String? = null,
-        val director: String? = null
+        val director: String? = null,
+        val originalTitle: String? = null
     )
 
     private val detailsCache = ConcurrentHashMap<String, MediaDetails>()
@@ -664,7 +832,8 @@ object TmdbService {
         val genreIds: List<Int>,
         val endpoint: String,
         val apiKey: String,
-        val score: Double
+        val score: Double,
+        val originalTitle: String? = null
     )
 
     fun getCachedMediaDetails(title: String, isSeries: Boolean): MediaDetails? {
@@ -751,6 +920,7 @@ object TmdbService {
                                     val mediaType = item.optString("media_type", if (endpoint == "tv") "tv" else "movie")
                                     val actualEndpoint = if (mediaType == "tv") "tv" else "movie"
                                     val candName = if (actualEndpoint == "tv") item.optString("name", "") else item.optString("title", "")
+                                    val origName = if (actualEndpoint == "tv") item.optString("original_name", "") else item.optString("original_title", "")
                                     val date = if (actualEndpoint == "tv") item.optString("first_air_date", "") else item.optString("release_date", "")
                                     val candYear = date.take(4).toIntOrNull()
                                     val posterPath = item.optString("poster_path", "")
@@ -788,7 +958,8 @@ object TmdbService {
                                             genreIds = gList,
                                             endpoint = actualEndpoint,
                                             apiKey = apiKey,
-                                            score = score
+                                            score = score,
+                                            originalTitle = origName.takeIf { it.isNotBlank() }
                                         )
                                     )
                                 }
@@ -803,15 +974,6 @@ object TmdbService {
 
             // Find best candidate
             val bestCandidate = candidates.maxByOrNull { it.score }
-
-            // Log each candidate and its selection status
-            for (cand in candidates) {
-                val isSelected = (cand.id == bestCandidate?.id && cand.score >= MIN_MATCH_SCORE)
-                Log.d(
-                    "MOVIE_MATCH_DEBUG",
-                    "SOURCE_TITLE=$title | CLEAN_TITLE=$cleanedTitle | EXTRACTED_YEAR=$extractedYear | TMDB_CANDIDATE=${cand.title} | TMDB_ID=${cand.id} | TMDB_YEAR=${cand.year} | TMDB_SCORE=${cand.score} | TMDB_SELECTED=$isSelected"
-                )
-            }
 
             // If best candidate passes safety threshold, fetch full details using tmdbId
             if (bestCandidate != null && bestCandidate.score >= MIN_MATCH_SCORE) {
@@ -894,7 +1056,8 @@ object TmdbService {
                         genres = genreList,
                         runtime = runtime,
                         numberOfSeasons = numberOfSeasons,
-                        tmdbId = tmdbId
+                        tmdbId = tmdbId,
+                        originalTitle = bestCandidate.originalTitle
                     )
                     finalSource = "TMDB"
                 } catch (e: Exception) {
@@ -944,11 +1107,6 @@ object TmdbService {
             )).let {
                 if (it.overview.isBlank()) it.copy(overview = "Sin sinopsis disponible.") else it
             }
-
-            Log.d(
-                "MOVIE_MATCH_DEBUG",
-                "FINAL_SOURCE=$finalSource | FINAL_TITLE=${finalDetails.title} | FINAL_YEAR=${finalDetails.year}"
-            )
 
             // Only cache if we got a valid, non-placeholder overview
             if (finalDetails.overview.isNotBlank() && finalDetails.overview != "Sin sinopsis disponible." && finalDetails.overview != "N/A") {
@@ -1106,68 +1264,66 @@ object TmdbService {
         return@withContext text
     }
 
-    private const val TAG_SUBTITLES = "SUBTITLE_SEARCH"
-
-    data class ExternalSubtitle(
-        val id: String,
-        val url: String,
-        val label: String,
-        val language: String
-    )
-
     data class SeasonEpisode(val season: Int, val episode: Int)
 
     fun cleanSeriesName(title: String): String {
-        var name = title
+        if (title.isBlank()) return ""
+        var name = title.trim()
+        name = name.replace(videoExtensionsRegex, "")
+
+        // Strip bracket prefixes like [ES] [1080p] (LAT)
+        var matched = true
+        var loops = 0
+        while (matched && loops < 5) {
+            loops++
+            val before = name
+            name = name.replace(bracketPrefixRegex, "").trim()
+            matched = name != before
+        }
+
+        // Strip delimited prefixes like "ES:", "ES -", "LAT |", "SERIES -"
+        name = stripDelimitedPrefix(name)
+
+        name = name.replace(Regex("^[\\s:|\\-_/•#+]+"), "").trim()
+
+        // Season and episode patterns to cut off metadata after series title
         val sEPattern1 = Regex("(?i)\\bS\\d+\\s*[-._]?\\s*E\\d+\\b.*")
         val sEPattern2 = Regex("\\b\\d+x\\d+\\b.*")
-        val sPattern = Regex("(?i)\\b(?:T|Temp|Temporada)\\s*\\d+.*")
-        
+        val sPattern = Regex("(?i)\\b(?:Temporada|Season|Temp|T)\\s*\\d+.*")
+        val ePattern = Regex("(?i)\\b(?:Episodio|Capitulo|Episode|Cap|Ep)\\s*\\d+.*")
+
         name = name.replace(sEPattern1, "")
         name = name.replace(sEPattern2, "")
         name = name.replace(sPattern, "")
-        
+        name = name.replace(ePattern, "")
+
+        name = name.replace(Regex("\\((?:19\\d\\d|20\\d\\d)\\)"), "")
+        name = name.replace(Regex("\\[.*?\\]"), " ")
+        name = name.replace(Regex("\\(.*?\\)"), " ")
         name = name.replace(Regex("[.\\-_/|+]"), " ")
-        return name.replace(Regex("\\s+"), " ").trim()
+        name = name.replace(Regex("\\s+"), " ").trim()
+
+        // Check for duplicate half (e.g. "CH Ching : CH Ching" -> "CH Ching")
+        if (name.contains(":")) {
+            val parts = name.split(":").map { it.trim() }.filter { it.isNotBlank() }
+            if (parts.size == 2 && parts[0].equals(parts[1], ignoreCase = true)) {
+                name = parts[0]
+            }
+        }
+
+        if (name.length < 2) {
+            val fallback = cleanTitleAndExtractYear(title).title
+            if (fallback.isNotBlank()) name = fallback
+        }
+
+        return name.trim()
     }
 
     fun extractSeasonEpisode(title: String): SeasonEpisode? {
-        val sEPattern1 = Regex("(?i)\\bS(\\d+)\\s*[-._]?\\s*E(\\d+)\\b")
-        val match1 = sEPattern1.find(title)
-        if (match1 != null) {
-            val s = match1.groupValues[1].toIntOrNull()
-            val e = match1.groupValues[2].toIntOrNull()
-            if (s != null && e != null) return SeasonEpisode(s, e)
-        }
-
-        val sEPattern2 = Regex("\\b(\\d+)x(\\d+)\\b")
-        val match2 = sEPattern2.find(title)
-        if (match2 != null) {
-            val s = match2.groupValues[1].toIntOrNull()
-            val e = match2.groupValues[2].toIntOrNull()
-            if (s != null && e != null) return SeasonEpisode(s, e)
-        }
-
-        val tPattern = Regex("(?i)\\b(?:T|Temp|Temporada)\\s*(\\d+)\\b")
-        val ePattern = Regex("(?i)\\b(?:E|Ep|Episode|Episodio|Cap|Capitulo|C)\\s*(\\d+)\\b")
-        val tMatch = tPattern.find(title)
-        val eMatch = ePattern.find(title)
-        if (tMatch != null && eMatch != null) {
-            val s = tMatch.groupValues[1].toIntOrNull()
-            val e = eMatch.groupValues[1].toIntOrNull()
-            if (s != null && e != null) return SeasonEpisode(s, e)
-        }
-        
-        val epOnlyPattern = Regex("(?i)\\b(?:E|Ep|Episode|Episodio|Cap|Capitulo|C)\\s*(\\d+)\\b")
-        val epMatch = epOnlyPattern.find(title)
-        if (epMatch != null) {
-            val e = epMatch.groupValues[1].toIntOrNull()
-            if (e != null) {
-                return SeasonEpisode(1, e)
-            }
-        }
-        
-        return null
+        val pair = com.example.motor.subtitles.SubtitleMatcher.extractSeasonEpisode(title) ?: return null
+        val s = pair.first ?: return null
+        val e = pair.second ?: return null
+        return SeasonEpisode(s, e)
     }
 
     suspend fun findImdbId(title: String, isSeries: Boolean): String? {
@@ -1256,603 +1412,6 @@ object TmdbService {
         }
     }
 
-    private fun mapLanguageLabel(langCode: String, sourceName: String): String {
-        val code = langCode.lowercase().trim()
-        return when {
-            code in listOf("es-419", "es-la", "es_la", "es_419", "latino", "latam") -> "Español Latino (Externo $sourceName)"
-            code in listOf("spa", "es", "spanish", "es-es", "es_es", "castellano") -> "Español (Externo $sourceName)"
-            code in listOf("rum", "ron", "ro", "romanian", "romana", "română") -> "Rumano (Externo $sourceName)"
-            code in listOf("eng", "en", "english") -> "Inglés (Externo $sourceName)"
-            code in listOf("fre", "fra", "fr", "french", "français", "francais") -> "Francés (Externo $sourceName)"
-            code in listOf("ger", "deu", "de", "german", "deutsch") -> "Alemán (Externo $sourceName)"
-            code in listOf("ita", "it", "italian", "italiano") -> "Italiano (Externo $sourceName)"
-            code in listOf("por", "pt", "portuguese", "portugués", "portugues", "pt-br", "pt-pt") -> "Portugués (Externo $sourceName)"
-            code in listOf("rus", "ru", "russian", "ruso") -> "Ruso (Externo $sourceName)"
-            code in listOf("cat", "ca", "catalan", "catalán") -> "Catalán (Externo $sourceName)"
-            code in listOf("glg", "gl", "galician", "gallego") -> "Gallego (Externo $sourceName)"
-            code in listOf("eus", "eu", "basque", "euskera") -> "Euskera (Externo $sourceName)"
-            code in listOf("pol", "pl", "polish", "polski") -> "Polaco (Externo $sourceName)"
-            code in listOf("tur", "tr", "turkish", "türkçe") -> "Turco (Externo $sourceName)"
-            code in listOf("nld", "nl", "dutch", "holandés") -> "Holandés (Externo $sourceName)"
-            code in listOf("ell", "el", "greek", "griego") -> "Griego (Externo $sourceName)"
-            code in listOf("ukr", "uk", "ukrainian", "ucraniano") -> "Ucraniano (Externo $sourceName)"
-            code in listOf("ara", "ar", "arabic", "árabe") -> "Árabe (Externo $sourceName)"
-            else -> "${langCode.uppercase()} (Externo $sourceName)"
-        }
-    }
-
-    private val subcatClient by lazy {
-        BaseEngine.client.newBuilder()
-            .connectionPool(okhttp3.ConnectionPool(20, 2, java.util.concurrent.TimeUnit.MINUTES))
-            .connectTimeout(4, java.util.concurrent.TimeUnit.SECONDS)
-            .readTimeout(4, java.util.concurrent.TimeUnit.SECONDS)
-            .build()
-    }
-
-    private val subtitlesCache = java.util.concurrent.ConcurrentHashMap<String, List<ExternalSubtitle>>()
-
-    suspend fun searchSubtitles(
-        rawTitle: String,
-        isSeries: Boolean,
-        seasonOverride: Int? = null,
-        episodeOverride: Int? = null
-    ): List<ExternalSubtitle> = withContext(Dispatchers.IO) {
-        if (rawTitle.isBlank()) return@withContext emptyList()
-
-        val cleaned = cleanTitleAndExtractYear(rawTitle)
-        val normTitle = if (cleaned.title.isNotBlank()) cleaned.title else cleanSimple(rawTitle)
-        val detectedYear = cleaned.year
-        val (seriesCleanName, season, episode) = if (isSeries) {
-            val sName = cleanSeriesName(rawTitle).ifBlank { normTitle }
-            val parsedSe = extractSeasonEpisode(rawTitle)
-            val s = seasonOverride ?: parsedSe?.season
-            val e = episodeOverride ?: parsedSe?.episode
-            Triple(sName, s, e)
-        } else {
-            Triple(normTitle, null, null)
-        }
-
-        val cacheKey1 = "${if (isSeries) "series" else "movie"}_${rawTitle.trim().lowercase()}_${season}_${episode}"
-        val cacheKey2 = "${if (isSeries) "series" else "movie"}_${normTitle.trim().lowercase()}_${detectedYear ?: ""}_${season}_${episode}"
-
-        subtitlesCache[cacheKey1]?.let { cached ->
-            if (cached.isNotEmpty()) {
-                Log.i(TAG_SUBTITLES, "Returning ${cached.size} cached subtitles for $rawTitle")
-                return@withContext cached
-            }
-        }
-        subtitlesCache[cacheKey2]?.let { cached ->
-            if (cached.isNotEmpty()) {
-                Log.i(TAG_SUBTITLES, "Returning ${cached.size} cached subtitles for $normTitle")
-                return@withContext cached
-            }
-        }
-
-        Log.i(TAG_SUBTITLES, "source=SubtitleCat search starting: title=$rawTitle, norm=$normTitle, year=$detectedYear")
-
-        val subcatList = try {
-            searchSubtitleCat(
-                rawTitle = rawTitle,
-                normTitle = normTitle,
-                detectedYear = detectedYear,
-                seriesCleanName = seriesCleanName,
-                isSeries = isSeries,
-                season = season,
-                episode = episode
-            )
-        } catch (e: Exception) {
-            Log.e(TAG_SUBTITLES, "error=Fallo en búsqueda SubtitleCat: ${e.message}")
-            emptyList()
-        }
-
-        val seenUrls = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
-        val filteredSubcat = mutableListOf<ExternalSubtitle>()
-        for (sub in subcatList) {
-            if (seenUrls.add(sub.url)) {
-                filteredSubcat.add(sub)
-            }
-        }
-
-        Log.i(TAG_SUBTITLES, "SUBTITLECAT_RESULTS total=${filteredSubcat.size}")
-
-        // Ordenación inteligente y priorización de idiomas: Español -> Rumano -> Inglés -> resto
-        val sortedList = filteredSubcat.sortedWith(
-            compareByDescending<ExternalSubtitle> { sub ->
-                val l = sub.language.lowercase().trim()
-                val lbl = sub.label.lowercase()
-                when {
-                    l in listOf("es", "es-419", "spa") || lbl.contains("español") || lbl.contains("spanish") || lbl.contains("castellano") || lbl.contains("latino") -> 1000
-                    l in listOf("ro", "rum", "ron") || lbl.contains("rumano") || lbl.contains("romanian") || lbl.contains("română") -> 800
-                    l in listOf("en", "eng") || lbl.contains("inglés") || lbl.contains("ingles") || lbl.contains("english") -> 600
-                    l in listOf("fr", "fra", "fre") || lbl.contains("francés") || lbl.contains("frances") || lbl.contains("french") -> 400
-                    l in listOf("de", "deu", "ger") || lbl.contains("alemán") || lbl.contains("aleman") || lbl.contains("german") -> 350
-                    l in listOf("it", "ita") || lbl.contains("italiano") || lbl.contains("italian") -> 300
-                    l in listOf("pt", "por") || lbl.contains("portugués") || lbl.contains("portugues") || lbl.contains("portuguese") -> 250
-                    l in listOf("ru", "rus") || lbl.contains("ruso") || lbl.contains("russian") -> 200
-                    else -> 100
-                }
-            }.thenByDescending { sub ->
-                // Exact title match bonus in label
-                if (normTitle.isNotBlank() && sub.label.contains(normTitle, ignoreCase = true)) 50 else 0
-            }
-        )
-
-        Log.i(TAG_SUBTITLES, "finalResults=${sortedList.size}")
-        if (sortedList.isNotEmpty()) {
-            subtitlesCache[cacheKey1] = sortedList
-            subtitlesCache[cacheKey2] = sortedList
-        }
-        sortedList
-    }
-
-    data class SubtitleCatLangEntry(
-        val language: String,
-        val downloadUrl: String,
-        val titleOrDesc: String = ""
-    )
-
-    suspend fun searchSubtitleCat(
-        rawTitle: String = "",
-        normTitle: String,
-        detectedYear: Int?,
-        seriesCleanName: String,
-        isSeries: Boolean,
-        season: Int? = null,
-        episode: Int? = null
-    ): List<ExternalSubtitle> = coroutineScope {
-        val queriesToTry = mutableListOf<String>()
-        if (isSeries) {
-            val cleanName = seriesCleanName.ifBlank { normTitle }
-            if (season != null && episode != null) {
-                val sStr = String.format(java.util.Locale.US, "%02d", season)
-                val eStr = String.format(java.util.Locale.US, "%02d", episode)
-                queriesToTry.add("$cleanName S${sStr}E${eStr}")
-            }
-            queriesToTry.add(cleanName)
-        } else {
-            if (detectedYear != null && detectedYear > 1900) {
-                queriesToTry.add("$normTitle $detectedYear")
-            }
-            queriesToTry.add(normTitle)
-            if (rawTitle.isNotBlank()) {
-                val simple = cleanSimple(rawTitle)
-                if (simple.isNotBlank() && simple != normTitle) {
-                    queriesToTry.add(simple)
-                }
-            }
-        }
-
-        val subcatHeaders = mapOf(
-            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language" to "es-ES,es;q=0.9,ro;q=0.8,en;q=0.7"
-        )
-
-        // 1. Ejecutar las búsquedas en paralelo
-        val uniqueQueries = queriesToTry.distinct().filter { it.isNotBlank() }.take(2)
-        val searchDeferreds = uniqueQueries.map { query ->
-            async(Dispatchers.IO) {
-                try {
-                    val encodedQuery = URLEncoder.encode(query, "UTF-8")
-                    val searchUrl = "https://www.subtitlecat.com/index.php?search=$encodedQuery"
-                    val (statusCode, html) = executeSubcatHttp(searchUrl, subcatHeaders)
-                    if (statusCode in 200..299 && html.isNotBlank()) {
-                        extractSubtitleCatResultPages(html)
-                    } else {
-                        emptyList()
-                    }
-                } catch (e: Exception) {
-                    emptyList<String>()
-                }
-            }
-        }
-
-        val foundPageUrls = mutableListOf<String>()
-        val seenPageUrls = mutableSetOf<String>()
-        for (deferred in searchDeferreds) {
-            for (pUrl in deferred.await()) {
-                if (seenPageUrls.add(pUrl)) {
-                    foundPageUrls.add(pUrl)
-                }
-            }
-        }
-
-        Log.i("SUBTITLECAT_DEBUG", "RESULT_PAGES_FOUND=${foundPageUrls.size}")
-        if (foundPageUrls.isEmpty()) {
-            return@coroutineScope emptyList()
-        }
-
-        // 2. Obtener los enlaces de subtítulos de las páginas de detalle en paralelo (máximo top 2 páginas)
-        val pagesToFetch = foundPageUrls.take(2)
-        val pageDeferreds = pagesToFetch.map { pageUrl ->
-            async(Dispatchers.IO) {
-                try {
-                    val (pageStatus, pageHtml) = executeSubcatHttp(pageUrl, subcatHeaders)
-                    if (pageStatus in 200..299 && pageHtml.isNotBlank()) {
-                        extractSubtitleCatLanguageEntries(pageHtml, pageUrl)
-                    } else {
-                        emptyList()
-                    }
-                } catch (e: Exception) {
-                    emptyList<SubtitleCatLangEntry>()
-                }
-            }
-        }
-
-        val allCandidateEntries = mutableListOf<SubtitleCatLangEntry>()
-        for (deferred in pageDeferreds) {
-            allCandidateEntries.addAll(deferred.await())
-        }
-
-        if (allCandidateEntries.isEmpty()) {
-            return@coroutineScope emptyList()
-        }
-
-        // 3. Filtrar y priorizar idiomas CLAVE antes de descargar (Español, Rumano, Inglés, etc.)
-        // Evita descargar 50 idiomas innecesarios uno a uno
-        fun getLangPriority(lang: String): Int {
-            val l = lang.lowercase().trim()
-            return when {
-                l in listOf("es", "es-419", "spa", "latino", "castellano") -> 100
-                l in listOf("ro", "rum", "ron", "romana", "română") -> 90
-                l in listOf("en", "eng") -> 80
-                l in listOf("fr", "fra", "fre") -> 50
-                l in listOf("de", "deu", "ger") -> 45
-                l in listOf("it", "ita") -> 40
-                l in listOf("pt", "por") -> 35
-                l in listOf("ru", "rus") -> 30
-                else -> 10
-            }
-        }
-
-        val prioritizedEntries = allCandidateEntries
-            .groupBy { it.language.lowercase() }
-            .flatMap { (_, entries) -> entries.take(2) } // máximo 2 por idioma
-            .sortedByDescending { getLangPriority(it.language) }
-            .take(8) // Máximo 8 candidatos en total
-
-        Log.i("SUBTITLECAT_DEBUG", "PRIORITIZED_LANG_ENTRIES=${prioritizedEntries.size}")
-
-        // 4. Resolver y validar los subtítulos seleccionados EN PARALELO
-        val seenSubUrls = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
-        val subDeferreds = prioritizedEntries.map { entry ->
-            async(Dispatchers.IO) {
-                try {
-                    val resolved = resolveAndValidateSubtitle(entry.downloadUrl, subcatHeaders)
-                    if (resolved != null && resolved.second && seenSubUrls.add(resolved.first)) {
-                        val label = mapLanguageLabel(entry.language, "SubtitleCat")
-                        ExternalSubtitle(
-                            id = "subcat_${resolved.first.hashCode()}",
-                            url = resolved.first,
-                            label = label,
-                            language = entry.language
-                        )
-                    } else null
-                } catch (e: Exception) {
-                    null
-                }
-            }
-        }
-
-        val results = subDeferreds.mapNotNull { it.await() }
-        Log.i("SUBTITLECAT_DEBUG", "FINAL_SUBTITLECAT_RESULTS=${results.size}")
-        results
-    }
-
-    private suspend fun executeSubcatHttp(url: String, headers: Map<String, String>): Pair<Int, String> = withContext(Dispatchers.IO) {
-        try {
-            val reqBuilder = okhttp3.Request.Builder().url(url)
-            headers.forEach { (k, v) -> reqBuilder.header(k, v) }
-            val response = subcatClient.newCall(reqBuilder.build()).execute()
-            val code = response.code
-            val body = response.body?.string() ?: ""
-            Pair(code, body)
-        } catch (e: Exception) {
-            Log.e("SUBTITLECAT_DEBUG", "HTTP error fetching $url: ${e.message}")
-            Pair(0, "")
-        }
-    }
-
-    fun extractSubtitleCatResultPages(html: String): List<String> {
-        val resultPages = mutableListOf<String>()
-        val seen = mutableSetOf<String>()
-
-        val patterns = listOf(
-            Regex("""href=["'](/subs/[^"']+\.html|subs/[^"']+\.html|/subtitles/[^"']+\.html)""", RegexOption.IGNORE_CASE),
-            Regex("""<a\s+[^>]*href=["']([^"']*(?:/subs/|/subtitles/)[^"']*)["'][^>]*>""", RegexOption.IGNORE_CASE),
-            Regex("""<td[^>]*>\s*<a\s+[^>]*href=["']([^"']+)["'][^>]*>.*?</a>""", RegexOption.IGNORE_CASE),
-            Regex("""<th[^>]*>\s*<a\s+[^>]*href=["']([^"']+)["'][^>]*>.*?</a>""", RegexOption.IGNORE_CASE)
-        )
-
-        for (pattern in patterns) {
-            val matches = pattern.findAll(html)
-            for (m in matches) {
-                val rawPath = m.groupValues[1].trim()
-                if (rawPath.isBlank()) continue
-                val lower = rawPath.lowercase()
-                if (lower.contains("search") || lower.contains("privacy") || lower.contains("contact") ||
-                    lower.contains("login") || lower.contains("register") || lower.contains("dmca") ||
-                    lower.endsWith(".css") || lower.endsWith(".js") || lower.endsWith(".png") || lower.endsWith(".jpg")
-                ) {
-                    continue
-                }
-                val fullUrl = normalizeSubtitleCatUrl(rawPath, "https://www.subtitlecat.com")
-                if (fullUrl.contains("subtitlecat.com") && (fullUrl.contains("/subs/") || fullUrl.contains("/subtitles/") || fullUrl.endsWith(".html"))) {
-                    if (seen.add(fullUrl)) {
-                        resultPages.add(fullUrl)
-                        if (resultPages.size >= 10) break
-                    }
-                }
-            }
-            if (resultPages.size >= 8) break
-        }
-        return resultPages
-    }
-
-    fun extractSubtitleCatLanguageEntries(html: String, pageUrl: String): List<SubtitleCatLangEntry> {
-        val entries = mutableListOf<SubtitleCatLangEntry>()
-        val seen = mutableSetOf<String>()
-
-        fun addEntry(langHint: String, rawUrl: String, desc: String = "") {
-            if (rawUrl.isBlank()) return
-            val fullUrl = normalizeSubtitleCatUrl(rawUrl, pageUrl)
-            val langCode = parseSubtitleCatLang(langHint, fullUrl)
-            if (langCode != "unknown" && fullUrl.isNotBlank()) {
-                val key = "${langCode}_${fullUrl}"
-                if (seen.add(key)) {
-                    entries.add(SubtitleCatLangEntry(language = langCode, downloadUrl = fullUrl, titleOrDesc = desc))
-                }
-            }
-        }
-
-        // 1. Elements with id="download_xxx" or id="download-xxx"
-        val downloadBtnIdRegex = Regex("""<a\s+[^>]*id=["']download[_-]([a-zA-Z0-9_-]+)["'][^>]*href=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
-        val downloadBtnIdRegexRev = Regex("""<a\s+[^>]*href=["']([^"']+)["'][^>]*id=["']download[_-]([a-zA-Z0-9_-]+)["']""", RegexOption.IGNORE_CASE)
-        for (m in downloadBtnIdRegex.findAll(html)) {
-            addEntry(m.groupValues[1], m.groupValues[2])
-        }
-        for (m in downloadBtnIdRegexRev.findAll(html)) {
-            addEntry(m.groupValues[2], m.groupValues[1])
-        }
-
-        // 2. Links with language suffix before .html / .srt / .vtt (e.g. /subs/123/Movie-es.html, /subs/123/Movie-ro.html)
-        val langSuffixRegex = Regex("""<a\s+[^>]*href=["']([^"']*-([a-z]{2}(?:-[0-9]{3}|-[a-z]{2})?)\.(?:html|srt|vtt))["'][^>]*>(.*?)</a>""", RegexOption.IGNORE_CASE)
-        for (m in langSuffixRegex.findAll(html)) {
-            val href = m.groupValues[1]
-            val langCode = m.groupValues[2]
-            val text = m.groupValues[3].replace(Regex("<[^>]*>"), "").trim()
-            addEntry(langCode.ifBlank { text }, href, text)
-        }
-
-        // 3. Table rows with language in first column and link/button in another column
-        val tableRowRegex = Regex("""<tr[^>]*>\s*<td[^>]*>(.*?)</td>\s*<td[^>]*>.*?<a\s+[^>]*href=["']([^"']+)["'].*?</td>""", RegexOption.IGNORE_CASE)
-        for (m in tableRowRegex.findAll(html)) {
-            val langText = m.groupValues[1].replace(Regex("<[^>]*>"), "").trim()
-            val href = m.groupValues[2].trim()
-            addEntry(langText, href, langText)
-        }
-
-        // 4. Any anchor containing known language name in text or title
-        val langNamesRegex = Regex(
-            """<a\s+[^>]*href=["']([^"']+)["'][^>]*>(?:<[^>]+>)*\s*(Spanish|Español|Castellano|Latino|Latin\s*America|Romanian|Română|Romana|English|French|Français|German|Deutsch|Italian|Italiano|Portuguese|Português|Russian|Русский|Catalan|Catalán|Galician|Gallego|Basque|Euskera|Polish|Polski|Turkish|Türkçe|Dutch|Holandés|Greek|Griego|Ukrainian|Ucraniano|Arabic|Árabe)\s*(?:<[^>]+>)*</a>""",
-            RegexOption.IGNORE_CASE
-        )
-        for (m in langNamesRegex.findAll(html)) {
-            val href = m.groupValues[1].trim()
-            val langText = m.groupValues[2].trim()
-            addEntry(langText, href, langText)
-        }
-
-        // 5. Direct .srt / .vtt or /download/ links on the page
-        val directSubRegex = Regex("""<a\s+[^>]*href=["']([^"']*(?:\.srt|\.vtt|/download/|download\.php\?[^"']*))["'][^>]*>(.*?)</a>""", RegexOption.IGNORE_CASE)
-        for (m in directSubRegex.findAll(html)) {
-            val href = m.groupValues[1].trim()
-            val text = m.groupValues[2].replace(Regex("<[^>]*>"), "").trim()
-            addEntry(text.ifBlank { href }, href, text)
-        }
-
-        // 6. If the page itself is a specific language page (e.g. ...-es.html, ...-ro.html)
-        val selfLang = parseSubtitleCatLang("", pageUrl)
-        if (selfLang != "unknown") {
-            val mainDownloadRegex = Regex("""<a\s+[^>]*href=["']([^"']*(?:\.srt|\.vtt|/download/|download\.php\?[^"']*))["']""", RegexOption.IGNORE_CASE)
-            val directMatch = mainDownloadRegex.find(html)
-            if (directMatch != null) {
-                addEntry(selfLang, directMatch.groupValues[1])
-            } else {
-                addEntry(selfLang, pageUrl)
-            }
-        }
-
-        return entries
-    }
-
-    private fun normalizeSubtitleCatUrl(rawUrl: String, baseUrl: String): String {
-        val trimmed = rawUrl.trim()
-        return when {
-            trimmed.startsWith("http://", ignoreCase = true) || trimmed.startsWith("https://", ignoreCase = true) -> trimmed
-            trimmed.startsWith("//") -> "https:$trimmed"
-            trimmed.startsWith("/") -> "https://www.subtitlecat.com$trimmed"
-            else -> "https://www.subtitlecat.com/$trimmed"
-        }
-    }
-
-    private suspend fun resolveAndValidateSubtitle(
-        initialUrl: String,
-        headers: Map<String, String>
-    ): Pair<String, Boolean>? = withContext(Dispatchers.IO) {
-        try {
-            var currentUrl = initialUrl
-            var attempts = 0
-            while (attempts < 3) {
-                attempts++
-                val (status, content) = executeSubcatHttp(currentUrl, headers)
-                if (status !in 200..299 || content.isBlank()) {
-                    return@withContext Pair(currentUrl, false)
-                }
-
-                val isHtml = content.contains("<!DOCTYPE", ignoreCase = true) ||
-                             content.contains("<html", ignoreCase = true) ||
-                             content.contains("<body", ignoreCase = true) ||
-                             content.contains("<head", ignoreCase = true)
-
-                if (!isHtml) {
-                    val hasTimestamps = content.contains("-->") || content.trimStart().startsWith("WEBVTT", ignoreCase = true)
-                    val isValid = hasTimestamps && content.length >= 20
-                    return@withContext Pair(currentUrl, isValid)
-                }
-
-                // If content is HTML, resolve the next download link
-                val nextLink = extractDirectSubtitleLinkFromHtml(content, currentUrl)
-                if (nextLink != null && nextLink != currentUrl) {
-                    currentUrl = nextLink
-                } else {
-                    return@withContext Pair(currentUrl, false)
-                }
-            }
-            Pair(currentUrl, false)
-        } catch (e: Exception) {
-            Log.e("SUBTITLECAT_DEBUG", "Error resolving/validating subtitle: ${e.message}")
-            null
-        }
-    }
-
-    fun extractDirectSubtitleLinkFromHtml(html: String, baseUrl: String): String? {
-        // 1. Check for explicit srt / vtt download links
-        val srtMatch = Regex("""<a\s+[^>]*href=["']([^"']*\.(?:srt|vtt)[^"']*)["']""", RegexOption.IGNORE_CASE).find(html)
-        if (srtMatch != null) {
-            val href = srtMatch.groupValues[1].trim()
-            if (href.isNotBlank()) return normalizeSubtitleCatUrl(href, baseUrl)
-        }
-
-        // 2. Check for download buttons with id="download_..." or id="download"
-        val downloadBtnMatch = Regex("""<a\s+[^>]*id=["']download(?:_[a-zA-Z0-9_-]+)?["'][^>]*href=["']([^"']+)["']""", RegexOption.IGNORE_CASE).find(html)
-            ?: Regex("""<a\s+[^>]*href=["']([^"']+)["'][^>]*id=["']download(?:_[a-zA-Z0-9_-]+)?["']""", RegexOption.IGNORE_CASE).find(html)
-        if (downloadBtnMatch != null) {
-            val href = downloadBtnMatch.groupValues[1].trim()
-            if (href.isNotBlank()) return normalizeSubtitleCatUrl(href, baseUrl)
-        }
-
-        // 3. Check for links with /download/ or download.php
-        val downloadPathMatch = Regex("""<a\s+[^>]*href=["']([^"']*(?:/download/|download\.php\?[^"']*))["']""", RegexOption.IGNORE_CASE).find(html)
-        if (downloadPathMatch != null) {
-            val href = downloadPathMatch.groupValues[1].trim()
-            if (href.isNotBlank()) return normalizeSubtitleCatUrl(href, baseUrl)
-        }
-
-        // 4. Check for download attribute
-        val downloadAttrMatch = Regex("""<a\s+[^>]*download(?:\s*=\s*["'][^"']*["'])?\s+[^>]*href=["']([^"']+)["']""", RegexOption.IGNORE_CASE).find(html)
-            ?: Regex("""<a\s+[^>]*href=["']([^"']+)["'][^>]*download""", RegexOption.IGNORE_CASE).find(html)
-        if (downloadAttrMatch != null) {
-            val href = downloadAttrMatch.groupValues[1].trim()
-            if (href.isNotBlank()) return normalizeSubtitleCatUrl(href, baseUrl)
-        }
-
-        return null
-    }
-
-    fun parseSubtitleCatLang(textOrId: String, url: String): String {
-        val combined = "$textOrId $url".lowercase()
-        return when {
-            // es-419 / Latin America
-            combined.contains("es-419") || combined.contains("es_419") || combined.contains("es-la") ||
-            combined.contains("es_la") || combined.contains("latino") || combined.contains("latin america") ||
-            combined.contains("latam") || textOrId.equals("es-419", true) || textOrId.equals("es_419", true) -> "es-419"
-
-            // Spanish
-            combined.contains("spanish") || combined.contains("español") || combined.contains("espanol") ||
-            combined.contains("castellano") || combined.contains("spa") || combined.contains("es-es") ||
-            combined.contains("es_es") || combined.contains("-es.") || combined.contains("/es/") ||
-            textOrId.equals("es", true) || textOrId.equals("spa", true) -> "es"
-
-            // Romanian
-            combined.contains("romanian") || combined.contains("romana") || combined.contains("română") ||
-            combined.contains("rumano") || combined.contains("rum") || combined.contains("ron") ||
-            combined.contains("ro-ro") || combined.contains("ro_ro") || combined.contains("-ro.") ||
-            combined.contains("/ro/") || textOrId.equals("ro", true) || textOrId.equals("rum", true) ||
-            textOrId.equals("ron", true) -> "ro"
-
-            // English
-            combined.contains("english") || combined.contains("inglés") || combined.contains("ingles") ||
-            combined.contains("eng") || combined.contains("en-us") || combined.contains("en-gb") ||
-            combined.contains("en_us") || combined.contains("-en.") || combined.contains("/en/") ||
-            textOrId.equals("en", true) || textOrId.equals("eng", true) -> "en"
-
-            // French
-            combined.contains("french") || combined.contains("francés") || combined.contains("frances") ||
-            combined.contains("français") || combined.contains("francais") || combined.contains("fra") ||
-            combined.contains("fre") || combined.contains("fr-fr") || combined.contains("-fr.") ||
-            combined.contains("/fr/") || textOrId.equals("fr", true) || textOrId.equals("fra", true) ||
-            textOrId.equals("fre", true) -> "fr"
-
-            // German
-            combined.contains("german") || combined.contains("deutsch") || combined.contains("alemán") ||
-            combined.contains("aleman") || combined.contains("deu") || combined.contains("ger") ||
-            combined.contains("de-de") || combined.contains("-de.") || combined.contains("/de/") ||
-            textOrId.equals("de", true) || textOrId.equals("deu", true) || textOrId.equals("ger", true) -> "de"
-
-            // Italian
-            combined.contains("italian") || combined.contains("italiano") || combined.contains("ita") ||
-            combined.contains("it-it") || combined.contains("-it.") || combined.contains("/it/") ||
-            textOrId.equals("it", true) || textOrId.equals("ita", true) -> "it"
-
-            // Portuguese
-            combined.contains("portuguese") || combined.contains("portugués") || combined.contains("portugues") ||
-            combined.contains("por") || combined.contains("pt-br") || combined.contains("pt-pt") ||
-            combined.contains("pt_br") || combined.contains("-pt.") || combined.contains("/pt/") ||
-            textOrId.equals("pt", true) || textOrId.equals("por", true) || textOrId.equals("pt-br", true) -> "pt"
-
-            // Russian
-            combined.contains("russian") || combined.contains("ruso") || combined.contains("русский") ||
-            combined.contains("rus") || combined.contains("ru-ru") || combined.contains("-ru.") ||
-            combined.contains("/ru/") || textOrId.equals("ru", true) || textOrId.equals("rus", true) -> "ru"
-
-            // Catalan
-            combined.contains("catalan") || combined.contains("catalán") || combined.contains("cat") ||
-            combined.contains("-ca.") || textOrId.equals("ca", true) -> "ca"
-
-            // Galician
-            combined.contains("galician") || combined.contains("gallego") || combined.contains("glg") ||
-            combined.contains("-gl.") || textOrId.equals("gl", true) -> "gl"
-
-            // Basque
-            combined.contains("basque") || combined.contains("euskera") || combined.contains("eus") ||
-            combined.contains("-eu.") || textOrId.equals("eu", true) -> "eu"
-
-            // Polish
-            combined.contains("polish") || combined.contains("polski") || combined.contains("pol") ||
-            combined.contains("-pl.") || textOrId.equals("pl", true) -> "pl"
-
-            // Turkish
-            combined.contains("turkish") || combined.contains("türkçe") || combined.contains("tur") ||
-            combined.contains("-tr.") || textOrId.equals("tr", true) -> "tr"
-
-            // Dutch
-            combined.contains("dutch") || combined.contains("holandés") || combined.contains("nld") ||
-            combined.contains("dut") || combined.contains("-nl.") || textOrId.equals("nl", true) -> "nl"
-
-            // Greek
-            combined.contains("greek") || combined.contains("griego") || combined.contains("ell") ||
-            combined.contains("gre") || combined.contains("-el.") || textOrId.equals("el", true) -> "el"
-
-            // Ukrainian
-            combined.contains("ukrainian") || combined.contains("ucraniano") || combined.contains("ukr") ||
-            combined.contains("-uk.") || textOrId.equals("uk", true) -> "uk"
-
-            // Arabic
-            combined.contains("arabic") || combined.contains("árabe") || combined.contains("ara") ||
-            combined.contains("-ar.") || textOrId.equals("ar", true) -> "ar"
-
-            else -> {
-                val cleanToken = textOrId.filter { it.isLetter() }.lowercase()
-                if (cleanToken.length in 2..3) cleanToken else "unknown"
-            }
-        }
-    }
-
-    suspend fun fetchExternalSubtitles(imdbId: String, isSeries: Boolean, season: Int? = null, episode: Int? = null): List<ExternalSubtitle> {
-        return searchSubtitles(rawTitle = imdbId, isSeries = isSeries, seasonOverride = season, episodeOverride = episode)
-    }
-
     /**
      * Specialized metadata/synopsis flow for Xtream content.
      * 1. Check cache first.
@@ -1881,8 +1440,9 @@ object TmdbService {
         var user = activePlaylist?.user ?: ""
         var pass = activePlaylist?.pass ?: ""
 
+        val xtreamSource = com.example.motor.source.XtreamSource()
         if ((host.isBlank() || user.isBlank() || pass.isBlank()) && activePlaylist != null && activePlaylist.url.isNotBlank()) {
-            val creds = com.example.motor.parser.XtreamParser.resolveXtreamCredentials(activePlaylist.url)
+            val creds = xtreamSource.resolveCredentials(activePlaylist.url)
             if (creds != null) {
                 host = creds.host
                 port = creds.port.ifBlank { "80" }
@@ -1899,7 +1459,7 @@ object TmdbService {
                     // Movie / VOD
                     val vodId = extractVodId(item)
                     if (!vodId.isNullOrBlank()) {
-                        val vodInfoMap = com.example.motor.parser.XtreamParser.fetchXtreamVodInfo(
+                        val vodInfoMap = xtreamSource.fetchVodInfo(
                             host = host,
                             port = port,
                             user = user,
@@ -1955,7 +1515,7 @@ object TmdbService {
                     // Series
                     val seriesId = extractSeriesId(item)
                     if (!seriesId.isNullOrBlank()) {
-                        val seriesInfoMap = com.example.motor.parser.XtreamParser.fetchXtreamSeriesInfo(
+                        val seriesInfoMap = xtreamSource.fetchSeriesInfo(
                             host = host,
                             port = port,
                             user = user,

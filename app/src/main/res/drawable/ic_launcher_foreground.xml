@@ -3,6 +3,6 @@
     <item
         android:width="66dp"
         android:height="66dp"
-        android:drawable="@drawable/iptv_logo_1783799334122"
+        android:drawable="@drawable/icon_opt_bright_neon_1793039917023"
         android:gravity="center" />
 </layer-list>

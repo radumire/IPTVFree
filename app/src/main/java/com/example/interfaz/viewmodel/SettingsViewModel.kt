@@ -12,7 +12,6 @@ import com.example.interfaz.THEMES_LIST
 import com.example.interfaz.state.SettingsState
 import com.example.motor.config.PlayerSettings
 import com.example.motor.config.Playlist
-import com.example.motor.db.AppDatabase
 import com.example.motor.db.IptvItem
 import com.example.motor.db.UserProfile
 import com.example.motor.repository.MediaCacheRepository
@@ -27,8 +26,6 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     private val TAG = "SettingsViewModel"
     private val sessionRepo = PortalSessionRepository.getInstance(application)
     private val mediaCacheRepo = MediaCacheRepository.getInstance(application)
-    private val appDatabase = AppDatabase.getDatabase(application)
-    private val epgDao = appDatabase.epgCacheDao()
 
     val currentProfile: StateFlow<UserProfile?> = sessionRepo.currentProfile
     val settings: StateFlow<PlayerSettings> = sessionRepo.settings
@@ -50,6 +47,9 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
     private val _uiState = MutableStateFlow(SettingsState())
     val uiState: StateFlow<SettingsState> = _uiState.asStateFlow()
+
+    private var playlistGeneration = 0
+    private var lastLoadedPlaylistId: Long? = null
 
     init {
         viewModelScope.launch {
@@ -87,18 +87,58 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                 }
             }.collect()
         }
+
+        viewModelScope.launch {
+            sessionRepo.activePlaylist.collect { pl ->
+                val activeId = pl?.id
+                val isDifferent = activeId != lastLoadedPlaylistId
+                if (isDifferent) {
+                    categoriesJob?.cancel()
+                    _liveChannels.value = emptyMap()
+                    _precomputedMoviesData.value = null
+                    _precomputedSeriesData.value = null
+                    lastLoadedPlaylistId = null
+                }
+            }
+        }
     }
 
-    fun updateLiveChannels(channels: Map<String, List<IptvItem>>) {
-        _liveChannels.value = channels
+    private var categoriesJob: kotlinx.coroutines.Job? = null
+
+    fun ensureCategoriesLoaded() {
+        val pl = sessionRepo.activePlaylist.value ?: return
+        if (lastLoadedPlaylistId == pl.id && _precomputedMoviesData.value != null) {
+            return
+        }
+        if (categoriesJob?.isActive == true) return
+        categoriesJob = viewModelScope.launch(Dispatchers.IO) {
+            loadCategoriesForPlaylist(pl)
+        }
     }
 
-    fun updateMoviesData(data: PrecomputedMoviesData?) {
-        _precomputedMoviesData.value = data
-    }
+    private suspend fun loadCategoriesForPlaylist(pl: Playlist) {
+        val tvCats = mediaCacheRepo.getCategoryNames(pl.id, "tv")
+        val movieCats = mediaCacheRepo.getCategoryNames(pl.id, "movie")
+        val seriesCats = mediaCacheRepo.getCategoryNames(pl.id, "series")
 
-    fun updateSeriesData(data: PrecomputedSeriesData?) {
-        _precomputedSeriesData.value = data
+        _liveChannels.value = tvCats.associateWith { emptyList<IptvItem>() }
+        _precomputedMoviesData.value = PrecomputedMoviesData(
+            groups = movieCats,
+            allMovies = emptyList(),
+            groupToMovies = emptyMap(),
+            categoryCounts = emptyMap(),
+            totalMoviesCount = 0
+        )
+        _precomputedSeriesData.value = PrecomputedSeriesData(
+            groups = seriesCats,
+            seriesBaseNameCache = emptyMap(),
+            categoryCounts = emptyMap(),
+            allSeriesUnique = emptyList(),
+            groupToUniqueSeries = emptyMap(),
+            allSeries = emptyList()
+        )
+        lastLoadedPlaylistId = pl.id
+        Log.d(TAG, "SETTINGS_CATALOG loaded category names without full parsing: tv=${tvCats.size} movieCats=${movieCats.size} seriesCats=${seriesCats.size}")
     }
 
     fun updateCurrentProfileField(
@@ -114,7 +154,6 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         hiddenSeriesSet: Set<String>? = null
     ) {
         viewModelScope.launch {
-            val current = currentProfile.value ?: return@launch
             sessionRepo.updateCurrentProfile { prof ->
                 prof.copy(
                     name = name ?: prof.name,
@@ -144,7 +183,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         updateCurrentProfileField(themeId = themeId)
     }
 
-    fun clearAllCategoryAndEpgCaches() {
+    fun clearAllCategoryCaches() {
         viewModelScope.launch {
             withContext(Dispatchers.IO) {
                 try {
@@ -160,8 +199,10 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                     Log.e(TAG, "Failed to clear temp cacheDir", e)
                 }
                 try { mediaCacheRepo.clearAllCaches() } catch (_: Exception) {}
-                try { epgDao.clearAll() } catch (_: Exception) {}
             }
+            _liveChannels.value = emptyMap()
+            _precomputedMoviesData.value = null
+            _precomputedSeriesData.value = null
             _uiState.update { it.copy(message = "Caché limpiada correctamente") }
         }
     }
@@ -170,12 +211,54 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     override fun getPlaylists(): List<Playlist> = playlists.value
     override fun updatePlaylists(playlists: List<Playlist>) {
         updateCurrentProfileField(playlists = playlists)
+        ensureCategoriesLoaded()
     }
     override fun connectPlaylist(playlist: Playlist) {
         viewModelScope.launch {
-            val updated = playlists.value.map { it.copy(active = it.id == playlist.id) }
-            updateCurrentProfileField(playlists = updated)
+            sessionRepo.setActivePlaylist(playlist.id)
+            ensureCategoriesLoaded()
         }
     }
     override fun getApplicationContext(): Context? = getApplication()
+
+    override fun getSubtitleKeys(): Pair<String, String> {
+        val s = settings.value
+        return Pair(s.openSubtitlesKey, s.assrtToken)
+    }
+
+    override fun updateSubtitleKeys(openSubtitlesKey: String?, assrtToken: String?) {
+        viewModelScope.launch {
+            val current = settings.value
+            val newOpenSub = if (!openSubtitlesKey.isNullOrBlank()) openSubtitlesKey.trim() else current.openSubtitlesKey
+            val newAssrt = if (!assrtToken.isNullOrBlank()) assrtToken.trim() else current.assrtToken
+            val updated = current.copy(
+                openSubtitlesKey = newOpenSub,
+                assrtToken = newAssrt
+            )
+            updateCurrentProfileField(settings = updated)
+            com.example.motor.subtitles.OpenSubtitlesProvider.setGlobalApiKey(newOpenSub.takeIf { it.isNotBlank() })
+            com.example.motor.subtitles.AssrtSubtitleProvider.setGlobalToken(newAssrt.takeIf { it.isNotBlank() })
+            Log.i(TAG, "Subtitle keys updated via sync: OpenSubtitles=${newOpenSub.isNotBlank()}, Assrt=${newAssrt.isNotBlank()}")
+        }
+    }
+
+    override fun syncData(playlists: List<Playlist>, openSubtitlesKey: String?, assrtToken: String?) {
+        viewModelScope.launch {
+            val current = settings.value
+            val newOpenSub = if (!openSubtitlesKey.isNullOrBlank()) openSubtitlesKey.trim() else current.openSubtitlesKey
+            val newAssrt = if (!assrtToken.isNullOrBlank()) assrtToken.trim() else current.assrtToken
+            val updatedSettings = current.copy(
+                openSubtitlesKey = newOpenSub,
+                assrtToken = newAssrt
+            )
+            // Atomic update: both playlists and settings updated simultaneously in the same DB transaction
+            updateCurrentProfileField(
+                playlists = playlists,
+                settings = updatedSettings
+            )
+            com.example.motor.subtitles.OpenSubtitlesProvider.setGlobalApiKey(newOpenSub.takeIf { it.isNotBlank() })
+            com.example.motor.subtitles.AssrtSubtitleProvider.setGlobalToken(newAssrt.takeIf { it.isNotBlank() })
+            Log.i(TAG, "syncData atomic update completed: playlists=${playlists.size}, OpenSubtitles=${newOpenSub.isNotBlank()}, Assrt=${newAssrt.isNotBlank()}")
+        }
+    }
 }

@@ -2,6 +2,7 @@ package com.example.motor.repository
 
 import com.example.motor.config.Playlist
 import com.example.motor.db.IptvItem
+import com.example.motor.subtitles.ExternalSubtitle
 import com.example.motor.tmdb.TmdbService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -9,7 +10,6 @@ import java.io.File
 
 typealias CleanedTitle = TmdbService.CleanedTitle
 typealias MediaDetails = TmdbService.MediaDetails
-typealias ExternalSubtitle = TmdbService.ExternalSubtitle
 
 class TmdbRepository private constructor() {
 
@@ -70,9 +70,9 @@ class TmdbRepository private constructor() {
         isSeries: Boolean,
         season: Int? = null,
         episode: Int? = null
-    ): List<TmdbService.ExternalSubtitle> = withContext(Dispatchers.IO) {
+    ): List<ExternalSubtitle> = withContext(Dispatchers.IO) {
         try {
-            TmdbService.searchSubtitles(rawTitle, isSeries, season, episode)
+            SubtitleRepository.getInstance().searchSubtitles(rawTitle, isSeries, season, episode)
         } catch (e: Exception) {
             emptyList()
         }

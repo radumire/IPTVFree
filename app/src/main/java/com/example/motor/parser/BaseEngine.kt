@@ -97,6 +97,15 @@ sealed class NetworkError(val code: String, message: String, val httpStatus: Int
     class Auth(msg: String) : NetworkError("AUTH", msg)
     class NotFound(msg: String) : NetworkError("NOT_FOUND", msg)
     class ProviderCode(status: Int, msg: String) : NetworkError("PROVIDER_CODE", msg, status)
+    class RateLimit(msg: String) : NetworkError("RATE_LIMIT", msg, 429)
+    class TlsError(msg: String) : NetworkError("TLS_ERROR", msg)
+    class PortalBlockedMac(msg: String) : NetworkError("PORTAL_BLOCKED_MAC", msg, 403)
+    class InvalidHandshake(msg: String) : NetworkError("INVALID_HANDSHAKE", msg)
+    class InvalidProfile(msg: String) : NetworkError("INVALID_PROFILE", msg)
+    class TokenExpired(msg: String) : NetworkError("TOKEN_EXPIRED", msg, 401)
+    class InvalidStalkerResponse(msg: String) : NetworkError("INVALID_STALKER_RESPONSE", msg)
+    class CreateLinkRejected(msg: String) : NetworkError("CREATE_LINK_REJECTED", msg)
+    class PlaybackLinkInvalid(msg: String) : NetworkError("PLAYBACK_LINK_INVALID", msg)
     class Unknown(msg: String) : NetworkError("UNKNOWN", msg)
 }
 
@@ -228,11 +237,7 @@ object BaseEngine {
                     throw e
                 }
                 if (attempt < 3) {
-                    try {
-                        Thread.sleep(backoffs[attempt - 1])
-                    } catch (ie: InterruptedException) {
-                        // ignore
-                    }
+                    kotlinx.coroutines.delay(backoffs[attempt - 1])
                 }
             }
         }

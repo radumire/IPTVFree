@@ -1,6 +1,7 @@
 package com.example.motor.db
 
 import android.content.Context
+import androidx.room.ColumnInfo
 import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
@@ -10,8 +11,11 @@ import androidx.room.Entity
 import androidx.room.PrimaryKey
 import androidx.room.Dao
 import androidx.room.Insert
+import androidx.room.Index
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.Types
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
@@ -44,22 +48,35 @@ data class IptvItem(
     val drmLicenseUrl: String? = null
 )
 
-data class EpgProgramme(
-    val start: Long, // Epoch ms
-    val stop: Long,  // Epoch ms
+data class SeriesEpisode(
+    val id: String = "",
+    val episodeNum: String = "",
+    val seasonNum: String = "",
     val title: String,
     val subtitle: String = "",
     val desc: String = "",
-    val category: String = "",
     val rating: String = "",
-    val icon: String? = null
-)
+    val icon: String? = null,
+    val playbackUrl: String? = null,
+    val stalkerCmd: String? = null,
+    val seriesId: String? = null,
+    val seasonId: String? = null,
+    val episodeId: String? = null,
+    val videoId: String? = null,
+    val fileId: String? = null,
+    val file: String? = null,
+    val path: String? = null,
+    val category: String? = null
+) {
+    val playUrl: String
+        get() = playbackUrl?.ifBlank { null } ?: category?.ifBlank { null } ?: stalkerCmd ?: ""
+}
 
-data class EpgChannelData(
+data class SeriesSeason(
     val id: String,
     val name: String,
     val icon: String? = null,
-    val programmes: List<EpgProgramme> = emptyList()
+    val episodes: List<SeriesEpisode> = emptyList()
 )
 
 // ─── ROOM ENTITIES ───────────────────────────────────────────────────────────
@@ -77,37 +94,41 @@ data class CategoryCache(
 data class SeriesEpisodesCache(
     @PrimaryKey val key: String, // e.g., "source::seriesKey"
     val seriesName: String,
-    val episodesJson: String, // List<EpgChannelData> serialized as JSON
+    val episodesJson: String, // List<SeriesSeason> serialized as JSON
     val updatedAt: Long
 )
 
-@Entity(tableName = "epg_cache")
-data class EpgCache(
-    @PrimaryKey val channelKey: String, // e.g., "source::channelKey"
-    val source: String,
-    val channelDataJson: String, // EpgChannelData serialized
-    val updatedAt: Long
+@Entity(
+    tableName = "playback_history",
+    primaryKeys = ["src", "playlistId"],
+    indices = [Index(value = ["playlistId"])]
 )
-
-@Entity(tableName = "playback_history")
 data class PlaybackHistory(
-    @PrimaryKey val src: String, // Streaming URL
+    val src: String, // Streaming URL
     val title: String,
     val position: Long, // in seconds
     val duration: Long, // in seconds
     val pct: Float,
     val type: String, // "movie", "series", "live"
-    val ts: Long
+    val ts: Long,
+    @ColumnInfo(defaultValue = "0")
+    val playlistId: Long = 0L
 )
 
-@Entity(tableName = "favorites")
+@Entity(
+    tableName = "favorites",
+    primaryKeys = ["id", "playlistId"],
+    indices = [Index(value = ["playlistId"])]
+)
 data class FavoriteItem(
-    @PrimaryKey val id: String, // e.g., "tv-source-name"
+    val id: String, // e.g., "tv-source-name"
     val title: String,
     val type: String, // "tv", "movie", "series"
     val url: String,
     val logo: String? = null,
-    val addedAt: Long
+    val addedAt: Long,
+    @ColumnInfo(defaultValue = "0")
+    val playlistId: Long = 0L
 )
 
 @Entity(tableName = "general_settings")
@@ -121,7 +142,7 @@ data class GeneralSetting(
 data class UserProfile(
     @PrimaryKey val id: Long,
     val name: String,
-    val avatar: String = "👤",
+    val avatar: String = "avatar_plumber",
     val colorIdx: Int = 0,
     val pin: String = "",
     val playlistsJson: String = "[]", // List<Playlist> serialized as JSON string
@@ -140,11 +161,8 @@ class Converters {
 
     private val iptvItemListType = Types.newParameterizedType(List::class.java, IptvItem::class.java)
     private val categoryMapType = Types.newParameterizedType(Map::class.java, String::class.java, iptvItemListType)
-    private val epgProgrammeListType = Types.newParameterizedType(List::class.java, EpgProgramme::class.java)
 
     private val categoryMapAdapter = moshi.adapter<Map<String, List<IptvItem>>>(categoryMapType)
-    private val epgChannelDataAdapter = moshi.adapter(EpgChannelData::class.java)
-    private val epgProgrammeListAdapter = moshi.adapter<List<EpgProgramme>>(epgProgrammeListType)
 
     @TypeConverter
     fun fromCategoryMap(map: Map<String, List<IptvItem>>?): String? {
@@ -154,16 +172,6 @@ class Converters {
     @TypeConverter
     fun toCategoryMap(json: String?): Map<String, List<IptvItem>>? {
         return json?.let { categoryMapAdapter.fromJson(it) }
-    }
-
-    @TypeConverter
-    fun fromEpgChannelData(data: EpgChannelData?): String? {
-        return data?.let { epgChannelDataAdapter.toJson(it) }
-    }
-
-    @TypeConverter
-    fun toEpgChannelData(json: String?): EpgChannelData? {
-        return json?.let { epgChannelDataAdapter.fromJson(it) }
     }
 }
 
@@ -206,39 +214,36 @@ interface SeriesEpisodesCacheDao {
 }
 
 @Dao
-interface EpgCacheDao {
-    @Query("SELECT * FROM epg_cache WHERE channelKey = :channelKey")
-    suspend fun getByChannelKey(channelKey: String): EpgCache?
-
-    @Query("SELECT * FROM epg_cache WHERE source = :source")
-    suspend fun getAllForSource(source: String): List<EpgCache>
-
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun insert(cache: EpgCache)
-
-    @Query("DELETE FROM epg_cache WHERE source = :source")
-    suspend fun deleteForSource(source: String)
-
-    @Query("DELETE FROM epg_cache")
-    suspend fun clearAll()
-}
-
-@Dao
 interface PlaybackHistoryDao {
     @Query("SELECT * FROM playback_history ORDER BY ts DESC")
     fun getAllHistoryFlow(): Flow<List<PlaybackHistory>>
 
+    @Query("SELECT * FROM playback_history WHERE playlistId = :playlistId ORDER BY ts DESC")
+    fun getHistoryForPlaylistFlow(playlistId: Long): Flow<List<PlaybackHistory>>
+
     @Query("SELECT * FROM playback_history ORDER BY ts DESC")
     suspend fun getAllHistory(): List<PlaybackHistory>
 
+    @Query("SELECT * FROM playback_history WHERE playlistId = :playlistId ORDER BY ts DESC")
+    suspend fun getHistoryForPlaylist(playlistId: Long): List<PlaybackHistory>
+
     @Query("SELECT * FROM playback_history WHERE src = :src")
     suspend fun getBySrc(src: String): PlaybackHistory?
+
+    @Query("SELECT * FROM playback_history WHERE src = :src AND playlistId = :playlistId")
+    suspend fun getBySrcAndPlaylist(src: String, playlistId: Long): PlaybackHistory?
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(history: PlaybackHistory)
 
     @Query("DELETE FROM playback_history WHERE src = :src")
     suspend fun deleteBySrc(src: String)
+
+    @Query("DELETE FROM playback_history WHERE src = :src AND playlistId = :playlistId")
+    suspend fun deleteBySrcAndPlaylist(src: String, playlistId: Long)
+
+    @Query("DELETE FROM playback_history WHERE playlistId = :playlistId")
+    suspend fun clearForPlaylist(playlistId: Long)
 
     @Query("DELETE FROM playback_history")
     suspend fun clearAll()
@@ -249,20 +254,41 @@ interface FavoriteItemDao {
     @Query("SELECT * FROM favorites ORDER BY addedAt DESC")
     fun getAllFavoritesFlow(): Flow<List<FavoriteItem>>
 
+    @Query("SELECT * FROM favorites WHERE playlistId = :playlistId ORDER BY addedAt DESC")
+    fun getFavoritesForPlaylistFlow(playlistId: Long): Flow<List<FavoriteItem>>
+
     @Query("SELECT * FROM favorites ORDER BY addedAt DESC")
     suspend fun getAllFavorites(): List<FavoriteItem>
+
+    @Query("SELECT * FROM favorites WHERE playlistId = :playlistId ORDER BY addedAt DESC")
+    suspend fun getFavoritesForPlaylist(playlistId: Long): List<FavoriteItem>
 
     @Query("SELECT * FROM favorites WHERE type = :type ORDER BY addedAt DESC")
     suspend fun getByType(type: String): List<FavoriteItem>
 
+    @Query("SELECT * FROM favorites WHERE type = :type AND playlistId = :playlistId ORDER BY addedAt DESC")
+    suspend fun getByTypeAndPlaylist(type: String, playlistId: Long): List<FavoriteItem>
+
     @Query("SELECT * FROM favorites WHERE id = :id")
     suspend fun getById(id: String): FavoriteItem?
+
+    @Query("SELECT * FROM favorites WHERE id = :id AND playlistId = :playlistId")
+    suspend fun getByIdAndPlaylist(id: String, playlistId: Long): FavoriteItem?
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(favorite: FavoriteItem)
 
     @Query("DELETE FROM favorites WHERE id = :id")
     suspend fun deleteById(id: String)
+
+    @Query("DELETE FROM favorites WHERE id = :id AND playlistId = :playlistId")
+    suspend fun deleteByIdAndPlaylist(id: String, playlistId: Long)
+
+    @Query("DELETE FROM favorites WHERE (id = :key OR url = :key OR title = :key) AND playlistId = :playlistId")
+    suspend fun deleteByAnyKeyAndPlaylist(key: String, playlistId: Long)
+
+    @Query("DELETE FROM favorites WHERE playlistId = :playlistId")
+    suspend fun clearForPlaylist(playlistId: Long)
 
     @Query("DELETE FROM favorites")
     suspend fun clearAll()
@@ -303,24 +329,127 @@ interface UserProfileDao {
 
 // ─── DATABASE DEFINITION ─────────────────────────────────────────────────────
 
+val MIGRATION_2_3 = object : Migration(2, 3) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS `playback_history_new` (
+                `src` TEXT NOT NULL,
+                `title` TEXT NOT NULL,
+                `position` INTEGER NOT NULL,
+                `duration` INTEGER NOT NULL,
+                `pct` REAL NOT NULL,
+                `type` TEXT NOT NULL,
+                `ts` INTEGER NOT NULL,
+                `playlistId` INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(`src`, `playlistId`)
+            )
+            """.trimIndent()
+        )
+
+        var activePlId = 0L
+        try {
+            val cursor = db.query("SELECT playlistsJson FROM user_profiles LIMIT 1")
+            if (cursor.moveToFirst()) {
+                val json = cursor.getString(0) ?: ""
+                val regex = Regex(""""id":\s*(\d+)[^}]*?"active":\s*true""")
+                val match = regex.find(json)
+                if (match != null) {
+                    activePlId = match.groupValues[1].toLongOrNull() ?: 0L
+                } else {
+                    val fallbackRegex = Regex(""""id":\s*(\d+)""")
+                    val fbMatch = fallbackRegex.find(json)
+                    if (fbMatch != null) {
+                        activePlId = fbMatch.groupValues[1].toLongOrNull() ?: 0L
+                    }
+                }
+            }
+            cursor.close()
+        } catch (_: Exception) {}
+
+        db.execSQL(
+            """
+            INSERT INTO `playback_history_new` (`src`, `title`, `position`, `duration`, `pct`, `type`, `ts`, `playlistId`)
+            SELECT `src`, `title`, `position`, `duration`, `pct`, `type`, `ts`, $activePlId FROM `playback_history`
+            """.trimIndent()
+        )
+        db.execSQL("DROP TABLE `playback_history`")
+        db.execSQL("ALTER TABLE `playback_history_new` RENAME TO `playback_history`")
+        db.execSQL("CREATE INDEX IF NOT EXISTS `index_playback_history_playlistId` ON `playback_history` (`playlistId`)")
+    }
+}
+
+val MIGRATION_3_4 = object : Migration(3, 4) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS `favorites_new` (
+                `id` TEXT NOT NULL,
+                `title` TEXT NOT NULL,
+                `type` TEXT NOT NULL,
+                `url` TEXT NOT NULL,
+                `logo` TEXT,
+                `addedAt` INTEGER NOT NULL,
+                `playlistId` INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(`id`, `playlistId`)
+            )
+            """.trimIndent()
+        )
+
+        var activePlId = 0L
+        try {
+            val cursor = db.query("SELECT playlistsJson FROM user_profiles LIMIT 1")
+            if (cursor.moveToFirst()) {
+                val json = cursor.getString(0) ?: ""
+                val regex = Regex(""""id":\s*(\d+)[^}]*?"active":\s*true""")
+                val match = regex.find(json)
+                if (match != null) {
+                    activePlId = match.groupValues[1].toLongOrNull() ?: 0L
+                } else {
+                    val fallbackRegex = Regex(""""id":\s*(\d+)""")
+                    val fbMatch = fallbackRegex.find(json)
+                    if (fbMatch != null) {
+                        activePlId = fbMatch.groupValues[1].toLongOrNull() ?: 0L
+                    }
+                }
+            }
+            cursor.close()
+        } catch (_: Exception) {}
+
+        db.execSQL(
+            """
+            INSERT INTO `favorites_new` (`id`, `title`, `type`, `url`, `logo`, `addedAt`, `playlistId`)
+            SELECT `id`, `title`, `type`, `url`, `logo`, `addedAt`, $activePlId FROM `favorites`
+            """.trimIndent()
+        )
+        db.execSQL("DROP TABLE `favorites`")
+        db.execSQL("ALTER TABLE `favorites_new` RENAME TO `favorites`")
+        db.execSQL("CREATE INDEX IF NOT EXISTS `index_favorites_playlistId` ON `favorites` (`playlistId`)")
+    }
+}
+
+val MIGRATION_4_5 = object : Migration(4, 5) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("DROP TABLE IF EXISTS `epg_cache`")
+    }
+}
+
 @Database(
     entities = [
         CategoryCache::class,
         SeriesEpisodesCache::class,
-        EpgCache::class,
         PlaybackHistory::class,
         FavoriteItem::class,
         GeneralSetting::class,
         UserProfile::class
     ],
-    version = 2,
+    version = 5,
     exportSchema = false
 )
 @TypeConverters(Converters::class)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun categoryCacheDao(): CategoryCacheDao
     abstract fun seriesEpisodesCacheDao(): SeriesEpisodesCacheDao
-    abstract fun epgCacheDao(): EpgCacheDao
     abstract fun playbackHistoryDao(): PlaybackHistoryDao
     abstract fun favoriteItemDao(): FavoriteItemDao
     abstract fun generalSettingDao(): GeneralSettingDao
@@ -336,7 +465,10 @@ abstract class AppDatabase : RoomDatabase() {
                     context.applicationContext,
                     AppDatabase::class.java,
                     "radu_iptv_player_db"
-                ).fallbackToDestructiveMigration().build()
+                )
+                    .addMigrations(MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
+                    .fallbackToDestructiveMigration()
+                    .build()
                 INSTANCE = instance
                 instance
             }

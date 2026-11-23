@@ -67,8 +67,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        com.example.motor.config.MemoryHelper.logMemoryDiagnostics(this, "MainActivity")
         setupCoilImageLoader()
         com.example.motor.repository.TmdbRepository.getInstance().init(cacheDir)
+        com.example.motor.repository.SubtitleRepository.getInstance().init(cacheDir)
         try {
             androidx.core.view.WindowCompat.setDecorFitsSystemWindows(window, false)
             hideSystemUI()
@@ -88,6 +90,20 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        try {
+            com.example.motor.repository.MediaCacheRepository.getInstance(application).trimMemory(level)
+        } catch (_: Exception) {}
+    }
+
+    override fun onLowMemory() {
+        super.onLowMemory()
+        try {
+            com.example.motor.repository.MediaCacheRepository.getInstance(application).clearMemoryCache(keepActiveTvOnly = true)
+        } catch (_: Exception) {}
     }
 
     override fun onStop() {
