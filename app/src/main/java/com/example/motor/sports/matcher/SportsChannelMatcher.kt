@@ -3,6 +3,26 @@ package com.example.motor.sports.matcher
 import com.example.motor.db.IptvItem
 import com.example.motor.sports.model.SportsEvent
 
+internal const val STALKER_NO_PLAYABLE_CMD = "CHANNEL_NO_PLAYABLE_CMD"
+
+internal fun IptvItem.isPlayableChannel(): Boolean {
+    val cmdTrimmed = stalkerCmd?.trim().orEmpty()
+    if (cmdTrimmed.equals(STALKER_NO_PLAYABLE_CMD, ignoreCase = true)) {
+        return false
+    }
+    val urlTrimmed = url?.trim().orEmpty()
+    val hasValidUrl = urlTrimmed.isNotEmpty() && !urlTrimmed.equals(STALKER_NO_PLAYABLE_CMD, ignoreCase = true)
+    val hasValidStalkerCmd = cmdTrimmed.isNotEmpty()
+    return hasValidUrl || hasValidStalkerCmd
+}
+
+internal fun IptvItem.dedupIdentityKey(): String {
+    val normName = name.trim().lowercase()
+    val normCmd = stalkerCmd?.trim().orEmpty()
+    val normUrl = url?.trim().orEmpty()
+    return "$normName\u0000$normCmd\u0000$normUrl"
+}
+
 enum class MatchConfidence {
     HIGH,     // Coincidencia fuerte -> elegible para AUTO_PLAY
     MEDIUM,   // Coincidencia suficiente -> elegible para SELECTION

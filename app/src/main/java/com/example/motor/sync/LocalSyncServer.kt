@@ -9,6 +9,7 @@ import com.example.motor.config.*
 import com.squareup.moshi.Types
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
@@ -28,7 +29,7 @@ object LocalSyncServer {
     private var serverSocket: ServerSocket? = null
     private var serverThread: Thread? = null
     private var dataProvider: SyncServerDataProvider? = null
-    private val scope = CoroutineScope(Dispatchers.IO)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     var isRunning = false
         private set

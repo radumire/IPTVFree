@@ -155,6 +155,7 @@ fun VideoPlayer(
     episode: Int? = null,
     categoryChannels: List<com.example.motor.db.IptvItem> = emptyList(),
     categoryName: String? = null,
+    currentChannel: com.example.motor.db.IptvItem? = null,
     onSelectChannel: ((com.example.motor.db.IptvItem) -> Unit)? = null,
     stopOnDispose: Boolean = (mediaType != "live")
 ) {
@@ -1748,6 +1749,8 @@ fun VideoPlayer(
                 categoryName = categoryName ?: "",
                 channels = categoryChannels,
                 currentChannelName = title,
+                currentChannel = currentChannel,
+                currentChannelUrl = src,
                 accentColor = Color(0xFFB07FEE),
                 onSelectChannel = { channel ->
                     lastInteractionTimestamp = System.currentTimeMillis()
@@ -2648,9 +2651,9 @@ private fun formatTime(seconds: Long): String {
     val m = (seconds % 3600) / 60
     val s = seconds % 60
     return if (h > 0) {
-        String.format("%d:%02d:%02d", h, m, s)
+        String.format(java.util.Locale.ROOT, "%d:%02d:%02d", h, m, s)
     } else {
-        String.format("%02d:%02d", m, s)
+        String.format(java.util.Locale.ROOT, "%02d:%02d", m, s)
     }
 }
 

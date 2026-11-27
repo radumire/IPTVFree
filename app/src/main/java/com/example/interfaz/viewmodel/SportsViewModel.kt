@@ -4,6 +4,10 @@ import android.app.Application
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.Translator
+import com.example.interfaz.ParentalControl
+import com.example.motor.config.JsonUtils
+import com.example.motor.config.PlayerSettings
 import com.example.motor.db.IptvItem
 import com.example.motor.sports.broadcast.SportsTvBroadcastProvider
 import com.example.motor.sports.broadcast.TheSportsDbBroadcastResolver
@@ -12,7 +16,6 @@ import com.example.motor.sports.model.SportsEvent
 import com.example.motor.sports.model.SportsEventStatus
 import com.example.motor.sports.model.SportsFilter
 import com.example.motor.sports.model.SportsSport
-import com.example.motor.sports.remote.ApiKeyValidationResult
 import com.example.motor.sports.repository.SportStatus
 import com.example.motor.sports.repository.SportsRefreshException
 import com.example.motor.sports.repository.SportsRepository
@@ -31,15 +34,6 @@ import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * Modos de la interfaz de configuración de API Key.
- */
-enum class ApiKeyDialogMode {
-    FORM,           // Introducir / cambiar clave
-    INFO,           // Ver clave enmascarada y opciones [CAMBIAR] / [ELIMINAR]
-    CONFIRM_DELETE  // Confirmar eliminación
-}
-
-/**
  * Estado del selector de canales cuando existen múltiples candidatos que superan el umbral SELECTION.
  */
 data class ChannelSelectionState(
@@ -48,17 +42,16 @@ data class ChannelSelectionState(
     val playlistId: Long?
 )
 
+data class PendingParentalUnlock(
+    val event: SportsEvent,
+    val candidate: SportsChannelCandidate,
+    val allCandidates: List<SportsChannelCandidate>,
+    val playlistId: Long?
+)
+
 data class SportsUiState(
     val isLoading: Boolean = false,
     val isRefreshing: Boolean = false,
-    val isApiKeyConfigured: Boolean = false,
-    val hasUserApiKey: Boolean = false,
-    val maskedApiKey: String? = null,
-    val showApiKeyConfigDialog: Boolean = false,
-    val apiKeyDialogMode: ApiKeyDialogMode = ApiKeyDialogMode.FORM,
-    val isCheckingApiKey: Boolean = false,
-    val apiKeyFeedbackMessage: String? = null,
-    val apiKeyFeedbackSuccess: Boolean = false,
     val selectedSport: SportsSport = SportsSport.FOOTBALL,
     val selectedFilter: SportsFilter = SportsFilter.ALL,
     val liveEvents: List<SportsEvent> = emptyList(),
@@ -68,7 +61,9 @@ data class SportsUiState(
     val categoryEventCounts: Map<SportsSport, Int> = emptyMap(),
     val errorMessage: String? = null,
     val channelSelectionState: ChannelSelectionState? = null,
-    val isMatchingChannel: Boolean = false
+    val isMatchingChannel: Boolean = false,
+    val isParentalUnlocked: Boolean = false,
+    val pendingParentalUnlock: PendingParentalUnlock? = null
 ) {
     /**
      * Calcula de forma reactiva el número de eventos de un deporte dentro del conjunto
@@ -110,6 +105,7 @@ class SportsViewModel(application: Application) : AndroidViewModel(application) 
     private var broadcastResolver: SportsTvBroadcastProvider = TheSportsDbBroadcastResolver.getInstance()
     private val sessionRepo = com.example.motor.repository.PortalSessionRepository.getInstance(application)
     private val iptvRepo = com.example.motor.repository.IptvRepository.getInstance(application, sessionRepo)
+    internal var streamResolverOverride: (suspend (IptvItem) -> Pair<String, Map<String, String>>)? = null
 
     constructor(
         application: Application,
@@ -126,9 +122,25 @@ class SportsViewModel(application: Application) : AndroidViewModel(application) 
 
     init {
         Log.d(TheSportsDbBroadcastResolver.TAG, "[THESPORTSDB] SportsViewModel initialized")
+        viewModelScope.launch {
+            var lastProfileId: Long? = sessionRepo.currentProfile.value?.id
+            sessionRepo.currentProfile.collect { profile ->
+                if (profile?.id != lastProfileId) {
+                    lastProfileId = profile?.id
+                    unlockedProfileId = null
+                    _uiState.update {
+                        it.copy(
+                            isParentalUnlocked = false,
+                            pendingParentalUnlock = null
+                        )
+                    }
+                }
+            }
+        }
     }
 
     private val loadedSportCounts = ConcurrentHashMap<SportsSport, Int>()
+    private var unlockedProfileId: Long? = null
 
     private fun buildCategoryCounts(): Map<SportsSport, Int> {
         val repoCounts = repository.getAllCachedEventCounts()
@@ -139,148 +151,23 @@ class SportsViewModel(application: Application) : AndroidViewModel(application) 
 
     private val _uiState = MutableStateFlow(
         SportsUiState(
-            isApiKeyConfigured = true,
-            hasUserApiKey = false,
-            maskedApiKey = null,
             categoryEventCounts = buildCategoryCounts(),
             errorMessage = null
         )
     )
     val uiState: StateFlow<SportsUiState> = _uiState.asStateFlow()
 
+    private val _lastPlayedChannel = MutableStateFlow<IptvItem?>(null)
+    val lastPlayedChannel: StateFlow<IptvItem?> = _lastPlayedChannel.asStateFlow()
+
+    fun getActivePlaylistId(): Long? = channelsProvider.getActivePlaylistId()
+
     private var loadJob: Job? = null
     private var livePollingJob: Job? = null
     private var preloadJob: Job? = null
+    private var matchJob: Job? = null
     @Volatile
     private var hasPreloadedCategories = false
-
-    fun openApiKeyConfig() {
-        val hasKey = repository.hasUserApiKey()
-        _uiState.update {
-            it.copy(
-                showApiKeyConfigDialog = true,
-                apiKeyDialogMode = if (hasKey) ApiKeyDialogMode.INFO else ApiKeyDialogMode.FORM,
-                apiKeyFeedbackMessage = null,
-                isCheckingApiKey = false
-            )
-        }
-    }
-
-    fun openApiKeyForm() {
-        _uiState.update {
-            it.copy(
-                apiKeyDialogMode = ApiKeyDialogMode.FORM,
-                apiKeyFeedbackMessage = null,
-                isCheckingApiKey = false
-            )
-        }
-    }
-
-    fun promptDeleteApiKey() {
-        _uiState.update {
-            it.copy(
-                apiKeyDialogMode = ApiKeyDialogMode.CONFIRM_DELETE,
-                apiKeyFeedbackMessage = null,
-                isCheckingApiKey = false
-            )
-        }
-    }
-
-    fun dismissApiKeyConfig() {
-        _uiState.update {
-            it.copy(
-                showApiKeyConfigDialog = false,
-                apiKeyFeedbackMessage = null,
-                isCheckingApiKey = false
-            )
-        }
-    }
-
-    fun deleteUserApiKey() {
-        repository.removeUserApiKey()
-        loadedSportCounts.clear()
-        val isConfigured = repository.isApiKeyConfigured()
-        _uiState.update {
-            it.copy(
-                hasUserApiKey = false,
-                maskedApiKey = null,
-                isApiKeyConfigured = isConfigured,
-                showApiKeyConfigDialog = false,
-                apiKeyFeedbackMessage = null,
-                isCheckingApiKey = false,
-                liveEvents = emptyList(),
-                todayEvents = emptyList(),
-                tomorrowEvents = emptyList(),
-                weekEvents = emptyList(),
-                categoryEventCounts = emptyMap(),
-                errorMessage = if (!isConfigured) "Para mostrar eventos deportivos necesitas una API key de API-Sports." else null
-            )
-        }
-        hasPreloadedCategories = false
-        loadData(forceRefresh = true)
-    }
-
-    fun saveAndCheckApiKey(apiKey: String) {
-        val cleanKey = apiKey.trim()
-        if (cleanKey.isEmpty()) {
-            _uiState.update {
-                it.copy(
-                    apiKeyFeedbackMessage = "La API key no es válida.",
-                    apiKeyFeedbackSuccess = false,
-                    isCheckingApiKey = false
-                )
-            }
-            return
-        }
-
-        viewModelScope.launch {
-            _uiState.update {
-                it.copy(
-                    isCheckingApiKey = true,
-                    apiKeyFeedbackMessage = null
-                )
-            }
-
-            val result = repository.saveAndValidateUserApiKey(cleanKey)
-            when (result) {
-                is ApiKeyValidationResult.Valid -> {
-                    val masked = repository.getMaskedUserApiKey()
-                    _uiState.update {
-                        it.copy(
-                            isCheckingApiKey = false,
-                            apiKeyFeedbackMessage = "✓ API configurada correctamente",
-                            apiKeyFeedbackSuccess = true,
-                            hasUserApiKey = true,
-                            maskedApiKey = masked,
-                            isApiKeyConfigured = true,
-                            errorMessage = null
-                        )
-                    }
-                    delay(800)
-                    _uiState.update { it.copy(showApiKeyConfigDialog = false) }
-                    loadData(forceRefresh = true)
-                }
-                is ApiKeyValidationResult.InvalidKey -> {
-                    _uiState.update {
-                        it.copy(
-                            isCheckingApiKey = false,
-                            apiKeyFeedbackMessage = "La API key no es válida.",
-                            apiKeyFeedbackSuccess = false
-                        )
-                    }
-                }
-                is ApiKeyValidationResult.NetworkError -> {
-                    _uiState.update {
-                        it.copy(
-                            isCheckingApiKey = false,
-                            apiKeyFeedbackMessage = "No se pudo comprobar la API key. Comprueba tu conexión.",
-                            apiKeyFeedbackSuccess = false
-                        )
-                    }
-                }
-            }
-        }
-    }
 
     fun selectSport(sport: SportsSport) {
         if (_uiState.value.selectedSport == sport) return
@@ -304,7 +191,7 @@ class SportsViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun preloadCategoryCounts() {
-        if (!repository.isApiKeyConfigured() || hasPreloadedCategories) return
+        if (hasPreloadedCategories) return
         hasPreloadedCategories = true
         preloadJob?.cancel()
         preloadJob = viewModelScope.launch(Dispatchers.IO) {
@@ -317,7 +204,8 @@ class SportsViewModel(application: Application) : AndroidViewModel(application) 
                 SportsSport.BOXING,
                 SportsSport.RUGBY,
                 SportsSport.BASEBALL,
-                SportsSport.GOLF
+                SportsSport.GOLF,
+                SportsSport.OTHER
             )
             supervisorScope {
                 sportsToPreload.forEach { sport ->
@@ -362,8 +250,7 @@ class SportsViewModel(application: Application) : AndroidViewModel(application) 
                 it.copy(
                     isLoading = it.liveEvents.isEmpty() && it.todayEvents.isEmpty() && it.tomorrowEvents.isEmpty() && it.weekEvents.isEmpty(),
                     isRefreshing = forceRefresh,
-                    errorMessage = null,
-                    isApiKeyConfigured = true
+                    errorMessage = null
                 )
             }
 
@@ -428,19 +315,20 @@ class SportsViewModel(application: Application) : AndroidViewModel(application) 
                     it.copy(
                         isLoading = false,
                         isRefreshing = false,
-                        errorMessage = "No se pudieron actualizar los eventos."
+                        errorMessage = Translator.translate("sports_refresh_error", currentLang())
                     )
                 }
             } catch (e: Exception) {
+                val lang = currentLang()
                 _uiState.update {
                     val hasExistingData = it.liveEvents.isNotEmpty() || it.todayEvents.isNotEmpty() || it.tomorrowEvents.isNotEmpty() || it.weekEvents.isNotEmpty()
                     it.copy(
                         isLoading = false,
                         isRefreshing = false,
                         errorMessage = if (hasExistingData) {
-                            "No se pudieron actualizar los eventos."
+                            Translator.translate("sports_refresh_error", lang)
                         } else {
-                            "No se pudieron cargar los eventos deportivos."
+                            Translator.translate("sports_load_failed", lang)
                         }
                     )
                 }
@@ -454,19 +342,113 @@ class SportsViewModel(application: Application) : AndroidViewModel(application) 
      * Flujo determinista (Fase 3):
      * - AUTO_PLAY: 1 candidato claro con confianza alta -> Reproduce inmediatamente.
      * - SELECTION: Múltiples candidatos válidos -> Despliega el diálogo selector.
-     * - NO_MATCH: Ninguna coincidencia suficiente -> Muestra "Canal no encontrado en la lista activa."
+     * - NO_MATCH: Ninguna coincidencia suficiente -> Muestra aviso de canal no encontrado.
      */
-    private suspend fun resolvePlayableChannel(channel: IptvItem): Pair<String, Map<String, String>> {
+    private sealed class StreamResolutionResult {
+        data class Success(val url: String, val headers: Map<String, String>) : StreamResolutionResult()
+        data class Failure(val message: String) : StreamResolutionResult()
+    }
+
+    internal fun buildStreamResolutionErrorMessage(channelName: String, error: Throwable?): String {
+        val lang = currentLang()
+        val detail = error?.message?.trim()?.takeIf { it.isNotBlank() }
+        return when (error) {
+            is com.example.motor.parser.NetworkError.PortalBlockedMac ->
+                Translator.translate(
+                    "sports_stream_blocked_mac",
+                    lang,
+                    channelName,
+                    detail ?: Translator.translate("sports_stream_blocked_mac_default", lang)
+                )
+            is com.example.motor.parser.NetworkError.Auth,
+            is com.example.motor.parser.NetworkError.TokenExpired ->
+                Translator.translate(
+                    "sports_stream_session_expired",
+                    lang,
+                    channelName,
+                    detail ?: Translator.translate("sports_stream_session_expired_default", lang)
+                )
+            is com.example.motor.parser.NetworkError.Timeout,
+            is com.example.motor.parser.NetworkError.ServerDown,
+            is com.example.motor.parser.NetworkError.Dns ->
+                Translator.translate(
+                    "sports_stream_connection_error",
+                    lang,
+                    channelName,
+                    detail ?: Translator.translate("sports_stream_connection_error_default", lang)
+                )
+            is com.example.motor.parser.NetworkError ->
+                Translator.translate(
+                    "sports_stream_open_error",
+                    lang,
+                    channelName,
+                    detail ?: Translator.translate("sports_stream_portal_error_default", lang)
+                )
+            null ->
+                Translator.translate("sports_stream_no_link", lang, channelName)
+            else ->
+                Translator.translate(
+                    "sports_stream_open_error",
+                    lang,
+                    channelName,
+                    detail ?: Translator.translate("sports_stream_resolve_error_default", lang)
+                )
+        }
+    }
+
+    private suspend fun resolvePlayableChannelResult(channel: IptvItem): StreamResolutionResult {
+        val fallbackDirectUrl = channel.url?.trim()?.takeIf {
+            it.isNotEmpty() && !it.equals(STALKER_NO_PLAYABLE_CMD, ignoreCase = true)
+        }
+        val override = streamResolverOverride
+        if (override != null) {
+            return try {
+                val (resolvedUrl, resolvedHeaders) = override(channel)
+                if (resolvedUrl.isNotBlank()) {
+                    StreamResolutionResult.Success(resolvedUrl, resolvedHeaders)
+                } else {
+                    StreamResolutionResult.Failure(buildStreamResolutionErrorMessage(channel.name, null))
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w("SportsViewModel", "Error resolving stream for ${channel.name}: ${e.message}")
+                if (fallbackDirectUrl != null) {
+                    StreamResolutionResult.Success(
+                        fallbackDirectUrl,
+                        iptvRepo.getStreamHeaders(sessionRepo.activePlaylist.value)
+                    )
+                } else {
+                    StreamResolutionResult.Failure(buildStreamResolutionErrorMessage(channel.name, e))
+                }
+            }
+        }
+
         val pl = sessionRepo.activePlaylist.value
         return if (pl != null) {
             try {
-                iptvRepo.resolveStreamUrl(pl, channel, "live")
+                val (resolvedUrl, resolvedHeaders) = iptvRepo.resolveStreamUrl(pl, channel, "live")
+                if (resolvedUrl.isNotBlank()) {
+                    StreamResolutionResult.Success(resolvedUrl, resolvedHeaders)
+                } else {
+                    StreamResolutionResult.Failure(buildStreamResolutionErrorMessage(channel.name, null))
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Log.w("SportsViewModel", "Error resolving stream for ${channel.name}: ${e.message}")
-                Pair(channel.url ?: "", iptvRepo.getStreamHeaders(pl))
+                if (fallbackDirectUrl != null) {
+                    StreamResolutionResult.Success(fallbackDirectUrl, iptvRepo.getStreamHeaders(pl))
+                } else {
+                    StreamResolutionResult.Failure(buildStreamResolutionErrorMessage(channel.name, e))
+                }
             }
+        } else if (fallbackDirectUrl != null) {
+            StreamResolutionResult.Success(fallbackDirectUrl, iptvRepo.getStreamHeaders(null))
         } else {
-            Pair(channel.url ?: "", iptvRepo.getStreamHeaders(null))
+            StreamResolutionResult.Failure(
+                Translator.translate("sports_no_active_playlist_for_channel", currentLang(), channel.name)
+            )
         }
     }
 
@@ -475,8 +457,11 @@ class SportsViewModel(application: Application) : AndroidViewModel(application) 
         onPlay: (src: String, title: String, dScheme: String?, dLicense: String?, matchChannels: List<IptvItem>, matchCategoryName: String?, headers: Map<String, String>) -> Unit,
         onNotice: (String) -> Unit
     ) {
-        viewModelScope.launch {
-            _uiState.update { it.copy(isMatchingChannel = true) }
+        if (matchJob?.isActive == true || _uiState.value.isMatchingChannel) {
+            return
+        }
+        _uiState.update { it.copy(isMatchingChannel = true) }
+        matchJob = viewModelScope.launch {
             try {
                 val currentPlaylistId = channelsProvider.getActivePlaylistId()
                 val channels = withContext(Dispatchers.IO) {
@@ -485,7 +470,7 @@ class SportsViewModel(application: Application) : AndroidViewModel(application) 
 
                 if (channels.isEmpty()) {
                     _uiState.update { it.copy(isMatchingChannel = false) }
-                    onNotice("No hay canales disponibles en la lista activa.")
+                    onNotice(Translator.translate("sports_no_channels", currentLang()))
                     return@launch
                 }
 
@@ -494,8 +479,16 @@ class SportsViewModel(application: Application) : AndroidViewModel(application) 
                     withContext(Dispatchers.IO) {
                         broadcastResolver.resolveBroadcastInfo(event)
                     }
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
                 } catch (e: Exception) {
                     null
+                }
+
+                if (channelsProvider.getActivePlaylistId() != currentPlaylistId) {
+                    _uiState.update { it.copy(isMatchingChannel = false) }
+                    onNotice(Translator.translate("sports_playlist_changed", currentLang()))
+                    return@launch
                 }
 
                 val enrichedEvent = if (broadcastInfo != null && broadcastInfo.channels.isNotEmpty()) {
@@ -508,33 +501,71 @@ class SportsViewModel(application: Application) : AndroidViewModel(application) 
                     matcher.matchChannel(enrichedEvent, channels, currentPlaylistId)
                 }
 
+                if (channelsProvider.getActivePlaylistId() != currentPlaylistId) {
+                    _uiState.update { it.copy(isMatchingChannel = false) }
+                    onNotice(Translator.translate("sports_playlist_changed", currentLang()))
+                    return@launch
+                }
+
                 when (matchResult.decision) {
                     MatchDecision.AUTO_PLAY -> {
                         val candidate = matchResult.topMatch
                         if (candidate != null) {
-                            val (resolvedUrl, resolvedHeaders) = withContext(Dispatchers.IO) {
-                                resolvePlayableChannel(candidate.channel)
+                            if (isChannelParentalLocked(candidate.channel)) {
+                                ParentalControl.logParental(
+                                    enabled = true,
+                                    channel = candidate.channel.name,
+                                    restricted = true,
+                                    pinRequired = true,
+                                    pinSuccess = false
+                                )
+                                _uiState.update {
+                                    it.copy(
+                                        isMatchingChannel = false,
+                                        channelSelectionState = null,
+                                        pendingParentalUnlock = PendingParentalUnlock(
+                                            event = event,
+                                            candidate = candidate,
+                                            allCandidates = matchResult.candidates.ifEmpty { listOf(candidate) },
+                                            playlistId = currentPlaylistId
+                                        )
+                                    )
+                                }
+                                return@launch
+                            }
+                            val resolution = withContext(Dispatchers.IO) {
+                                resolvePlayableChannelResult(candidate.channel)
                             }
                             _uiState.update { it.copy(isMatchingChannel = false) }
-                            if (resolvedUrl.isNotBlank()) {
-                                _uiState.update { it.copy(channelSelectionState = null) }
-                                val matchChannels = matchResult.candidates.map { it.channel }.ifEmpty { listOf(candidate.channel) }
-                                val matchTitle = "${event.homeTeam} vs ${event.awayTeam}"
-                                onPlay(
-                                    resolvedUrl,
-                                    candidate.channel.name,
-                                    candidate.channel.drmScheme,
-                                    candidate.channel.drmLicenseUrl,
-                                    matchChannels,
-                                    matchTitle,
-                                    resolvedHeaders
-                                )
-                            } else {
-                                onNotice("Canal no encontrado en la lista activa.")
+                            if (channelsProvider.getActivePlaylistId() != currentPlaylistId) {
+                                onNotice(Translator.translate("sports_playlist_changed", currentLang()))
+                                return@launch
+                            }
+                            when (resolution) {
+                                is StreamResolutionResult.Success -> {
+                                    _uiState.update { it.copy(channelSelectionState = null) }
+                                    val matchChannels = filterAllowedMatchChannels(
+                                        matchResult.candidates.map { it.channel }.ifEmpty { listOf(candidate.channel) }
+                                    )
+                                    val matchTitle = "${event.homeTeam} vs ${event.awayTeam}"
+                                    _lastPlayedChannel.value = candidate.channel
+                                    onPlay(
+                                        resolution.url,
+                                        candidate.channel.name,
+                                        candidate.channel.drmScheme,
+                                        candidate.channel.drmLicenseUrl,
+                                        matchChannels,
+                                        matchTitle,
+                                        resolution.headers
+                                    )
+                                }
+                                is StreamResolutionResult.Failure -> {
+                                    onNotice(resolution.message)
+                                }
                             }
                         } else {
                             _uiState.update { it.copy(isMatchingChannel = false) }
-                            onNotice("Canal no encontrado en la lista activa.")
+                            onNotice(Translator.translate("sports_channel_not_found", currentLang()))
                         }
                     }
                     MatchDecision.SELECTION -> {
@@ -551,12 +582,24 @@ class SportsViewModel(application: Application) : AndroidViewModel(application) 
                     }
                     MatchDecision.NO_MATCH -> {
                         _uiState.update { it.copy(isMatchingChannel = false) }
-                        onNotice("Canal no encontrado en la lista activa.")
+                        onNotice(Translator.translate("sports_channel_not_found", currentLang()))
                     }
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                _uiState.update { it.copy(isMatchingChannel = false) }
+                throw e
             } catch (e: Exception) {
                 _uiState.update { it.copy(isMatchingChannel = false) }
-                onNotice("Canal no encontrado en la lista activa.")
+                val lang = currentLang()
+                val detail = e.message?.trim()?.takeIf { it.isNotBlank() }
+                onNotice(
+                    detail?.let { Translator.translate("sports_search_error_detail", lang, it) }
+                        ?: Translator.translate("sports_search_error", lang)
+                )
+            } finally {
+                if (_uiState.value.isMatchingChannel) {
+                    _uiState.update { it.copy(isMatchingChannel = false) }
+                }
             }
         }
     }
@@ -569,44 +612,204 @@ class SportsViewModel(application: Application) : AndroidViewModel(application) 
         onPlay: (src: String, title: String, dScheme: String?, dLicense: String?, matchChannels: List<IptvItem>, matchCategoryName: String?, headers: Map<String, String>) -> Unit,
         onNotice: (String) -> Unit
     ) {
+        if (matchJob?.isActive == true || _uiState.value.isMatchingChannel) {
+            return
+        }
+
         val currentPlaylistId = channelsProvider.getActivePlaylistId()
         val activeSelection = _uiState.value.channelSelectionState
 
         // Invalidación estricta de playlist si cambió entretanto
         if (activeSelection != null && activeSelection.playlistId != currentPlaylistId) {
             dismissChannelSelection()
-            onNotice("La lista activa ha cambiado. Vuelve a pulsar Ver.")
+            onNotice(Translator.translate("sports_playlist_changed", currentLang()))
             return
         }
 
         val allCandidates = activeSelection?.candidates ?: listOf(candidate)
-        val matchChannels = allCandidates.map { it.channel }
+
+        if (isChannelParentalLocked(candidate.channel)) {
+            ParentalControl.logParental(
+                enabled = true,
+                channel = candidate.channel.name,
+                restricted = true,
+                pinRequired = true,
+                pinSuccess = false
+            )
+            val pendingEvent = activeSelection?.event ?: SportsEvent(
+                id = "manual_${candidate.channel.name}",
+                sport = _uiState.value.selectedSport.id,
+                league = "",
+                homeTeam = candidate.channel.name,
+                awayTeam = "",
+                startTime = 0L,
+                status = SportsEventStatus.LIVE
+            )
+            _uiState.update {
+                it.copy(
+                    channelSelectionState = null,
+                    pendingParentalUnlock = PendingParentalUnlock(
+                        event = pendingEvent,
+                        candidate = candidate,
+                        allCandidates = allCandidates,
+                        playlistId = currentPlaylistId
+                    )
+                )
+            }
+            return
+        }
+
+        val matchChannels = filterAllowedMatchChannels(allCandidates.map { it.channel })
         val matchTitle = activeSelection?.event?.let { "${it.homeTeam} vs ${it.awayTeam}" } ?: candidate.channel.name
 
         dismissChannelSelection()
-        viewModelScope.launch {
-            _uiState.update { it.copy(isMatchingChannel = true) }
+        _uiState.update { it.copy(isMatchingChannel = true) }
+        matchJob = viewModelScope.launch {
             try {
-                val (resolvedUrl, resolvedHeaders) = withContext(Dispatchers.IO) {
-                    resolvePlayableChannel(candidate.channel)
+                val resolution = withContext(Dispatchers.IO) {
+                    resolvePlayableChannelResult(candidate.channel)
                 }
                 _uiState.update { it.copy(isMatchingChannel = false) }
-                if (resolvedUrl.isNotBlank()) {
-                    onPlay(
-                        resolvedUrl,
-                        candidate.channel.name,
-                        candidate.channel.drmScheme,
-                        candidate.channel.drmLicenseUrl,
-                        matchChannels,
-                        matchTitle,
-                        resolvedHeaders
-                    )
-                } else {
-                    onNotice("Canal no reproducible.")
+                if (channelsProvider.getActivePlaylistId() != currentPlaylistId) {
+                    onNotice(Translator.translate("sports_playlist_changed", currentLang()))
+                    return@launch
                 }
+                when (resolution) {
+                    is StreamResolutionResult.Success -> {
+                        _lastPlayedChannel.value = candidate.channel
+                        onPlay(
+                            resolution.url,
+                            candidate.channel.name,
+                            candidate.channel.drmScheme,
+                            candidate.channel.drmLicenseUrl,
+                            matchChannels,
+                            matchTitle,
+                            resolution.headers
+                        )
+                    }
+                    is StreamResolutionResult.Failure -> {
+                        onNotice(resolution.message)
+                    }
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                _uiState.update { it.copy(isMatchingChannel = false) }
+                throw e
             } catch (e: Exception) {
                 _uiState.update { it.copy(isMatchingChannel = false) }
-                onNotice("Canal no reproducible.")
+                onNotice(buildStreamResolutionErrorMessage(candidate.channel.name, e))
+            } finally {
+                if (_uiState.value.isMatchingChannel) {
+                    _uiState.update { it.copy(isMatchingChannel = false) }
+                }
+            }
+        }
+    }
+
+    private fun currentPlayerSettings(): PlayerSettings {
+        val rawSettings = sessionRepo.currentProfile.value?.settingsJson
+        return if (!rawSettings.isNullOrBlank()) {
+            JsonUtils.settingsFromJson(rawSettings)
+        } else {
+            sessionRepo.settings.value
+        }
+    }
+
+    private fun currentLang(): String = currentPlayerSettings().lang
+
+    fun getExpectedParentalPin(): String = currentPlayerSettings().parentalPin
+
+    fun isParentalUnlockedForCurrentProfile(): Boolean {
+        val profileId = sessionRepo.currentProfile.value?.id
+        return _uiState.value.isParentalUnlocked && unlockedProfileId == profileId
+    }
+
+    fun isChannelParentalLocked(channel: IptvItem): Boolean {
+        val settings = currentPlayerSettings()
+        return settings.parentalEnabled &&
+            !isParentalUnlockedForCurrentProfile() &&
+            ParentalControl.isChannelRestricted(channel, settings)
+    }
+
+    internal fun filterAllowedMatchChannels(channels: List<IptvItem>): List<IptvItem> {
+        val settings = currentPlayerSettings()
+        if (!settings.parentalEnabled || isParentalUnlockedForCurrentProfile()) {
+            return channels
+        }
+        return channels.filter { !ParentalControl.isChannelRestricted(it, settings) }
+    }
+
+    fun dismissParentalPrompt() {
+        _uiState.update { it.copy(pendingParentalUnlock = null) }
+    }
+
+    fun confirmParentalUnlockAndPlay(
+        onPlay: (src: String, title: String, dScheme: String?, dLicense: String?, matchChannels: List<IptvItem>, matchCategoryName: String?, headers: Map<String, String>) -> Unit,
+        onNotice: (String) -> Unit
+    ) {
+        val pending = _uiState.value.pendingParentalUnlock ?: return
+        if (matchJob?.isActive == true || _uiState.value.isMatchingChannel) {
+            return
+        }
+
+        unlockedProfileId = sessionRepo.currentProfile.value?.id
+        _uiState.update {
+            it.copy(
+                isParentalUnlocked = true,
+                pendingParentalUnlock = null
+            )
+        }
+
+        val currentPlaylistId = channelsProvider.getActivePlaylistId()
+        if (pending.playlistId != currentPlaylistId) {
+            onNotice(Translator.translate("sports_playlist_changed", currentLang()))
+            return
+        }
+
+        val matchChannels = pending.allCandidates.map { it.channel }.ifEmpty { listOf(pending.candidate.channel) }
+        val matchTitle = if (pending.event.awayTeam.isNotBlank()) {
+            "${pending.event.homeTeam} vs ${pending.event.awayTeam}"
+        } else {
+            pending.candidate.channel.name
+        }
+
+        _uiState.update { it.copy(isMatchingChannel = true) }
+        matchJob = viewModelScope.launch {
+            try {
+                val resolution = withContext(Dispatchers.IO) {
+                    resolvePlayableChannelResult(pending.candidate.channel)
+                }
+                _uiState.update { it.copy(isMatchingChannel = false) }
+                if (channelsProvider.getActivePlaylistId() != currentPlaylistId) {
+                    onNotice(Translator.translate("sports_playlist_changed", currentLang()))
+                    return@launch
+                }
+                when (resolution) {
+                    is StreamResolutionResult.Success -> {
+                        _lastPlayedChannel.value = pending.candidate.channel
+                        onPlay(
+                            resolution.url,
+                            pending.candidate.channel.name,
+                            pending.candidate.channel.drmScheme,
+                            pending.candidate.channel.drmLicenseUrl,
+                            matchChannels,
+                            matchTitle,
+                            resolution.headers
+                        )
+                    }
+                    is StreamResolutionResult.Failure -> {
+                        onNotice(resolution.message)
+                    }
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                _uiState.update { it.copy(isMatchingChannel = false) }
+                throw e
+            } catch (e: Exception) {
+                _uiState.update { it.copy(isMatchingChannel = false) }
+                onNotice(buildStreamResolutionErrorMessage(pending.candidate.channel.name, e))
+            } finally {
+                if (_uiState.value.isMatchingChannel) {
+                    _uiState.update { it.copy(isMatchingChannel = false) }
+                }
             }
         }
     }
@@ -616,7 +819,6 @@ class SportsViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun startLivePolling() {
-        if (!repository.isApiKeyConfigured()) return
         if (livePollingJob?.isActive == true) return
 
         livePollingJob = viewModelScope.launch {
@@ -670,5 +872,6 @@ class SportsViewModel(application: Application) : AndroidViewModel(application) 
         stopLivePolling()
         loadJob?.cancel()
         preloadJob?.cancel()
+        matchJob?.cancel()
     }
 }

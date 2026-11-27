@@ -22,10 +22,12 @@ import com.google.android.gms.cast.framework.CastContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -81,7 +83,7 @@ class TvCastManager private constructor() {
     private var nsdDiscoveryListener: NsdManager.DiscoveryListener? = null
     private var multicastLock: WifiManager.MulticastLock? = null
     private var discoveryJob: Job? = null
-    private val scope = CoroutineScope(Dispatchers.IO)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     // High-performance parallel subnet scanning concurrency
     private val subnetScanSemaphore = Semaphore(48)
@@ -97,8 +99,9 @@ class TvCastManager private constructor() {
 
         override fun onRouteRemoved(router: MediaRouter, route: MediaRouter.RouteInfo) {
             Log.d(DIAG_TAG, "[Google Cast] Route removed: id=${route.id}, name=${route.name}")
-            val current = _discoveredDevices.value.filterNot { it.id == route.id || it.mediaRoute?.id == route.id }
-            _discoveredDevices.value = current
+            _discoveredDevices.update { current ->
+                current.filterNot { it.id == route.id || it.mediaRoute?.id == route.id }
+            }
         }
     }
 
@@ -942,43 +945,52 @@ class TvCastManager private constructor() {
             prefs.edit().putString(KEY_SAVED_DEVICES_JSON, jsonArray.toString()).apply()
             _savedDevices.value = current
 
-            val discovered = _discoveredDevices.value.map {
-                if (it.id == deviceIdOrIp || it.ipAddress == deviceIdOrIp) it.copy(isSaved = false) else it
+            _discoveredDevices.update { currentDiscovered ->
+                currentDiscovered.map {
+                    if (it.id == deviceIdOrIp || it.ipAddress == deviceIdOrIp) it.copy(isSaved = false) else it
+                }
             }
-            _discoveredDevices.value = discovered
         } catch (e: Exception) {
             Log.e(DIAG_TAG, "Error forgetting device: ${e.message}")
         }
     }
 
     private fun addOrUpdateDevice(device: TvCastDevice) {
-        val current = _discoveredDevices.value.toMutableList()
         val isSavedAlready = _savedDevices.value.any {
             it.id == device.id || (!device.ipAddress.isNullOrBlank() && it.ipAddress == device.ipAddress && it.type == device.type)
         }
         val deviceWithSaved = if (isSavedAlready) device.copy(isSaved = true) else device
+        var addedNew = false
 
-        val existingIndex = current.indexOfFirst {
-            it.id == deviceWithSaved.id || (!deviceWithSaved.ipAddress.isNullOrBlank() && it.ipAddress == deviceWithSaved.ipAddress && it.type == deviceWithSaved.type)
+        _discoveredDevices.update { currentList ->
+            addedNew = false
+            val current = currentList.toMutableList()
+            val existingIndex = current.indexOfFirst {
+                it.id == deviceWithSaved.id || (!deviceWithSaved.ipAddress.isNullOrBlank() && it.ipAddress == deviceWithSaved.ipAddress && it.type == deviceWithSaved.type)
+            }
+
+            if (existingIndex >= 0) {
+                val existing = current[existingIndex]
+                val updated = existing.copy(
+                    name = if (deviceWithSaved.name.length > existing.name.length && !deviceWithSaved.name.contains("($")) deviceWithSaved.name else existing.name,
+                    mediaRoute = existing.mediaRoute ?: deviceWithSaved.mediaRoute,
+                    avTransportUrl = existing.avTransportUrl ?: deviceWithSaved.avTransportUrl,
+                    ipAddress = existing.ipAddress ?: deviceWithSaved.ipAddress,
+                    manufacturer = existing.manufacturer ?: deviceWithSaved.manufacturer,
+                    modelName = existing.modelName ?: deviceWithSaved.modelName,
+                    isSaved = existing.isSaved || deviceWithSaved.isSaved
+                )
+                current[existingIndex] = updated
+            } else {
+                current.add(deviceWithSaved)
+                addedNew = true
+            }
+            current
         }
 
-        if (existingIndex >= 0) {
-            val existing = current[existingIndex]
-            val updated = existing.copy(
-                name = if (deviceWithSaved.name.length > existing.name.length && !deviceWithSaved.name.contains("($")) deviceWithSaved.name else existing.name,
-                mediaRoute = existing.mediaRoute ?: deviceWithSaved.mediaRoute,
-                avTransportUrl = existing.avTransportUrl ?: deviceWithSaved.avTransportUrl,
-                ipAddress = existing.ipAddress ?: deviceWithSaved.ipAddress,
-                manufacturer = existing.manufacturer ?: deviceWithSaved.manufacturer,
-                modelName = existing.modelName ?: deviceWithSaved.modelName,
-                isSaved = existing.isSaved || deviceWithSaved.isSaved
-            )
-            current[existingIndex] = updated
-        } else {
-            current.add(deviceWithSaved)
+        if (addedNew) {
             Log.i(DIAG_TAG, "Added new TV Cast device: [${deviceWithSaved.type}] '${deviceWithSaved.name}' (${deviceWithSaved.ipAddress ?: "MediaRoute"}) [saved=${deviceWithSaved.isSaved}]")
         }
-        _discoveredDevices.value = current
     }
 
     private fun probeUnicastSsdp(ip: String, physicalNetwork: Network?): String? {

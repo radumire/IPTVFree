@@ -31,6 +31,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
 import com.example.Translator
 import com.example.interfaz.AppThemeColors
+import com.example.interfaz.ParentalPinDialog
 import com.example.interfaz.components.TvButton
 import com.example.interfaz.components.TV_FOCUSED_TEXT
 import com.example.interfaz.components.tvCardFocusable
@@ -359,7 +360,7 @@ fun CinemaBarHomeScreen(
                             CinemaTab.SERIES -> onNavigate("series")
                             CinemaTab.MOVIES -> onNavigate("movies")
                             CinemaTab.SPORTS -> onNavigate("sports")
-                            CinemaTab.FAVORITES -> onNavigate("movies")
+                            CinemaTab.FAVORITES -> onNavigate("favorites")
                             else -> {}
                         }
                     },
@@ -592,7 +593,26 @@ fun CinemaBarHomeScreen(
                 )
             },
             onDismiss = { sportsViewModel.dismissChannelSelection() },
-            theme = theme
+            theme = theme,
+            lang = lang,
+            isLockedChannel = { sportsViewModel.isChannelParentalLocked(it) }
+        )
+    }
+
+    val pendingSportsParental = sportsUiState.pendingParentalUnlock
+    if (pendingSportsParental != null) {
+        ParentalPinDialog(
+            channelName = pendingSportsParental.candidate.channel.name,
+            expectedPin = sportsViewModel.getExpectedParentalPin(),
+            onDismiss = { sportsViewModel.dismissParentalPrompt() },
+            onSuccess = {
+                sportsViewModel.confirmParentalUnlockAndPlay(
+                    onPlay = onPlaySport,
+                    onNotice = { sportsNotice = it }
+                )
+            },
+            theme = theme,
+            lang = lang
         )
     }
 
@@ -621,7 +641,7 @@ fun CinemaBarHomeScreen(
                     )
                     Spacer(modifier = Modifier.width(16.dp))
                     Text(
-                        text = if (lang == "es") "Buscando canal para el partido..." else "Searching broadcast channel...",
+                        text = Translator.translate("sports_searching_channel", lang),
                         color = Color.White,
                         fontSize = 14.sp,
                         fontWeight = FontWeight.Medium

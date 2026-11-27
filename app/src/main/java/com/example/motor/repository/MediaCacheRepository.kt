@@ -19,6 +19,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.ensureActive
@@ -61,10 +62,45 @@ class MediaCacheRepository private constructor(private val application: Applicat
     // Scope para operaciones en segundo plano y deduplicación de cargas a nivel de repositorio
     private val repoScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    // Protección contra cargas simultáneas (Single-Flight)
+    // Protección contra cargas simultáneas (Single-Flight) y escrituras concurrentes por archivo de caché
     private val inFlightLoads = ConcurrentHashMap<String, Deferred<CacheResult<Map<String, List<IptvItem>>>>>()
     private val inFlightMutex = Mutex()
-    private val vodIncrementalMutex = Mutex()
+    private val categoryWriteMutexes = ConcurrentHashMap<String, Mutex>()
+
+    private fun getCategoryWriteMutex(key: String): Mutex =
+        categoryWriteMutexes.getOrPut(key) { Mutex() }
+
+    private fun writeCategoryMapAtomically(file: File, data: Map<String, List<IptvItem>>) {
+        file.parentFile?.mkdirs()
+        val tmpFile = File(file.parentFile ?: filesDir, "${file.name}.tmp.${System.nanoTime()}")
+        try {
+            val typeAdapter = JsonUtils.moshi.adapter<Map<String, List<IptvItem>>>(
+                Types.newParameterizedType(
+                    Map::class.java,
+                    String::class.java,
+                    Types.newParameterizedType(List::class.java, IptvItem::class.java)
+                )
+            )
+            tmpFile.sink().buffer().use { sink ->
+                typeAdapter.toJson(sink, data)
+            }
+            if (!tmpFile.renameTo(file)) {
+                if (file.exists()) {
+                    file.delete()
+                }
+                if (!tmpFile.renameTo(file)) {
+                    tmpFile.copyTo(file, overwrite = true)
+                    tmpFile.delete()
+                }
+            }
+        } finally {
+            if (tmpFile.exists()) {
+                try {
+                    tmpFile.delete()
+                } catch (_: Throwable) {}
+            }
+        }
+    }
 
     private val _cacheUpdateEvents = MutableSharedFlow<Long>(extraBufferCapacity = 16)
     val cacheUpdateEvents: SharedFlow<Long> = _cacheUpdateEvents.asSharedFlow()
@@ -199,8 +235,17 @@ class MediaCacheRepository private constructor(private val application: Applicat
         private var INSTANCE: MediaCacheRepository? = null
 
         fun getInstance(application: Application): MediaCacheRepository {
-            return INSTANCE ?: synchronized(this) {
-                INSTANCE ?: MediaCacheRepository(application).also { INSTANCE = it }
+            val existing = INSTANCE
+            if (existing != null && existing.application === application) {
+                return existing
+            }
+            return synchronized(this) {
+                val locked = INSTANCE
+                if (locked != null && locked.application === application) {
+                    locked
+                } else {
+                    MediaCacheRepository(application).also { INSTANCE = it }
+                }
             }
         }
     }
@@ -573,64 +618,61 @@ class MediaCacheRepository private constructor(private val application: Applicat
         type: String,
         data: Map<String, List<IptvItem>>
     ) = withContext(Dispatchers.IO) {
-        val totalCount = data.values.sumOf { it.size }
-        saveCategoryCount(playlistId, type, totalCount)
-
         val key = makeCategoryKey(playlistId, type)
-        val now = System.currentTimeMillis()
+        getCategoryWriteMutex(key).withLock {
+            val totalCount = data.values.sumOf { it.size }
+            saveCategoryCount(playlistId, type, totalCount)
 
-        // Para evitar mantener catálogos gigantes innecesarios simultáneamente en RAM:
-        val lowerType = type.lowercase()
-        if (lowerType == "tv") {
-            // Canales de TV se mantienen calientes en RAM para acceso instantáneo
-            memoryCategoryCache[key] = MemoryCacheEntry(
-                data = data,
-                updatedAt = now,
-                count = totalCount
-            )
-        } else {
-            // VOD (películas y series): Se persisten en disco de forma segura mediante streaming Okio.
-            // No retenemos los mapas de decenas de miles de items en RAM aquí para evitar picos de Heap
-            // y ciclos continuos de GC durante conexiones o cambios de listas. Se cargarán bajo demanda
-            // al acceder a sus pantallas respectivas (MoviesViewModel / SeriesViewModel).
-            memoryCategoryCache.remove(key)
-        }
+            val now = System.currentTimeMillis()
 
-        // 1. Guardar en archivo de disco usando Okio streaming
-        try {
-            val file = getCacheFile(playlistId, type)
-            val typeAdapter = JsonUtils.moshi.adapter<Map<String, List<IptvItem>>>(
-                Types.newParameterizedType(Map::class.java, String::class.java, Types.newParameterizedType(List::class.java, IptvItem::class.java))
-            )
-            file.sink().buffer().use { sink ->
-                typeAdapter.toJson(sink, data)
+            // Para evitar mantener catálogos gigantes innecesarios simultáneamente en RAM:
+            val lowerType = type.lowercase()
+            if (lowerType == "tv") {
+                // Canales de TV se mantienen calientes en RAM para acceso instantáneo
+                memoryCategoryCache[key] = MemoryCacheEntry(
+                    data = data,
+                    updatedAt = now,
+                    count = totalCount
+                )
+            } else {
+                // VOD (películas y series): Se persisten en disco de forma segura mediante streaming Okio.
+                // No retenemos los mapas de decenas de miles de items en RAM aquí para evitar picos de Heap
+                // y ciclos continuos de GC durante conexiones o cambios de listas. Se cargarán bajo demanda
+                // al acceder a sus pantallas respectivas (MoviesViewModel / SeriesViewModel).
+                memoryCategoryCache.remove(key)
             }
-        } catch (e: Throwable) {
-            Log.e(TAG, "Error saving category cache to File for playlist $playlistId type $type", e)
-        }
 
-        // 2. Intentar guardar en Room Database solo si el tamaño es reducido (< 1500 items y < 1.5MB)
-        if (totalCount in 1..1500) {
+            // 1. Guardar en archivo de disco de forma atómica usando Okio streaming + archivo temporal
             try {
-                val json = JsonUtils.iptvItemsMapToJson(data)
-                if (json.length < 1_500_000) {
-                    val entity = CategoryCache(
-                        id = key,
-                        source = playlistId.toString(),
-                        type = type.lowercase(),
-                        dataJson = json,
-                        updatedAt = now
-                    )
-                    categoryDao.insert(entity)
-                }
+                val file = getCacheFile(playlistId, type)
+                writeCategoryMapAtomically(file, data)
             } catch (e: Throwable) {
-                Log.w(TAG, "Omitting Room cache store for large key $key (disk cache active)", e)
+                Log.e(TAG, "Error saving category cache to File for playlist $playlistId type $type", e)
             }
-        }
 
-        try {
-            _cacheUpdateEvents.tryEmit(playlistId)
-        } catch (_: Throwable) {}
+            // 2. Intentar guardar en Room Database solo si el tamaño es reducido (< 1500 items y < 1.5MB)
+            if (totalCount in 1..1500) {
+                try {
+                    val json = JsonUtils.iptvItemsMapToJson(data)
+                    if (json.length < 1_500_000) {
+                        val entity = CategoryCache(
+                            id = key,
+                            source = playlistId.toString(),
+                            type = type.lowercase(),
+                            dataJson = json,
+                            updatedAt = now
+                        )
+                        categoryDao.insert(entity)
+                    }
+                } catch (e: Throwable) {
+                    Log.w(TAG, "Omitting Room cache store for large key $key (disk cache active)", e)
+                }
+            }
+
+            try {
+                _cacheUpdateEvents.tryEmit(playlistId)
+            } catch (_: Throwable) {}
+        }
     }
 
     /**
@@ -644,8 +686,8 @@ class MediaCacheRepository private constructor(private val application: Applicat
         notify: Boolean = true
     ) = withContext(Dispatchers.IO) {
         if (items.isEmpty()) return@withContext
-        vodIncrementalMutex.withLock {
-            val key = makeCategoryKey(playlistId, "movie")
+        val key = makeCategoryKey(playlistId, "movie")
+        getCategoryWriteMutex(key).withLock {
             val currentMap = LinkedHashMap(memoryCategoryCache[key]?.data ?: run {
                 val existing = getCategoryCache(playlistId, "movie")
                 existing.data ?: emptyMap()
@@ -681,12 +723,7 @@ class MediaCacheRepository private constructor(private val application: Applicat
             // 2. Persistir a disco de forma atómica y streaming
             try {
                 val file = getCacheFile(playlistId, "movie")
-                val typeAdapter = JsonUtils.moshi.adapter<Map<String, List<IptvItem>>>(
-                    Types.newParameterizedType(Map::class.java, String::class.java, Types.newParameterizedType(List::class.java, IptvItem::class.java))
-                )
-                file.sink().buffer().use { sink ->
-                    typeAdapter.toJson(sink, currentMap)
-                }
+                writeCategoryMapAtomically(file, currentMap)
             } catch (e: Throwable) {
                 Log.e(TAG, "Error appending VOD category cache to file for playlist $playlistId", e)
             }
@@ -773,10 +810,89 @@ class MediaCacheRepository private constructor(private val application: Applicat
         prefs.edit().clear().apply()
         try {
             filesDir.listFiles { _, name ->
-                name.startsWith("playlist_cache_") && name.endsWith(".json")
+                name.startsWith("playlist_cache_") && (name.endsWith(".json") || name.contains(".json.tmp"))
             }?.forEach { it.delete() }
         } catch (e: Throwable) {
             Log.e(TAG, "Error deleting disk cache files", e)
+        }
+    }
+}
+
+/**
+ * Serializa y regula (throttle + single-flight) los guardados parciales en segundo plano
+ * para evitar ráfagas de E/S en disco, picos de memoria y escrituras fuera de orden.
+ */
+internal class ThrottledCategoryCacheSaver(
+    private val minIntervalMs: Long = 2_500L,
+    private val clockMs: () -> Long = { System.currentTimeMillis() },
+    private val onPersist: suspend (type: String, grouped: Map<String, List<IptvItem>>) -> Unit
+) {
+    private val persistMutex = Mutex()
+    private val stateLock = Any()
+    private val lastSavedAtByType = HashMap<String, Long>()
+    private val lastSavedCountByType = HashMap<String, Int>()
+    private var inFlightJob: Job? = null
+
+    fun submitPartial(
+        scope: CoroutineScope,
+        type: String,
+        itemsSnapshot: List<IptvItem>,
+        shouldContinue: () -> Boolean
+    ) {
+        if (!shouldContinue() || itemsSnapshot.isEmpty()) return
+        synchronized(stateLock) {
+            val existing = inFlightJob
+            if (existing != null && existing.isActive) {
+                return
+            }
+            val now = clockMs()
+            val lastAt = lastSavedAtByType[type] ?: 0L
+            val lastCount = lastSavedCountByType[type] ?: 0
+            val isFirstBatch = lastCount == 0
+            val enoughTimeElapsed = (now - lastAt) >= minIntervalMs
+            if (!isFirstBatch && (!enoughTimeElapsed || itemsSnapshot.size <= lastCount)) {
+                return
+            }
+            inFlightJob = scope.launch(Dispatchers.IO) {
+                persistMutex.withLock {
+                    if (!shouldContinue()) return@withLock
+                    try {
+                        val grouped = itemsSnapshot.groupBy { it.group }
+                        onPersist(type, grouped)
+                        synchronized(stateLock) {
+                            lastSavedAtByType[type] = clockMs()
+                            lastSavedCountByType[type] = itemsSnapshot.size
+                        }
+                    } catch (ce: CancellationException) {
+                        throw ce
+                    } catch (t: Throwable) {
+                        Log.w("ThrottledCacheSaver", "Error guardando caché parcial $type", t)
+                    }
+                }
+            }
+        }
+    }
+
+    suspend fun saveFinal(
+        type: String,
+        items: List<IptvItem>,
+        shouldContinue: () -> Boolean
+    ) {
+        val prevJob = synchronized(stateLock) { inFlightJob }
+        try {
+            prevJob?.join()
+        } catch (_: CancellationException) {
+            // Ignored; cancellation check runs inside lock
+        } catch (_: Throwable) {}
+
+        persistMutex.withLock {
+            if (!shouldContinue() || items.isEmpty()) return@withLock
+            val grouped = items.groupBy { it.group }
+            onPersist(type, grouped)
+            synchronized(stateLock) {
+                lastSavedAtByType[type] = clockMs()
+                lastSavedCountByType[type] = items.size
+            }
         }
     }
 }

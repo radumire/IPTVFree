@@ -62,7 +62,10 @@ class MoviesViewModel(application: Application) : AndroidViewModel(application) 
             iptvRepo.favoriteItems.collect { favs ->
                 val activeId = sessionRepo.activePlaylist.value?.id
                 val filtered = if (activeId != null) favs.filter { it.playlistId == activeId } else emptyList()
-                val favIds = filtered.filter { it.type == "movie" }.flatMap { listOfNotNull(it.id, it.url, it.title) }.toSet()
+                val favIds = filtered.filter { IptvRepository.normalizeFavoriteType(it.type) == "movie" }
+                    .flatMap { listOfNotNull(it.id, it.url.takeIf { u -> u.isNotBlank() }, it.stalkerCmd, it.title.takeIf { t -> t.isNotBlank() }) }
+                    .filter { it.isNotBlank() }
+                    .toSet()
                 _uiState.update { state -> state.copy(favoriteIds = favIds) }
             }
         }
@@ -264,13 +267,7 @@ class MoviesViewModel(application: Application) : AndroidViewModel(application) 
     fun toggleFavorite(item: IptvItem) {
         viewModelScope.launch {
             val pl = sessionRepo.activePlaylist.value ?: return@launch
-            val id = item.name
-            if (_uiState.value.favoriteIds.contains(id) || (item.url != null && _uiState.value.favoriteIds.contains(item.url))) {
-                iptvRepo.removeFavorite(id, pl.id)
-                item.url?.let { iptvRepo.removeFavorite(it, pl.id) }
-            } else {
-                iptvRepo.addFavorite(id, item.name, "movie", item.url ?: "", item.logo, pl.id)
-            }
+            iptvRepo.toggleFavoriteItem(item, "movie", pl.id)
         }
     }
 }

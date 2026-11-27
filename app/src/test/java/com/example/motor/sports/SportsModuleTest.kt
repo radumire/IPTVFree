@@ -1219,5 +1219,140 @@ class SportsModuleTest {
         assertEquals(MatchDecision.NO_MATCH, negResult.decision)
         assertTrue(negResult.candidates.isEmpty())
     }
+
+    // 54. Canal Stalker con centinela CHANNEL_NO_PLAYABLE_CMD queda excluido del matching deportivo
+    @Test
+    fun test54_stalkerNoPlayableCmdExcluded() = runBlocking {
+        val event = createSampleEvent(home = "Real Madrid", away = "Barcelona")
+        val brokenOnlyChannels = listOf(
+            IptvItem(name = "EVENTOS | Real Madrid vs Barcelona", group = "DEPORTES", url = null, stalkerCmd = "CHANNEL_NO_PLAYABLE_CMD"),
+            IptvItem(name = "DAZN LaLiga", group = "DEPORTES", url = null, stalkerCmd = " CHANNEL_NO_PLAYABLE_CMD ")
+        )
+        val noMatchResult = matcher.matchChannel(event, brokenOnlyChannels, playlistId = 10L)
+        assertEquals(MatchDecision.NO_MATCH, noMatchResult.decision)
+        assertTrue(noMatchResult.candidates.isEmpty())
+
+        // Si además existe un canal Stalker válido, solo se selecciona el válido
+        val mixedChannels = brokenOnlyChannels + listOf(
+            IptvItem(name = "DAZN LaLiga HD", group = "DEPORTES", url = null, stalkerCmd = "ffrt http://portal.example/ch/101")
+        )
+        val mixedResult = matcher.matchChannel(event, mixedChannels, playlistId = 10L)
+        assertEquals(MatchDecision.AUTO_PLAY, mixedResult.decision)
+        assertEquals(1, mixedResult.candidates.size)
+        assertEquals("ffrt http://portal.example/ch/101", mixedResult.topMatch?.channel?.stalkerCmd)
+    }
+
+    // 55. Canal MAC/Stalker válido (url = null, stalkerCmd válido) se empareja correctamente
+    @Test
+    fun test55_validStalkerChannelWithNullUrlMatched() = runBlocking {
+        val event = createSampleEvent(home = "Arsenal", away = "Chelsea", league = "Premier League")
+        val channels = listOf(
+            IptvItem(name = "Arsenal vs Chelsea FHD", group = "DEPORTES", url = null, stalkerCmd = "ffmpeg http://portal.example/live/55")
+        )
+        val result = matcher.matchChannel(event, channels, playlistId = 20L)
+        assertEquals(MatchDecision.AUTO_PLAY, result.decision)
+        assertEquals("Arsenal vs Chelsea FHD", result.topMatch?.channel?.name)
+        assertEquals("ffmpeg http://portal.example/live/55", result.topMatch?.channel?.stalkerCmd)
+    }
+
+    // 56. Canales Stalker duplicados (ej. por categoría "Todos") se deduplican manteniendo streams distintos
+    @Test
+    fun test56_duplicateStalkerChannelsDeduplicatedPreservingDistinctCmds() = runBlocking {
+        val event = createSampleEvent(
+            home = "Real Madrid",
+            away = "Barcelona",
+            league = "LaLiga"
+        ).withBroadcasters(listOf("DAZN LaLiga"))
+        val duplicateChannels = listOf(
+            IptvItem(name = "DAZN LaLiga HD", group = "Todos", url = null, stalkerCmd = "ffrt http://portal.example/ch/101"),
+            IptvItem(name = "DAZN LaLiga HD", group = "DEPORTES", url = null, stalkerCmd = "ffrt http://portal.example/ch/101")
+        )
+        val singleResult = matcher.matchChannel(event, duplicateChannels, playlistId = 30L)
+        assertEquals(MatchDecision.AUTO_PLAY, singleResult.decision)
+        assertEquals(1, singleResult.candidates.size)
+
+        val backupChannels = duplicateChannels + listOf(
+            IptvItem(name = "DAZN LaLiga HD", group = "DEPORTES", url = null, stalkerCmd = "ffrt http://portal.example/ch/202")
+        )
+        val multiResult = matcher.matchChannel(event, backupChannels, playlistId = 30L)
+        assertEquals(MatchDecision.SELECTION, multiResult.decision)
+        assertEquals(2, multiResult.candidates.size)
+    }
+
+    // 57. Nombres Stalker con códecs (H.265, H.264, 50 FPS, HDR10+) y prefijos numéricos de portal (104 | ...) coinciden correctamente
+    @Test
+    fun test57_stalkerCodecAndLeadingNumberPrefixesMatchBroadcaster() = runBlocking {
+        val targetDazn = "DAZN LaLiga"
+        assertTrue(matcher.matchBroadcasterPrecise("104 | DAZN LaLiga H.265", "104 | DAZN LaLiga H.265", targetDazn))
+        assertTrue(matcher.matchBroadcasterPrecise("[ES] 014 - DAZN LaLiga H.264 50 FPS", "[ES] 014 - DAZN LaLiga H.264 50 FPS", targetDazn))
+        assertTrue(matcher.matchBroadcasterPrecise("ES | 55: DAZN LaLiga HDR10+", "ES | 55: DAZN LaLiga HDR10+", targetDazn))
+
+        assertTrue(matcher.matchBroadcasterPrecise("#22: Eurosport 01 HD", "#22: Eurosport 01 HD", "Eurosport 1"))
+        assertTrue(matcher.matchBroadcasterPrecise("CH 55 - Eurosport 2 HDR10+", "CH 55 - Eurosport 2 HDR10+", "Eurosport 2"))
+        assertFalse(matcher.matchBroadcasterPrecise("CH 55 - Eurosport 2 HDR10+", "CH 55 - Eurosport 2 HDR10+", "Eurosport 1"))
+
+        val event = createSampleEvent(
+            home = "Real Madrid",
+            away = "Barcelona",
+            league = "LaLiga"
+        ).withBroadcasters(listOf("DAZN LaLiga"))
+        val channels = listOf(
+            IptvItem(name = "104 | DAZN LaLiga H.265", group = "DEPORTES", url = null, stalkerCmd = "ffrt http://portal.example/ch/104"),
+            IptvItem(name = "Canal Cocina", group = "VARIOS", url = null, stalkerCmd = "ffrt http://portal.example/ch/999")
+        )
+        val result = matcher.matchChannel(event, channels, playlistId = 40L)
+        assertEquals(MatchDecision.AUTO_PLAY, result.decision)
+        assertEquals("104 | DAZN LaLiga H.265", result.topMatch?.channel?.name)
+    }
+
+    // 58. Abreviaturas M+, M., Movistar+ y Movistar Plus+ se canonicalizan correctamente antes de eliminar separadores
+    @Test
+    fun test58_movistarPlusAndMPlusAbbreviationsMatchAcrossVariants() = runBlocking {
+        assertTrue(matcher.matchBroadcasterPrecise("M+ LaLiga HD", "M+ LaLiga HD", "Movistar Plus+ LaLiga"))
+        assertTrue(matcher.matchBroadcasterPrecise("Movistar+ LaLiga FHD", "Movistar+ LaLiga FHD", "M+ LaLiga"))
+        assertTrue(matcher.matchBroadcasterPrecise("M+ Liga de Campeones", "M+ Liga de Campeones", "Movistar Liga de Campeones"))
+        assertTrue(matcher.matchBroadcasterPrecise("M. Campeones HD", "M. Campeones HD", "M+ Liga de Campeones"))
+        assertTrue(matcher.matchBroadcasterPrecise("M+ Basket HD", "M+ Basket HD", "Movistar+ Basket"))
+        assertTrue(matcher.matchBroadcasterPrecise("ES | M+ Deportes 2 H.265", "ES | M+ Deportes 2 H.265", "Movistar Deportes 2"))
+
+        // No debe confundir M+ Clásicos ni M+ Golf con Movistar Deportes
+        assertFalse(matcher.matchBroadcasterPrecise("M+ Clásicos HD", "M+ Clásicos HD", "Movistar Deportes"))
+        assertFalse(matcher.matchBroadcasterPrecise("M+ Golf HD", "M+ Golf HD", "Movistar Deportes"))
+
+        val uclEvent = createSampleEvent(
+            home = "Bayern",
+            away = "Inter",
+            league = "UEFA Champions League"
+        ).withBroadcasters(listOf("Movistar Liga de Campeones"))
+        val uclChannels = listOf(
+            IptvItem(name = "108 | M+ Liga de Campeones H.265", group = "DEPORTES", url = null, stalkerCmd = "ffrt http://portal.example/ch/108")
+        )
+        val result = matcher.matchChannel(uclEvent, uclChannels, playlistId = 41L)
+        assertEquals(MatchDecision.AUTO_PLAY, result.decision)
+        assertEquals("108 | M+ Liga de Campeones H.265", result.topMatch?.channel?.name)
+    }
+
+    // 59. Señal principal numerada (ej. DAZN LaLiga 1) coincide con DAZN LaLiga, mientras que canal secundario (2) se rechaza
+    @Test
+    fun test59_numberedPrimaryVariantMatchesBroadcasterWhileSecondaryRejected() = runBlocking {
+        assertTrue(matcher.matchBroadcasterPrecise("DAZN LaLiga 1", "DAZN LaLiga 1", "DAZN LaLiga"))
+        assertTrue(matcher.matchBroadcasterPrecise("M+ LaLiga 1 HD", "M+ LaLiga 1 HD", "Movistar LaLiga"))
+        assertFalse(matcher.matchBroadcasterPrecise("DAZN LaLiga 2", "DAZN LaLiga 2", "DAZN LaLiga"))
+
+        val event = createSampleEvent(
+            home = "Atletico Madrid",
+            away = "Sevilla",
+            league = "LaLiga"
+        ).withBroadcasters(listOf("DAZN LaLiga"))
+        val channels = listOf(
+            IptvItem(name = "DAZN LaLiga 1 HD", group = "DEPORTES", url = null, stalkerCmd = "ffrt http://portal.example/ch/11"),
+            IptvItem(name = "DAZN LaLiga 2 HD", group = "DEPORTES", url = null, stalkerCmd = "ffrt http://portal.example/ch/12")
+        )
+        val result = matcher.matchChannel(event, channels, playlistId = 42L)
+        assertEquals(MatchDecision.AUTO_PLAY, result.decision)
+        assertEquals("DAZN LaLiga 1 HD", result.topMatch?.channel?.name)
+    }
 }
+
+
 

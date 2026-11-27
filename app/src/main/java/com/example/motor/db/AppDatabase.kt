@@ -121,14 +121,19 @@ data class PlaybackHistory(
     indices = [Index(value = ["playlistId"])]
 )
 data class FavoriteItem(
-    val id: String, // e.g., "tv-source-name"
+    val id: String, // Deterministic e.g., "tv::<stalkerCmd/url>" or legacy ID
     val title: String,
     val type: String, // "tv", "movie", "series"
     val url: String,
     val logo: String? = null,
     val addedAt: Long,
     @ColumnInfo(defaultValue = "0")
-    val playlistId: Long = 0L
+    val playlistId: Long = 0L,
+    val stalkerCmd: String? = null,
+    val seriesId: String? = null,
+    val categoryGroup: String? = null,
+    val drmScheme: String? = null,
+    val drmLicenseUrl: String? = null
 )
 
 @Entity(tableName = "general_settings")
@@ -284,8 +289,36 @@ interface FavoriteItemDao {
     @Query("DELETE FROM favorites WHERE id = :id AND playlistId = :playlistId")
     suspend fun deleteByIdAndPlaylist(id: String, playlistId: Long)
 
-    @Query("DELETE FROM favorites WHERE (id = :key OR url = :key OR title = :key) AND playlistId = :playlistId")
+    @Query("DELETE FROM favorites WHERE id = :id AND type = :type AND playlistId = :playlistId")
+    suspend fun deleteByIdTypeAndPlaylist(id: String, type: String, playlistId: Long)
+
+    @Query(
+        """
+        DELETE FROM favorites
+        WHERE :key != ''
+          AND (
+              id = :key
+              OR (url != '' AND url = :key)
+              OR (title != '' AND title = :key)
+          )
+          AND playlistId = :playlistId
+        """
+    )
     suspend fun deleteByAnyKeyAndPlaylist(key: String, playlistId: Long)
+
+    @Query(
+        """
+        DELETE FROM favorites
+        WHERE type = :type
+          AND playlistId = :playlistId
+          AND (
+              (:title != '' AND title = :title AND (url = '' OR url IS NULL) AND (stalkerCmd IS NULL OR stalkerCmd = '') AND (seriesId IS NULL OR seriesId = ''))
+              OR (:tvgId != '' AND id = :tvgId)
+              OR (:title != '' AND id = :title)
+          )
+        """
+    )
+    suspend fun deleteLegacyMatchAndPlaylist(type: String, title: String, tvgId: String, playlistId: Long)
 
     @Query("DELETE FROM favorites WHERE playlistId = :playlistId")
     suspend fun clearForPlaylist(playlistId: Long)
@@ -434,6 +467,16 @@ val MIGRATION_4_5 = object : Migration(4, 5) {
     }
 }
 
+val MIGRATION_5_6 = object : Migration(5, 6) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE `favorites` ADD COLUMN `stalkerCmd` TEXT")
+        db.execSQL("ALTER TABLE `favorites` ADD COLUMN `seriesId` TEXT")
+        db.execSQL("ALTER TABLE `favorites` ADD COLUMN `categoryGroup` TEXT")
+        db.execSQL("ALTER TABLE `favorites` ADD COLUMN `drmScheme` TEXT")
+        db.execSQL("ALTER TABLE `favorites` ADD COLUMN `drmLicenseUrl` TEXT")
+    }
+}
+
 @Database(
     entities = [
         CategoryCache::class,
@@ -443,7 +486,7 @@ val MIGRATION_4_5 = object : Migration(4, 5) {
         GeneralSetting::class,
         UserProfile::class
     ],
-    version = 5,
+    version = 6,
     exportSchema = false
 )
 @TypeConverters(Converters::class)
@@ -466,7 +509,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "radu_iptv_player_db"
                 )
-                    .addMigrations(MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
+                    .addMigrations(MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
                     .fallbackToDestructiveMigration()
                     .build()
                 INSTANCE = instance

@@ -38,6 +38,7 @@ import com.example.parseHexColor
 import com.example.motor.db.IptvItem
 import com.example.motor.db.SeriesEpisode
 import com.example.motor.db.SeriesSeason
+import com.example.motor.repository.IptvRepository
 import com.example.motor.repository.MediaDetails
 import com.example.interfaz.AppThemeColors
 import com.example.interfaz.viewmodel.SeriesViewModel
@@ -165,8 +166,8 @@ fun SeriesScreen(
     }
     val allSeries = precomputedData?.allSeries ?: emptyList()
 
-    val favSeriesKeys = remember(favoritesList) {
-        favoritesList.filter { it.type == "series" }.flatMap { listOfNotNull(it.id, it.url, it.title) }.toSet()
+    val seriesFavorites = remember(favoritesList) {
+        favoritesList.filter { IptvRepository.normalizeFavoriteType(it.type) == "series" }
     }
 
     val hiddenSeries = settingsObj.hiddenSeriesCategories
@@ -179,10 +180,8 @@ fun SeriesScreen(
         }
     }
 
-    val favoriteSeries = remember(visibleSeries, favSeriesKeys) {
-        visibleSeries.filter {
-            (it.name in favSeriesKeys || (it.url != null && it.url in favSeriesKeys) || (it.seriesId != null && it.seriesId in favSeriesKeys))
-        }
+    val favoriteSeries = remember(visibleSeries, seriesFavorites) {
+        visibleSeries.filter { IptvRepository.isItemFavorited(it, "series", seriesFavorites) }
     }
 
     val favoritesCount = remember(favoriteSeries) {
@@ -489,23 +488,11 @@ fun SeriesScreen(
                                             }
                                         )
 
-                                        val isFav = item.name in favSeriesKeys || (item.url != null && item.url in favSeriesKeys) || (item.seriesId != null && item.seriesId in favSeriesKeys)
+                                        val isFav = remember(item, seriesFavorites) {
+                                            IptvRepository.isItemFavorited(item, "series", seriesFavorites)
+                                        }
                                         TvIconButton(
-                                            onClick = {
-                                                if (isFav) {
-                                                    viewModel.removeFavorite(item.name)
-                                                    item.url?.let { viewModel.removeFavorite(it) }
-                                                    item.seriesId?.let { viewModel.removeFavorite(it) }
-                                                } else {
-                                                    viewModel.addFavorite(
-                                                        id = item.name,
-                                                        title = item.name,
-                                                        type = "series",
-                                                        url = item.url ?: "",
-                                                        logo = item.logo
-                                                    )
-                                                }
-                                            },
+                                            onClick = { viewModel.toggleFavorite(item) },
                                             containerColor = Color.Black.copy(alpha = 0.6f),
                                             shape = CircleShape,
                                             modifier = Modifier
@@ -572,7 +559,9 @@ fun SeriesScreen(
             }
         }
 
-        val isFav = series.name in favSeriesKeys || (series.url != null && series.url in favSeriesKeys) || (series.seriesId != null && series.seriesId in favSeriesKeys)
+        val isFav = remember(series, seriesFavorites) {
+            IptvRepository.isItemFavorited(series, "series", seriesFavorites)
+        }
         val firstSeasonFocusRequester = remember { FocusRequester() }
         val selectedSeasonFocusRequester = remember { FocusRequester() }
         val firstEpisodeFocusRequester = remember { FocusRequester() }
@@ -805,21 +794,7 @@ fun SeriesScreen(
                                     }
 
                                     TvIconButton(
-                                        onClick = {
-                                            if (isFav) {
-                                                viewModel.removeFavorite(series.name)
-                                                series.url?.let { viewModel.removeFavorite(it) }
-                                                series.seriesId?.let { viewModel.removeFavorite(it) }
-                                            } else {
-                                                viewModel.addFavorite(
-                                                    id = series.name,
-                                                    title = series.name,
-                                                    type = "series",
-                                                    url = series.url ?: "",
-                                                    logo = series.logo
-                                                )
-                                            }
-                                        },
+                                        onClick = { viewModel.toggleFavorite(series) },
                                         containerColor = Color.White.copy(alpha = 0.08f),
                                         shape = RoundedCornerShape(6.dp),
                                         modifier = Modifier.size(32.dp)

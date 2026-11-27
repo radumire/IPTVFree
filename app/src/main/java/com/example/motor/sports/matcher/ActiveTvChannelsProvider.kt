@@ -50,18 +50,37 @@ class DefaultActiveTvChannelsProvider(
         val rawHidden = sessionRepo.settings.value.hiddenTvCategories
         val hiddenCategories = rawHidden.map { it.trim().lowercase() }.toSet()
 
-        val candidates = if (hiddenCategories.isEmpty()) {
-            dataMap.values.flatten()
-        } else {
-            // Solo buscar entre las categorías y canales visibles que el usuario ha elegido mostrar (en los ocultos no)
-            dataMap.filterKeys { key -> key.trim().lowercase() !in hiddenCategories }
-                .values.flatten()
+        val hasNonSyntheticCategories = dataMap.keys.any { key ->
+            val norm = key.trim().lowercase()
+            norm != "todos" && norm != "all"
         }
 
-        candidates.filter { item ->
-            val itemGroup = item.group?.trim()?.lowercase().orEmpty()
-            (itemGroup.isEmpty() || itemGroup !in hiddenCategories) &&
-                (!item.url.isNullOrBlank() || !item.stalkerCmd.isNullOrBlank())
+        val seenKeys = HashSet<String>()
+        val result = ArrayList<IptvItem>()
+
+        for ((categoryKey, items) in dataMap) {
+            val normCategoryKey = categoryKey.trim().lowercase()
+            if (hasNonSyntheticCategories && (normCategoryKey == "todos" || normCategoryKey == "all")) {
+                continue
+            }
+            if (normCategoryKey in hiddenCategories) {
+                continue
+            }
+
+            for (item in items) {
+                val itemGroup = item.group.trim().lowercase()
+                if (itemGroup.isNotEmpty() && itemGroup in hiddenCategories) {
+                    continue
+                }
+                if (!item.isPlayableChannel()) {
+                    continue
+                }
+                if (seenKeys.add(item.dedupIdentityKey())) {
+                    result.add(item)
+                }
+            }
         }
+
+        result
     }
 }

@@ -29,6 +29,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CloudDownload
+import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.People
 import androidx.compose.material.icons.filled.PlayArrow
@@ -423,14 +424,29 @@ private fun LandscapeSymmetricLayout(
                     .fillMaxWidth()
             )
 
-            // Lower: Row of 3 symmetric utility buttons (Listas, Ajustes, Perfiles)
+            // Lower: Row of 4 symmetric utility buttons (Favoritos, Listas, Ajustes, Perfiles)
             Row(
                 modifier = Modifier
                     .weight(0.32f)
                     .fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                // 5. LISTAS
+                // 5. FAVORITOS
+                ClassicTvLauncherButton(
+                    title = "FAVORITOS",
+                    icon = Icons.Default.Favorite,
+                    themeCard = themeCard,
+                    themeCardHover = themeCardHover,
+                    themeAccent = themeAccent,
+                    badgeText = if (uiState.favorites.isNotEmpty()) "${uiState.favorites.size}" else null,
+                    testTag = "btn_favorites",
+                    onClick = { onNavigate("favorites") },
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight()
+                )
+
+                // 6. LISTAS
                 ClassicTvLauncherButton(
                     title = "LISTAS",
                     icon = Icons.Default.CloudDownload,
@@ -444,7 +460,7 @@ private fun LandscapeSymmetricLayout(
                         .fillMaxHeight()
                 )
 
-                // 6. AJUSTES
+                // 7. AJUSTES
                 ClassicTvLauncherButton(
                     title = "AJUSTES",
                     icon = Icons.Default.Settings,
@@ -458,7 +474,7 @@ private fun LandscapeSymmetricLayout(
                         .fillMaxHeight()
                 )
 
-                // 7. PERFILES
+                // 8. PERFILES
                 ClassicTvLauncherButton(
                     title = "PERFILES",
                     icon = Icons.Default.People,
@@ -574,11 +590,24 @@ private fun PortraitLayout(
             )
         }
 
-        // Row for the 3 utility buttons
+        // 2x2 grid for utility buttons (Favoritos, Listas, Ajustes, Perfiles)
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
         ) {
+            ClassicTvLauncherButton(
+                title = "FAVORITOS",
+                icon = Icons.Default.Favorite,
+                themeCard = themeCard,
+                themeCardHover = themeCardHover,
+                themeAccent = themeAccent,
+                badgeText = if (uiState.favorites.isNotEmpty()) "${uiState.favorites.size}" else null,
+                testTag = "btn_favorites",
+                onClick = { onNavigate("favorites") },
+                modifier = Modifier
+                    .weight(1f)
+                    .height(82.dp)
+            )
             ClassicTvLauncherButton(
                 title = "LISTAS",
                 icon = Icons.Default.CloudDownload,
@@ -589,8 +618,14 @@ private fun PortraitLayout(
                 onClick = { onNavigate("playlists") },
                 modifier = Modifier
                     .weight(1f)
-                    .height(85.dp)
+                    .height(82.dp)
             )
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
             ClassicTvLauncherButton(
                 title = "AJUSTES",
                 icon = Icons.Default.Settings,
@@ -601,7 +636,7 @@ private fun PortraitLayout(
                 onClick = { onNavigate("settings") },
                 modifier = Modifier
                     .weight(1f)
-                    .height(85.dp)
+                    .height(82.dp)
             )
             ClassicTvLauncherButton(
                 title = "PERFILES",
@@ -613,7 +648,7 @@ private fun PortraitLayout(
                 onClick = { onNavigate("accounts") },
                 modifier = Modifier
                     .weight(1f)
-                    .height(85.dp)
+                    .height(82.dp)
             )
         }
     }

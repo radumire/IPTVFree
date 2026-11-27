@@ -20,6 +20,7 @@ import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 import androidx.media3.extractor.DefaultExtractorsFactory
+import androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory
 import androidx.media3.ui.PlayerView
 import java.util.UUID
 import kotlinx.coroutines.CoroutineScope
@@ -246,7 +247,12 @@ object PlayerRepository {
         }
 
         val extractorsFactory = DefaultExtractorsFactory()
-            .setTsExtractorFlags(1 or 8 or 16 or 64) // FLAG_ALLOW_NON_IDR_KEYFRAMES, FLAG_DETECT_ACCESS_UNITS, FLAG_IGNORE_SPLICE_INFO_STREAM, FLAG_ENABLE_HDMV_DTS_AUDIO_STREAMS
+            .setTsExtractorFlags(
+                DefaultTsPayloadReaderFactory.FLAG_ALLOW_NON_IDR_KEYFRAMES or
+                    DefaultTsPayloadReaderFactory.FLAG_DETECT_ACCESS_UNITS or
+                    DefaultTsPayloadReaderFactory.FLAG_IGNORE_SPLICE_INFO_STREAM or
+                    DefaultTsPayloadReaderFactory.FLAG_ENABLE_HDMV_DTS_AUDIO_STREAMS
+            )
             .setTsExtractorTimestampSearchBytes(2000 * 188)
             .setConstantBitrateSeekingEnabled(true)
 

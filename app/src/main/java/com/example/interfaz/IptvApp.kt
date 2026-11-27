@@ -124,10 +124,12 @@ fun AppContent(viewModel: MainViewModel, theme: AppThemeColors) {
     var activePlayerEpisode by remember { mutableStateOf<Int?>(null) }
     var activeCategoryName by remember { mutableStateOf("") }
     var activeCategoryChannels by remember { mutableStateOf<List<com.example.motor.db.IptvItem>>(emptyList()) }
+    var activeCategoryPlaylistId by remember { mutableStateOf<Long?>(null) }
+    var activePlayingChannel by remember { mutableStateOf<com.example.motor.db.IptvItem?>(null) }
 
     // Navigation Back Stack
     val backStack = remember { mutableStateListOf<String>() }
-    val topLevelScreens = remember { setOf("home", "live_tv", "movies", "series", "sports", "playlists", "settings", "accounts") }
+    val topLevelScreens = remember { setOf("home", "live_tv", "movies", "series", "sports", "favorites", "playlists", "settings", "accounts") }
 
     fun navigateTo(screen: String) {
         if (currentScreen != screen) {
@@ -145,7 +147,7 @@ fun AppContent(viewModel: MainViewModel, theme: AppThemeColors) {
 
     fun navigateBack() {
         if (backStack.isNotEmpty()) {
-            currentScreen = backStack.removeLast()
+            currentScreen = backStack.removeAt(backStack.lastIndex)
         } else if (currentScreen != "home") {
             currentScreen = "home"
         }
@@ -163,6 +165,8 @@ fun AppContent(viewModel: MainViewModel, theme: AppThemeColors) {
         } else if (activePlayerSrc != null) {
             activePlayerSrc = null
             activeStreamHeaders = emptyMap()
+            activeCategoryPlaylistId = null
+            activePlayingChannel = null
             if (currentScreen != "live_tv") {
                 playerViewModel.stop()
             }
@@ -180,6 +184,8 @@ fun AppContent(viewModel: MainViewModel, theme: AppThemeColors) {
         if (currentProfile == null && currentScreen != "profiles") {
             activePlayerSrc = null
             activeStreamHeaders = emptyMap()
+            activeCategoryPlaylistId = null
+            activePlayingChannel = null
             playerViewModel.stop()
             playlistViewModel.cancelConnection()
             backStack.clear()
@@ -197,6 +203,8 @@ fun AppContent(viewModel: MainViewModel, theme: AppThemeColors) {
             lastHandledProfileId = prof.id
             activePlayerSrc = null
             activeStreamHeaders = emptyMap()
+            activeCategoryPlaylistId = null
+            activePlayingChannel = null
             playerViewModel.stop()
             playlistViewModel.cancelConnection()
             val settingsObj = JsonUtils.settingsFromJson(prof.settingsJson)
@@ -222,6 +230,8 @@ fun AppContent(viewModel: MainViewModel, theme: AppThemeColors) {
                 onProfileSelected = { p ->
                     activePlayerSrc = null
                     activeStreamHeaders = emptyMap()
+                    activeCategoryPlaylistId = null
+                    activePlayingChannel = null
                     backStack.clear()
                     profileViewModel.switchProfile(p)
                     currentScreen = "home"
@@ -311,7 +321,121 @@ fun AppContent(viewModel: MainViewModel, theme: AppThemeColors) {
                                             activeDrmScheme = dScheme
                                             activeDrmLicenseUrl = dLicense
                                             activeCategoryChannels = matchChannels
-                                            activeCategoryName = matchCat ?: "Deportes"
+                                            activeCategoryName = matchCat ?: Translator.translate("sports", settingsObj.lang)
+                                            activeCategoryPlaylistId = sportsViewModel.getActivePlaylistId()
+                                            activePlayingChannel = sportsViewModel.lastPlayedChannel.value
+                                        },
+                                        onExitRequest = { showExitConfirmDialog = true },
+                                        theme = theme
+                                    )
+                                }
+                                "showcase" -> {
+                                    ShowcaseHomeScreen(
+                                        homeViewModel = homeViewModel,
+                                        liveTvViewModel = liveTvViewModel,
+                                        moviesViewModel = moviesViewModel,
+                                        seriesViewModel = seriesViewModel,
+                                        sportsViewModel = sportsViewModel,
+                                        onNavigate = { navigateTo(it) },
+                                        onPlayLiveChannel = { src, title, dScheme, dLicense, catName, catChannels, headers, ch ->
+                                            activePlayerSrc = src
+                                            activeStreamHeaders = headers
+                                            activePlayerTitle = title
+                                            activePlayerType = "live"
+                                            activeDrmScheme = dScheme
+                                            activeDrmLicenseUrl = dLicense
+                                            activeCategoryName = catName
+                                            activeCategoryChannels = catChannels
+                                            activeCategoryPlaylistId = liveTvViewModel.getActivePlaylistId()
+                                            activePlayingChannel = ch
+                                        },
+                                        onPlayVod = { src, title, type, dScheme, dLicense, headers ->
+                                            activePlayerSrc = src
+                                            activeStreamHeaders = headers
+                                            activePlayerTitle = title
+                                            activePlayerType = type
+                                            activeDrmScheme = dScheme
+                                            activeDrmLicenseUrl = dLicense
+                                            if (type == "series") {
+                                                val se = com.example.motor.tmdb.TmdbService.extractSeasonEpisode(title)
+                                                activePlayerSeriesTitle = com.example.motor.tmdb.TmdbService.cleanSeriesName(title)
+                                                activePlayerSeason = se?.season
+                                                activePlayerEpisode = se?.episode
+                                            } else {
+                                                activePlayerSeriesTitle = null
+                                                activePlayerSeason = null
+                                                activePlayerEpisode = null
+                                            }
+                                        },
+                                        onPlaySport = { src, title, dScheme, dLicense, matchChannels, matchCat, headers ->
+                                            activePlayerSrc = src
+                                            activeStreamHeaders = headers
+                                            activePlayerTitle = title
+                                            activePlayerType = "live"
+                                            activeDrmScheme = dScheme
+                                            activeDrmLicenseUrl = dLicense
+                                            activeCategoryChannels = matchChannels
+                                            activeCategoryName = matchCat ?: Translator.translate("sports", settingsObj.lang)
+                                            activeCategoryPlaylistId = sportsViewModel.getActivePlaylistId()
+                                            activePlayingChannel = sportsViewModel.lastPlayedChannel.value
+                                        },
+                                        onExitRequest = { showExitConfirmDialog = true },
+                                        theme = theme
+                                    )
+                                }
+                                "live_stage" -> {
+                                    LiveStageHomeScreen(
+                                        homeViewModel = homeViewModel,
+                                        liveTvViewModel = liveTvViewModel,
+                                        moviesViewModel = moviesViewModel,
+                                        seriesViewModel = seriesViewModel,
+                                        sportsViewModel = sportsViewModel,
+                                        settingsViewModel = settingsViewModel,
+                                        playerViewModel = playerViewModel,
+                                        isFullScreenActive = activePlayerSrc != null,
+                                        currentFullscreenChannel = activePlayingChannel,
+                                        onNavigate = { navigateTo(it) },
+                                        onPlayLiveChannel = { src, title, dScheme, dLicense, catName, catChannels, headers, ch ->
+                                            activePlayerSrc = src
+                                            activeStreamHeaders = headers
+                                            activePlayerTitle = title
+                                            activePlayerType = "live"
+                                            activeDrmScheme = dScheme
+                                            activeDrmLicenseUrl = dLicense
+                                            activeCategoryName = catName
+                                            activeCategoryChannels = catChannels
+                                            activeCategoryPlaylistId = liveTvViewModel.getActivePlaylistId()
+                                            activePlayingChannel = ch
+                                        },
+                                        onPlayVod = { src, title, type, dScheme, dLicense, headers ->
+                                            activePlayerSrc = src
+                                            activeStreamHeaders = headers
+                                            activePlayerTitle = title
+                                            activePlayerType = type
+                                            activeDrmScheme = dScheme
+                                            activeDrmLicenseUrl = dLicense
+                                            if (type == "series") {
+                                                val se = com.example.motor.tmdb.TmdbService.extractSeasonEpisode(title)
+                                                activePlayerSeriesTitle = com.example.motor.tmdb.TmdbService.cleanSeriesName(title)
+                                                activePlayerSeason = se?.season
+                                                activePlayerEpisode = se?.episode
+                                            } else {
+                                                activePlayerSeriesTitle = null
+                                                activePlayerSeason = null
+                                                activePlayerEpisode = null
+                                            }
+                                        },
+                                        onPlaySport = { src, title, dScheme, dLicense, matchChannels, matchCat, headers ->
+                                            activePlayerSrc = src
+                                            activeStreamHeaders = headers
+                                            activePlayerTitle = title
+                                            activePlayerType = "live"
+                                            activeDrmScheme = dScheme
+                                            activeDrmLicenseUrl = dLicense
+                                            activeCategoryChannels = matchChannels
+                                            activeCategoryName = matchCat ?: Translator.translate("sports", settingsObj.lang)
+                                            activeCategoryPlaylistId = sportsViewModel.getActivePlaylistId()
+                                            activePlayingChannel = sportsViewModel.lastPlayedChannel.value
                                         },
                                         onExitRequest = { showExitConfirmDialog = true },
                                         theme = theme
@@ -341,6 +465,12 @@ fun AppContent(viewModel: MainViewModel, theme: AppThemeColors) {
                                 activeDrmLicenseUrl = dLicense
                                 activeCategoryName = catName
                                 activeCategoryChannels = catChannels
+                                activeCategoryPlaylistId = liveTvViewModel.getActivePlaylistId()
+                                activePlayingChannel = catChannels.firstOrNull {
+                                    !it.url.isNullOrBlank() && it.url == src
+                                } ?: catChannels.firstOrNull {
+                                    it.name.equals(title, ignoreCase = true)
+                                }
                             },
                             onBack = { navigateTo("home") },
                             theme = theme,
@@ -386,7 +516,56 @@ fun AppContent(viewModel: MainViewModel, theme: AppThemeColors) {
                                 activeDrmLicenseUrl = dLicense
                                 activeCategoryChannels = matchChannels
                                 activeCategoryName = matchCategoryName ?: Translator.translate("sports", settingsObj.lang)
+                                activeCategoryPlaylistId = sportsViewModel.getActivePlaylistId()
+                                activePlayingChannel = sportsViewModel.lastPlayedChannel.value
                             },
+                            onBack = { navigateTo("home") },
+                            theme = theme,
+                            lang = settingsObj.lang
+                        )
+                        "favorites" -> com.example.interfaz.screens.FavoritesScreen(
+                            viewModel = homeViewModel,
+                            onPlay = { src, title, type, dScheme, dLicense, headers, categoryChannels ->
+                                activePlayerSrc = src
+                                activeStreamHeaders = headers
+                                activePlayerTitle = title
+                                activePlayerType = type
+                                activeDrmScheme = dScheme
+                                activeDrmLicenseUrl = dLicense
+                                if (type == "live") {
+                                    activeCategoryChannels = categoryChannels
+                                    activeCategoryName = Translator.translate("favorites", settingsObj.lang)
+                                    activeCategoryPlaylistId = liveTvViewModel.getActivePlaylistId()
+                                    activePlayingChannel = categoryChannels.firstOrNull {
+                                        !it.url.isNullOrBlank() && it.url == src
+                                    } ?: categoryChannels.firstOrNull {
+                                        it.name.equals(title, ignoreCase = true)
+                                    }
+                                    activePlayerSeriesTitle = null
+                                    activePlayerSeason = null
+                                    activePlayerEpisode = null
+                                } else {
+                                    activeCategoryChannels = emptyList()
+                                    activeCategoryName = ""
+                                    activeCategoryPlaylistId = null
+                                    activePlayingChannel = null
+                                    if (type == "series") {
+                                        val se = com.example.motor.tmdb.TmdbService.extractSeasonEpisode(title)
+                                        activePlayerSeriesTitle = com.example.motor.tmdb.TmdbService.cleanSeriesName(title)
+                                        activePlayerSeason = se?.season
+                                        activePlayerEpisode = se?.episode
+                                    } else {
+                                        activePlayerSeriesTitle = null
+                                        activePlayerSeason = null
+                                        activePlayerEpisode = null
+                                    }
+                                }
+                            },
+                            onOpenSeries = { seriesItem ->
+                                seriesViewModel.pendingSelectedSeries.value = seriesItem
+                                navigateTo("series")
+                            },
+                            onNavigateCatalog = { route -> navigateTo(route) },
                             onBack = { navigateTo("home") },
                             theme = theme,
                             lang = settingsObj.lang
@@ -401,6 +580,8 @@ fun AppContent(viewModel: MainViewModel, theme: AppThemeColors) {
                             onLogout = {
                                 activePlayerSrc = null
                                 activeStreamHeaders = emptyMap()
+                                activeCategoryPlaylistId = null
+                                activePlayingChannel = null
                                 playerViewModel.stop()
                                 playlistViewModel.cancelConnection()
                                 backStack.clear()
@@ -595,6 +776,8 @@ fun AppContent(viewModel: MainViewModel, theme: AppThemeColors) {
                             activePlayerEpisode = null
                             activeCategoryName = ""
                             activeCategoryChannels = emptyList()
+                            activeCategoryPlaylistId = null
+                            activePlayingChannel = null
                             if (currentScreen != "live_tv") {
                                 playerViewModel.stop()
                             }
@@ -610,29 +793,48 @@ fun AppContent(viewModel: MainViewModel, theme: AppThemeColors) {
                         episode = activePlayerEpisode,
                         categoryChannels = activeCategoryChannels,
                         categoryName = activeCategoryName,
+                        currentChannel = activePlayingChannel,
                         onSelectChannel = { channel ->
-                            coroutineScope.launch {
-                                try {
-                                    val (resolvedUrl, resolvedHeaders) = liveTvViewModel.resolveStream(channel)
-                                    if (resolvedUrl.isNotBlank()) {
-                                        activePlayerSrc = resolvedUrl
-                                        activeStreamHeaders = resolvedHeaders
-                                        activePlayerTitle = channel.name
-                                        activeDrmScheme = channel.drmScheme
-                                        activeDrmLicenseUrl = channel.drmLicenseUrl
-                                    } else {
+                            val currentPlaylistId = liveTvViewModel.getActivePlaylistId()
+                            if (activeCategoryPlaylistId != null && currentPlaylistId != activeCategoryPlaylistId) {
+                                android.widget.Toast.makeText(
+                                    context,
+                                    Translator.translate("player_zap_playlist_changed", pSettings.lang),
+                                    android.widget.Toast.LENGTH_SHORT
+                                ).show()
+                            } else {
+                                coroutineScope.launch {
+                                    try {
+                                        val (resolvedUrl, resolvedHeaders) = liveTvViewModel.resolveStream(channel)
+                                        if (liveTvViewModel.getActivePlaylistId() != currentPlaylistId) {
+                                            android.widget.Toast.makeText(
+                                                context,
+                                                Translator.translate("player_zap_playlist_changed", pSettings.lang),
+                                                android.widget.Toast.LENGTH_SHORT
+                                            ).show()
+                                            return@launch
+                                        }
+                                        if (resolvedUrl.isNotBlank()) {
+                                            activePlayerSrc = resolvedUrl
+                                            activeStreamHeaders = resolvedHeaders
+                                            activePlayerTitle = channel.name
+                                            activePlayingChannel = channel
+                                            activeDrmScheme = channel.drmScheme
+                                            activeDrmLicenseUrl = channel.drmLicenseUrl
+                                        } else {
+                                            android.widget.Toast.makeText(
+                                                context,
+                                                Translator.translate("player_zap_url_error", pSettings.lang),
+                                                android.widget.Toast.LENGTH_SHORT
+                                            ).show()
+                                        }
+                                    } catch (e: Exception) {
                                         android.widget.Toast.makeText(
                                             context,
-                                            "No se pudo resolver la URL del canal",
+                                            Translator.translate("player_zap_switch_error", pSettings.lang, e.message ?: ""),
                                             android.widget.Toast.LENGTH_SHORT
                                         ).show()
                                     }
-                                } catch (e: Exception) {
-                                    android.widget.Toast.makeText(
-                                        context,
-                                        "Error al cambiar de canal: ${e.message}",
-                                        android.widget.Toast.LENGTH_SHORT
-                                    ).show()
                                 }
                             }
                         }
@@ -693,6 +895,7 @@ fun AppShell(
         MenuItem("movies", Translator.translate("movies", lang), Icons.Default.Movie),
         MenuItem("series", Translator.translate("series", lang), Icons.Default.VideoLibrary),
         MenuItem("sports", Translator.translate("sports", lang), Icons.Default.SportsSoccer),
+        MenuItem("favorites", Translator.translate("favorites", lang), Icons.Default.Favorite),
         MenuItem("playlists", Translator.translate("playlists", lang), Icons.Default.CloudDownload),
         MenuItem("settings", Translator.translate("settings", lang), Icons.Default.Settings),
         MenuItem("accounts", Translator.translate("accounts", lang), Icons.Default.People)
@@ -704,6 +907,7 @@ fun AppShell(
         MenuItem("movies", Translator.translate("movies", lang), Icons.Default.Movie),
         MenuItem("series", Translator.translate("series", lang), Icons.Default.VideoLibrary),
         MenuItem("sports", Translator.translate("sports", lang), Icons.Default.SportsSoccer),
+        MenuItem("favorites", Translator.translate("favorites", lang), Icons.Default.Favorite),
         MenuItem("playlists", Translator.translate("playlists", lang), Icons.Default.CloudDownload),
         MenuItem("settings", Translator.translate("settings", lang), Icons.Default.Settings)
     )
@@ -749,6 +953,7 @@ fun AppShell(
                                 "movies" -> Translator.translate("movies", lang)
                                 "series" -> Translator.translate("series", lang)
                                 "sports" -> Translator.translate("sports", lang)
+                                "favorites" -> Translator.translate("favorites", lang)
                                 "playlists" -> Translator.translate("playlists", lang)
                                 "accounts" -> Translator.translate("accounts", lang)
                                 "settings" -> Translator.translate("settings", lang)
@@ -812,9 +1017,10 @@ fun AppShell(
 
                         Column(
                             modifier = Modifier
+                                .weight(1f)
                                 .clip(RoundedCornerShape(8.dp))
                                 .tvClickable { onNavigate(item.route) }
-                                .padding(horizontal = 10.dp, vertical = 6.dp),
+                                .padding(horizontal = 2.dp, vertical = 6.dp),
                             horizontalAlignment = Alignment.CenterHorizontally,
                             verticalArrangement = Arrangement.Center
                         ) {
@@ -822,14 +1028,15 @@ fun AppShell(
                                 imageVector = item.icon,
                                 contentDescription = item.title,
                                 tint = tint,
-                                modifier = Modifier.size(22.dp)
+                                modifier = Modifier.size(20.dp)
                             )
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
                                 text = item.title,
                                 color = tint,
-                                fontSize = 9.sp,
+                                fontSize = 8.5.sp,
                                 maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
                                 fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
                             )
                         }
@@ -838,7 +1045,7 @@ fun AppShell(
             }
         }
     } else {
-        val showSidebar = currentScreen !in listOf("live_tv", "movies", "series", "sports") && !isClassicHome && !isFullScreenOverlay
+        val showSidebar = currentScreen !in listOf("live_tv", "movies", "series", "sports", "favorites") && !isClassicHome && !isFullScreenOverlay
         val context = LocalContext.current
         val isTvOrBox = remember(context) {
             val pm = context.packageManager

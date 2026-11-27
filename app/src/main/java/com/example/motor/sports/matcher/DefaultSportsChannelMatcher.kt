@@ -73,6 +73,17 @@ class DefaultSportsChannelMatcher : SportsChannelMatcher {
         private val UFC_INDICATORS = setOf(
             "ufc", "mma", "fight pass", "artes marciales", "bellator", "pfl", "combate"
         )
+
+        private val MOVISTAR_PLUS_WORD_REGEX = Regex("\\bmovistar\\s+plus\\s*\\+?")
+        private val MOVISTAR_SIGN_REGEX = Regex("\\bmovistar\\s*\\+")
+        private val M_PLUS_ABBR_REGEX = Regex("(^|[\\s|:\\-\\[\\]()/•.,])m\\s*\\+(?=[\\s|:\\-\\[\\]()/•.,a-z0-9]|$)")
+        private val M_DOT_ABBR_REGEX = Regex("(^|[\\s|:\\-\\[\\]()/•.,])m\\.(?=\\s*[a-z0-9]|$)")
+        private val M_PREFIX_WORD_REGEX = Regex(
+            "\\bm (?=(?:laliga|la liga|campeones|liga de campeones|l campeones|deportes|golf|clasicos|vamos|ellas vamos|basket|baloncesto|nba|f1|motogp|tenis|tennis|estrenos|accion|comedia|drama)\\b)"
+        )
+        private val LEADING_PORTAL_NUMBER_REGEX = Regex(
+            "(?i)^\\s*(?:(?:\\[[a-z]{2,5}\\]|\\([a-z]{2,5}\\))\\s*[|\\-:]?\\s*|[a-z]{2,3}\\s*[|\\-:]\\s*)?(?:ch\\s*\\d{1,4}\\s*[|\\-.:]+\\s*|#?\\d{1,4}\\s*[|\\-.:]+\\s*|#?\\d{2,4}\\s+(?=[a-zA-Z]))"
+        )
     }
 
     override suspend fun matchChannel(
@@ -103,8 +114,8 @@ class DefaultSportsChannelMatcher : SportsChannelMatcher {
         val awayTokens = if (normAway.isNotBlank()) TextNormalizer.extractCleanTokens(normAway) else emptyList()
 
         for (channel in availableChannels) {
-            // Canal sin URL reproducible o comando Stalker no es candidato
-            if (channel.url.isNullOrBlank() && channel.stalkerCmd.isNullOrBlank()) {
+            // Canal sin URL reproducible o comando Stalker válido no es candidato
+            if (!channel.isPlayableChannel()) {
                 continue
             }
 
@@ -231,8 +242,10 @@ class DefaultSportsChannelMatcher : SportsChannelMatcher {
             }
         }
 
-        // Ordenar candidatos por puntuación descendente
-        val sortedCandidates = evaluatedCandidates.sortedByDescending { it.score }
+        // Ordenar candidatos por puntuación descendente y deduplicar entradas idénticas
+        val sortedCandidates = evaluatedCandidates
+            .sortedByDescending { it.score }
+            .distinctBy { it.channel.dedupIdentityKey() }
 
         val verifiedCandidates = sortedCandidates.filter {
             it.reasons.any { r -> r.startsWith("BROADCASTER_VERIFIED_BY_THESPORTSDB") }
@@ -442,7 +455,7 @@ class DefaultSportsChannelMatcher : SportsChannelMatcher {
                 }
                 leagueNorm.contains("champions") || leagueNorm.contains("ucl") || leagueNorm.contains("liga de campeones") -> {
                     padded.contains(" champions ") || padded.contains(" liga de campeones ") ||
-                            padded.contains(" m campeones ") || padded.contains(" ucl ")
+                            padded.contains(" m campeones ") || padded.contains(" l campeones ") || padded.contains(" ucl ")
                 }
                 leagueNorm.contains("premier") -> {
                     padded.contains(" premier ") || padded.contains(" premier league ") || padded.contains(" epl ")
@@ -602,15 +615,14 @@ class DefaultSportsChannelMatcher : SportsChannelMatcher {
      * corresponda estrictamente con la emisora temática.
      */
     private fun matchThematicBroadcaster(channelName: String, fullText: String, broadcasterCandidate: String, sport: SportsSport): Boolean {
-        val normCandidate = TextNormalizer.normalize(broadcasterCandidate)
-        if (normCandidate.isBlank()) return false
+        val canonCandidate = canonicalizeBroadcaster(broadcasterCandidate)
+        if (canonCandidate.isBlank()) return false
 
         // Proveedores genéricos solos ("dazn", "movistar", "m+") no acreditan una emisora temática de otra disciplina
-        if (normCandidate == "dazn" || normCandidate == "movistar" || normCandidate == "m+" ||
-            normCandidate == "movistar plus+" || normCandidate == "movistar plus") {
-            // Solo si el canal se llama exactamente igual (ej. canal "DAZN" o canal "Movistar Plus+")
-            val cleanChannelName = TextNormalizer.normalize(channelName)
-            return cleanChannelName == normCandidate
+        if (canonCandidate == "dazn" || canonCandidate == "movistar" || canonCandidate == "movistar plus") {
+            val cleanTokens = TextNormalizer.extractCleanTokens(canonicalizeBroadcaster(stripLeadingPortalChannelNumber(channelName)))
+            return cleanTokens == listOf("dazn") ||
+                (canonCandidate.startsWith("movistar") && (cleanTokens == listOf("movistar") || cleanTokens == listOf("movistar", "plus")))
         }
 
         return matchBroadcasterPrecise(channelName, fullText, broadcasterCandidate)
@@ -620,14 +632,14 @@ class DefaultSportsChannelMatcher : SportsChannelMatcher {
      * Comprobación precisa de coincidencia de emisora (utilizada para emisoras verificadas por TheSportsDB).
      *
      * Reglas estrictas:
-     * - Coincide: "[ES] DAZN LALIGA HD", "DAZN LaLiga FHD", "ESP - DAZN LALIGA", "DAZN LALIGA 4K", "M. DEPORTES HD"
+     * - Coincide: "[ES] DAZN LALIGA HD", "104 | DAZN LaLiga H.265", "DAZN LaLiga 1", "M+ LaLiga", "M. DEPORTES HD"
      * - NO coincide: "DAZN", "DAZN 1", "DAZN 2", "DAZN LaLiga 2", "M. CLASICOS", "M. GOLF"
      */
     fun matchBroadcasterPrecise(channelName: String, fullText: String, targetBroadcaster: String): Boolean {
         if (targetBroadcaster.isBlank() || channelName.isBlank()) return false
 
         val canonTarget = canonicalizeBroadcaster(targetBroadcaster)
-        val canonChannel = canonicalizeBroadcaster(channelName)
+        val canonChannel = canonicalizeBroadcaster(stripLeadingPortalChannelNumber(channelName))
 
         val targetTokens = TextNormalizer.extractCleanTokens(canonTarget)
         val channelTokens = TextNormalizer.extractCleanTokens(canonChannel)
@@ -635,16 +647,23 @@ class DefaultSportsChannelMatcher : SportsChannelMatcher {
         if (targetTokens.isEmpty()) return false
 
         // 1. Números específicos (ej. DAZN 1 vs DAZN 2 vs DAZN LaLiga 2)
-        val targetNumbers = targetTokens.filter { it.all { c -> c.isDigit() } }.toSet()
-        val channelNumbers = channelTokens.filter { it.all { c -> c.isDigit() } }.toSet()
+        val targetNumbers = targetTokens
+            .filter { it.all { c -> c.isDigit() } }
+            .map { it.trimStart('0').ifEmpty { "0" } }
+            .toSet()
+        val channelNumbers = channelTokens
+            .filter { it.all { c -> c.isDigit() } }
+            .map { it.trimStart('0').ifEmpty { "0" } }
+            .toSet()
 
         if (targetNumbers.isNotEmpty()) {
             // Si la emisora objetivo tiene número, el canal DEBE tener exactamente ese número
             if (targetNumbers != channelNumbers) return false
         } else {
             // Si la emisora objetivo NO tiene número (ej. "DAZN LaLiga"),
-            // un canal secundario con número (ej. "DAZN LaLiga 2", "DAZN 1") NO es coincidencia
-            if (channelNumbers.isNotEmpty()) return false
+            // se acepta la señal principal numerada con "1" (ej. "DAZN LaLiga 1"),
+            // pero canales secundarios ("DAZN LaLiga 2", "DAZN 2") NO coinciden
+            if (channelNumbers.isNotEmpty() && channelNumbers != setOf("1")) return false
         }
 
         // 2. Tokens no numéricos obligatorios
@@ -657,19 +676,27 @@ class DefaultSportsChannelMatcher : SportsChannelMatcher {
         return targetNonNumTokens.all { it in channelNonNumTokens }
     }
 
+    private fun stripLeadingPortalChannelNumber(channelName: String): String {
+        return LEADING_PORTAL_NUMBER_REGEX.replaceFirst(channelName, "").trim().ifEmpty { channelName }
+    }
+
     private fun canonicalizeBroadcaster(text: String): String {
-        var norm = TextNormalizer.normalize(text)
-        return norm.replace("movistar+", "movistar")
-            .replace("m+", "movistar")
-            .replace("m. ", "movistar ")
-            .replace("m.", "movistar ")
-            .replace("m laliga", "movistar laliga")
-            .replace("m campeones", "movistar campeones")
-            .replace("m liga de campeones", "movistar campeones")
-            .replace("m deportes", "movistar deportes")
-            .replace("m golf", "movistar golf")
-            .replace("m clasicos", "movistar clasicos")
+        var prepared = text.trim().lowercase()
+        prepared = MOVISTAR_PLUS_WORD_REGEX.replace(prepared, "movistar")
+        prepared = MOVISTAR_SIGN_REGEX.replace(prepared, "movistar")
+        prepared = M_PLUS_ABBR_REGEX.replace(prepared, "$1movistar ")
+        prepared = M_DOT_ABBR_REGEX.replace(prepared, "$1movistar ")
+
+        var norm = TextNormalizer.normalize(prepared)
+        norm = M_PREFIX_WORD_REGEX.replace(norm, "movistar ")
+        return norm
+            .replace("liga de campeones", "campeones")
+            .replace("l campeones", "campeones")
             .replace("la liga", "laliga")
+            .replace("formula 1", "f1")
+            .replace("formula1", "f1")
+            .replace("moto gp", "motogp")
             .replace("bt sport", "tnt sports")
+            .trim()
     }
 }

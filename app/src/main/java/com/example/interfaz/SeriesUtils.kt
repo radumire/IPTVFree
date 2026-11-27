@@ -397,8 +397,8 @@ fun groupM3uEpisodes(
             displayName = displayName.trim().removePrefix("-").trim().removePrefix(":").trim()
 
             val isOnlyEpNumber = displayName == epNum.toString() ||
-                                 displayName == String.format("%02d", epNum) ||
-                                 displayName == String.format("%03d", epNum)
+                                 displayName == String.format(java.util.Locale.ROOT, "%02d", epNum) ||
+                                 displayName == String.format(java.util.Locale.ROOT, "%03d", epNum)
 
             val titleText = if (displayName.isNotEmpty() && !isOnlyEpNumber) {
                 "S${seasonNum} E${epNum}: $displayName"

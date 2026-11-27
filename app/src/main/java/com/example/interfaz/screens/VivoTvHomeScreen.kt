@@ -515,7 +515,7 @@ private fun VivoLandscapeTiles(
                 VivoHorizontalTile(
                     title = "Favorites",
                     icon = Icons.Default.BookmarkBorder,
-                    onClick = { onNavigate("live_tv") },
+                    onClick = { onNavigate("favorites") },
                     themeCard = themeCard,
                     themeCardHover = themeCardHover,
                     themeAccent = themeAccent,
@@ -780,7 +780,7 @@ private fun VivoPortraitTiles(
             VivoHorizontalTile(
                 title = "Favorites",
                 icon = Icons.Default.BookmarkBorder,
-                onClick = { onNavigate("live_tv") },
+                onClick = { onNavigate("favorites") },
                 themeCard = themeCard,
                 themeCardHover = themeCardHover,
                 themeAccent = themeAccent,

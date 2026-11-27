@@ -5,7 +5,7 @@ import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -28,6 +28,7 @@ import com.example.Translator
 import com.example.parseHexColor
 import com.example.motor.db.*
 import com.example.motor.config.*
+import com.example.motor.repository.IptvRepository
 import com.example.interfaz.AppThemeColors
 import com.example.interfaz.viewmodel.HomeViewModel
 import com.example.interfaz.state.HomeState
@@ -50,6 +51,7 @@ fun HomeScreen(
     theme: AppThemeColors
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+    val settingsObj by viewModel.settings.collectAsStateWithLifecycle()
     var selectedMovieItem by remember { mutableStateOf<IptvItem?>(null) }
     val scope = rememberCoroutineScope()
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -155,7 +157,10 @@ fun HomeScreen(
                             horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(12.dp),
                             modifier = Modifier.fillMaxWidth()
                         ) {
-                            items(newestMovies, key = { it.name + (it.url ?: "") }) { movie ->
+                            itemsIndexed(
+                                newestMovies,
+                                key = { index, movie -> homeNewestMovieKey(index, movie) }
+                            ) { _, movie ->
                                 var isFocused by remember { mutableStateOf(false) }
                                 Column(
                                     modifier = Modifier
@@ -304,7 +309,10 @@ fun HomeScreen(
                             horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(12.dp),
                             modifier = Modifier.fillMaxWidth()
                         ) {
-                            items(continueWatching.take(10), key = { "${it.playlistId}_${it.src}_${it.title}" }) { hist ->
+                            itemsIndexed(
+                                continueWatching.take(10),
+                                key = { index, hist -> homeContinueWatchingKey(index, hist) }
+                            ) { _, hist ->
                                 var isFocused by remember { mutableStateOf(false) }
                                 Box(
                                     modifier = Modifier
@@ -370,12 +378,42 @@ fun HomeScreen(
             if (favsList.isNotEmpty()) {
                 item {
                     Column {
-                        Text("Favoritos Recientes", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 10.dp))
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(bottom = 10.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = Translator.translate("recent_favorites", settingsObj.lang),
+                                color = Color.White,
+                                fontSize = 16.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            TvButton(
+                                onClick = { onNavigate("favorites") },
+                                containerColor = parseHexColor(theme.card).copy(alpha = 0.65f),
+                                focusedContainerColor = TV_FOCUSED_BG,
+                                shape = RoundedCornerShape(20.dp),
+                                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
+                            ) { isViewAllFocused ->
+                                Text(
+                                    text = "${Translator.translate("view_all", settingsObj.lang)} (${favsList.size})",
+                                    color = if (isViewAllFocused) TV_FOCUSED_TEXT else parseHexColor(theme.accentLight),
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+                        }
                         LazyRow(
                             horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(12.dp),
                             modifier = Modifier.fillMaxWidth()
                         ) {
-                            items(favsList.take(6), key = { "${it.playlistId}_${it.id}_${it.type}" }) { fav ->
+                            itemsIndexed(
+                                favsList.take(6),
+                                key = { index, fav -> homeFavoriteKey(index, fav) }
+                            ) { _, fav ->
                                 var isFocused by remember { mutableStateOf(false) }
                                 Box(
                                     modifier = Modifier
@@ -440,24 +478,13 @@ fun HomeScreen(
     }
 
     selectedMovieItem?.let { movie ->
-        val isFav = uiState.favorites.any { it.id == movie.name || (movie.url != null && it.url == movie.url) || it.title == movie.name }
+        val isFav = remember(movie, uiState.favorites) {
+            IptvRepository.isItemFavorited(movie, "movie", uiState.favorites)
+        }
         MovieDetailModal(
             movie = movie,
             isFav = isFav,
-            onToggleFavorite = {
-                if (isFav) {
-                    viewModel.removeFavorite(movie.name)
-                    movie.url?.let { viewModel.removeFavorite(it) }
-                } else {
-                    viewModel.addFavorite(
-                        id = movie.name,
-                        title = movie.name,
-                        type = "movie",
-                        url = movie.url ?: "",
-                        logo = movie.logo
-                    )
-                }
-            },
+            onToggleFavorite = { viewModel.toggleFavoriteItem(movie, "movie") },
             onPlay = {
                 if (!movie.url.isNullOrEmpty()) {
                     onPlay(movie.url, movie.name, "movie", movie.drmScheme, movie.drmLicenseUrl, emptyMap())
@@ -554,3 +581,12 @@ fun MetricCard(
         }
     }
 }
+
+internal fun homeNewestMovieKey(index: Int, movie: IptvItem): String =
+    "${movie.name}_${movie.stalkerCmd ?: ""}_${movie.url ?: ""}_$index"
+
+internal fun homeContinueWatchingKey(index: Int, hist: PlaybackHistory): String =
+    "${hist.playlistId}_${hist.src}_${hist.title}_$index"
+
+internal fun homeFavoriteKey(index: Int, fav: FavoriteItem): String =
+    "${fav.playlistId}_${fav.id}_${fav.type}_$index"

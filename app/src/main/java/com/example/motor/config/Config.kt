@@ -225,6 +225,19 @@ object JsonUtils {
         return moshi.adapter(StalkerDevice::class.java).toJson(device)
     }
 
+    fun stalkerCompatStateFromJson(json: String): com.example.motor.parser.PortalCompatibilityState? {
+        if (json.isBlank()) return null
+        return try {
+            moshi.adapter(com.example.motor.parser.PortalCompatibilityState::class.java).fromJson(json)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    fun stalkerCompatStateToJson(state: com.example.motor.parser.PortalCompatibilityState): String {
+        return moshi.adapter(com.example.motor.parser.PortalCompatibilityState::class.java).toJson(state)
+    }
+
     fun iptvItemsMapFromJson(json: String): Map<String, List<IptvItem>> {
         val listType = Types.newParameterizedType(List::class.java, IptvItem::class.java)
         val mapType = Types.newParameterizedType(Map::class.java, String::class.java, listType)

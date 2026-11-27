@@ -86,6 +86,13 @@ class OpenSportsRemoteDataSource(
             "racing/nascar-premier" to "NASCAR"
         )
 
+        // Otros deportes no cubiertos en el resto de pestañas (Hockey hielo, Fútbol americano)
+        private val OTHER_SPORTS_LEAGUES = listOf(
+            "hockey/nhl" to "NHL Hockey",
+            "football/nfl" to "NFL",
+            "football/college-football" to "NCAA Football"
+        )
+
         private const val EUROLEAGUE_BASE = "https://api-live.euroleague.net/v2/competitions"
         private const val ACB_URL = "https://www.acb.com/es/liga/partidos"
 
@@ -125,7 +132,7 @@ class OpenSportsRemoteDataSource(
                 SportsSport.RUGBY -> fetchEspnGenericEvents("rugby", sport, null, true)
                 SportsSport.GOLF -> fetchEspnGenericEvents("golf/pga", sport, null, true)
                 SportsSport.BOXING -> fetchEspnGenericEvents("boxing", sport, null, true)
-                SportsSport.OTHER -> fetchFootballEvents(dateParam = null, liveOnly = true)
+                SportsSport.OTHER -> fetchOtherSportsEvents(dateParam = null, liveOnly = true)
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error fetching live events for $sport", e)
@@ -147,7 +154,7 @@ class OpenSportsRemoteDataSource(
                 SportsSport.RUGBY -> fetchEspnGenericEvents("rugby", sport, dateParam, false)
                 SportsSport.GOLF -> fetchEspnGenericEvents("golf/pga", sport, dateParam, false)
                 SportsSport.BOXING -> fetchEspnGenericEvents("boxing", sport, dateParam, false)
-                SportsSport.OTHER -> fetchFootballEvents(dateParam = dateParam, liveOnly = false)
+                SportsSport.OTHER -> fetchOtherSportsEvents(dateParam = dateParam, liveOnly = false)
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error fetching events by date for $sport on $date", e)
@@ -163,7 +170,8 @@ class OpenSportsRemoteDataSource(
         if (endDate.isBefore(startDate)) return@withContext emptyList()
         try {
             when (sport) {
-                SportsSport.FOOTBALL, SportsSport.OTHER -> fetchFootballWeekEvents(startDate, endDate)
+                SportsSport.FOOTBALL -> fetchFootballWeekEvents(startDate, endDate)
+                SportsSport.OTHER -> fetchOtherSportsWeekEvents(startDate, endDate)
                 SportsSport.FORMULA1 -> fetchFormula1Events(
                     dateParam = null,
                     liveOnly = false,
@@ -248,6 +256,43 @@ class OpenSportsRemoteDataSource(
         }
         deferredByDay.flatMap {
             try { it.await() } catch (_: Exception) { emptyList() }
+        }.distinctBy { it.id }.sortedBy { it.startTime }
+    }
+
+    // ─── OTROS DEPORTES (ESPN: NHL, NFL, NCAA Football) ───────────────────────────
+
+    private suspend fun fetchOtherSportsEvents(dateParam: String?, liveOnly: Boolean): List<SportsEvent> = supervisorScope {
+        val deferredList = OTHER_SPORTS_LEAGUES.map { (endpoint, defaultName) ->
+            async(Dispatchers.IO) {
+                val url = if (dateParam != null) {
+                    "$ESPN_BASE/$endpoint/scoreboard?dates=$dateParam"
+                } else {
+                    "$ESPN_BASE/$endpoint/scoreboard"
+                }
+                parseEspnScoreboard(url, SportsSport.OTHER, defaultName, liveOnly)
+            }
+        }
+
+        deferredList.flatMap {
+            try { it.await() } catch (_: Exception) { emptyList() }
+        }.distinctBy { it.id }.sortedBy { it.startTime }
+    }
+
+    private suspend fun fetchOtherSportsWeekEvents(
+        startDate: LocalDate,
+        endDate: LocalDate
+    ): List<SportsEvent> = supervisorScope {
+        val dates = buildDateRange(startDate, endDate)
+        val deferredByDay = dates.map { date ->
+            async(Dispatchers.IO) {
+                fetchOtherSportsEvents(dateParam = date.format(ESPN_DATE_FORMAT), liveOnly = false)
+            }
+        }
+        deferredByDay.flatMap {
+            try { it.await() } catch (_: Exception) { emptyList() }
+        }.filter {
+            val eventDate = Instant.ofEpochMilli(it.startTime).atZone(ZoneId.systemDefault()).toLocalDate()
+            !eventDate.isBefore(startDate) && !eventDate.isAfter(endDate)
         }.distinctBy { it.id }.sortedBy { it.startTime }
     }
 

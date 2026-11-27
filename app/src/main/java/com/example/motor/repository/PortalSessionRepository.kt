@@ -65,8 +65,11 @@ class PortalSessionRepository private constructor(
 
     // MAC Stalker session cache (by playlist ID string)
     private val stalkerSessions = java.util.concurrent.ConcurrentHashMap<String, Map<String, Any>>()
-    // MAC Stalker learned compatibility state (by playlist ID string)
+    // MAC Stalker learned compatibility state (by playlist ID string, backed by SharedPreferences)
     private val stalkerCompatStates = java.util.concurrent.ConcurrentHashMap<String, com.example.motor.parser.PortalCompatibilityState>()
+    private val compatPrefs by lazy {
+        application.getSharedPreferences("stalker_compat_states", Context.MODE_PRIVATE)
+    }
 
     init {
         // Initialize network monitor
@@ -198,15 +201,48 @@ class PortalSessionRepository private constructor(
     }
 
     fun getStalkerCompatState(playlistIdKey: String): com.example.motor.parser.PortalCompatibilityState? {
-        return stalkerCompatStates[playlistIdKey]
+        stalkerCompatStates[playlistIdKey]?.let { return it }
+        val rawJson = try {
+            compatPrefs.getString(playlistIdKey, null)
+        } catch (e: Throwable) {
+            Log.w(TAG, "Error reading persisted Stalker compat state for $playlistIdKey", e)
+            null
+        } ?: return null
+
+        val parsed = JsonUtils.stalkerCompatStateFromJson(rawJson)
+        if (parsed != null) {
+            stalkerCompatStates[playlistIdKey] = parsed
+        } else {
+            // Corrupt or incompatible JSON entry: clean up cleanly
+            try {
+                compatPrefs.edit().remove(playlistIdKey).apply()
+            } catch (_: Throwable) {}
+        }
+        return parsed
     }
 
     fun setStalkerCompatState(playlistIdKey: String, state: com.example.motor.parser.PortalCompatibilityState) {
         stalkerCompatStates[playlistIdKey] = state
+        try {
+            val json = JsonUtils.stalkerCompatStateToJson(state)
+            compatPrefs.edit().putString(playlistIdKey, json).apply()
+        } catch (e: Throwable) {
+            Log.w(TAG, "Error persisting Stalker compat state for $playlistIdKey", e)
+        }
     }
 
     fun clearStalkerCompatState(playlistIdKey: String) {
         stalkerCompatStates.remove(playlistIdKey)
+        try {
+            compatPrefs.edit().remove(playlistIdKey).apply()
+        } catch (e: Throwable) {
+            Log.w(TAG, "Error removing persisted Stalker compat state for $playlistIdKey", e)
+        }
+    }
+
+    @androidx.annotation.VisibleForTesting
+    internal fun clearInMemoryCompatCacheForTests() {
+        stalkerCompatStates.clear()
     }
 
     suspend fun reconnectActivePlaylistSilently() = withContext(Dispatchers.IO) {
@@ -250,8 +286,17 @@ class PortalSessionRepository private constructor(
         private var INSTANCE: PortalSessionRepository? = null
 
         fun getInstance(application: Application): PortalSessionRepository {
-            return INSTANCE ?: synchronized(this) {
-                INSTANCE ?: PortalSessionRepository(application).also { INSTANCE = it }
+            val existing = INSTANCE
+            if (existing != null && existing.application === application) {
+                return existing
+            }
+            return synchronized(this) {
+                val locked = INSTANCE
+                if (locked != null && locked.application === application) {
+                    locked
+                } else {
+                    PortalSessionRepository(application).also { INSTANCE = it }
+                }
             }
         }
 

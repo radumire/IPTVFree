@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -47,12 +48,14 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import com.example.motor.db.IptvItem
+import com.example.motor.sports.matcher.dedupIdentityKey
 
 /**
  * Overlay semitransparente lateral que muestra los canales de la categoría seleccionada
@@ -66,6 +69,8 @@ fun PlayerChannelsOverlay(
     currentChannelName: String?,
     onSelectChannel: (IptvItem) -> Unit,
     onDismiss: () -> Unit,
+    currentChannel: IptvItem? = null,
+    currentChannelUrl: String? = null,
     accentColor: Color = Color(0xFFB07FEE),
     modifier: Modifier = Modifier
 ) {
@@ -78,15 +83,51 @@ fun PlayerChannelsOverlay(
         val listState = rememberLazyListState()
         val initialFocusRequester = remember { FocusRequester() }
 
-        val targetInitialIndex = remember(channels, currentChannelName) {
-            val idx = channels.indexOfFirst {
-                it.name.equals(currentChannelName, ignoreCase = true)
+        val currentChannelIndex = remember(channels, currentChannel, currentChannelUrl, currentChannelName) {
+            if (currentChannel != null) {
+                val targetKey = currentChannel.dedupIdentityKey()
+                val targetGroup = currentChannel.group.trim()
+                val exactWithGroup = channels.indexOfFirst {
+                    it.dedupIdentityKey() == targetKey && it.group.trim().equals(targetGroup, ignoreCase = true)
+                }
+                if (exactWithGroup >= 0) {
+                    exactWithGroup
+                } else {
+                    val exactKey = channels.indexOfFirst { it.dedupIdentityKey() == targetKey }
+                    if (exactKey >= 0) {
+                        exactKey
+                    } else {
+                        val targetCmd = currentChannel.stalkerCmd?.trim().orEmpty()
+                        val byCmd = if (targetCmd.isNotEmpty()) {
+                            channels.indexOfFirst { it.stalkerCmd?.trim().orEmpty() == targetCmd }
+                        } else -1
+                        if (byCmd >= 0) byCmd else {
+                            val targetUrl = currentChannelUrl?.trim().takeIf { !it.isNullOrBlank() }
+                                ?: currentChannel.url?.trim().takeIf { !it.isNullOrBlank() }
+                            val byUrl = if (targetUrl != null) {
+                                channels.indexOfFirst { it.url?.trim()?.equals(targetUrl, ignoreCase = true) == true }
+                            } else -1
+                            if (byUrl >= 0) byUrl else channels.indexOfFirst {
+                                it.name.equals(currentChannelName, ignoreCase = true)
+                            }
+                        }
+                    }
+                }
+            } else {
+                val targetUrl = currentChannelUrl?.trim().takeIf { !it.isNullOrBlank() }
+                val byUrl = if (targetUrl != null) {
+                    channels.indexOfFirst { it.url?.trim()?.equals(targetUrl, ignoreCase = true) == true }
+                } else -1
+                if (byUrl >= 0) byUrl else channels.indexOfFirst {
+                    it.name.equals(currentChannelName, ignoreCase = true)
+                }
             }
-            if (idx >= 0) idx else 0
         }
 
+        val targetInitialIndex = currentChannelIndex.coerceAtLeast(0)
+
         // Hacer auto-scroll y solicitar foco al canal actual cuando se abra la lista
-        LaunchedEffect(visible) {
+        LaunchedEffect(visible, targetInitialIndex) {
             if (visible && channels.isNotEmpty()) {
                 listState.scrollToItem(targetInitialIndex)
                 kotlinx.coroutines.delay(120L)
@@ -124,7 +165,7 @@ fun PlayerChannelsOverlay(
         ) {
             Column(
                 modifier = Modifier
-                    .fillMaxWidth()
+                    .fillMaxSize()
                     .padding(horizontal = 16.dp, vertical = 14.dp)
             ) {
                 // ─── CABECERA DEL PANEL (CANALES + NOMBRE CATEGORÍA) ───
@@ -198,8 +239,11 @@ fun PlayerChannelsOverlay(
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                     contentPadding = PaddingValues(bottom = 12.dp)
                 ) {
-                    itemsIndexed(channels, key = { index, item -> "${item.name}_${item.url ?: ""}_$index" }) { index, channel ->
-                        val isCurrentPlaying = channel.name.equals(currentChannelName, ignoreCase = true)
+                    itemsIndexed(
+                        items = channels,
+                        key = { index, item -> "${item.dedupIdentityKey()}_${item.group}_$index" }
+                    ) { index, channel ->
+                        val isCurrentPlaying = index == currentChannelIndex
                         var isItemFocused by remember { mutableStateOf(false) }
 
                         val itemBg = if (isItemFocused) {
@@ -227,6 +271,7 @@ fun PlayerChannelsOverlay(
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
+                                .testTag("player_overlay_channel_$index")
                                 .then(
                                     if (requester != null) Modifier.focusRequester(requester) else Modifier
                                 )
@@ -300,6 +345,7 @@ fun PlayerChannelsOverlay(
                                             .size(8.dp)
                                             .clip(CircleShape)
                                             .background(Color(0xFFB07FEE))
+                                            .testTag("player_overlay_active_dot_$index")
                                     )
                                 }
                             }

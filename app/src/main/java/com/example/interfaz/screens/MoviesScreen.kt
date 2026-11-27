@@ -31,6 +31,7 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.TextStyle
 import com.example.parseHexColor
 import com.example.motor.db.IptvItem
+import com.example.motor.repository.IptvRepository
 import com.example.interfaz.AppThemeColors
 import kotlinx.coroutines.launch
 import com.example.interfaz.viewmodel.MoviesViewModel
@@ -118,8 +119,8 @@ fun MoviesScreen(
     val allMovies = precomputedData?.allMovies ?: emptyList()
     val movieMap = precomputedData?.groupToMovies ?: emptyMap()
 
-    val favMovieKeys = remember(favoritesList) {
-        favoritesList.filter { it.type == "movie" }.flatMap { listOfNotNull(it.id, it.url, it.title) }.toSet()
+    val movieFavorites = remember(favoritesList) {
+        favoritesList.filter { IptvRepository.normalizeFavoriteType(it.type) == "movie" }
     }
 
     val hidden = settingsObj.hiddenMovieCategories
@@ -131,8 +132,8 @@ fun MoviesScreen(
         }
     }
 
-    val favoriteMovies = remember(visibleMovies, favMovieKeys) {
-        visibleMovies.filter { it.name in favMovieKeys || (it.url != null && it.url in favMovieKeys) }
+    val favoriteMovies = remember(visibleMovies, movieFavorites) {
+        visibleMovies.filter { IptvRepository.isItemFavorited(it, "movie", movieFavorites) }
     }
 
     val movieFavCount = remember(favoriteMovies) {
@@ -402,22 +403,11 @@ fun MoviesScreen(
                                         }
                                     )
 
-                                    val isFav = item.name in favMovieKeys || (item.url != null && item.url in favMovieKeys)
+                                    val isFav = remember(item, movieFavorites) {
+                                        IptvRepository.isItemFavorited(item, "movie", movieFavorites)
+                                    }
                                     TvIconButton(
-                                        onClick = {
-                                            if (isFav) {
-                                                viewModel.removeFavorite(item.name)
-                                                item.url?.let { viewModel.removeFavorite(it) }
-                                            } else {
-                                                viewModel.addFavorite(
-                                                    id = item.name,
-                                                    title = item.name,
-                                                    type = "movie",
-                                                    url = item.url ?: "",
-                                                    logo = item.logo
-                                                )
-                                            }
-                                        },
+                                        onClick = { viewModel.toggleFavorite(item) },
                                         containerColor = Color.Black.copy(alpha = 0.6f),
                                         shape = CircleShape,
                                         modifier = Modifier
@@ -463,24 +453,13 @@ fun MoviesScreen(
 
     if (selectedMovieItem != null) {
         val movie = selectedMovieItem!!
-            val isFav = favoritesList.any { it.id == movie.name || (movie.url != null && it.url == movie.url) || it.title == movie.name }
+            val isFav = remember(movie, movieFavorites) {
+                IptvRepository.isItemFavorited(movie, "movie", movieFavorites)
+            }
             MovieDetailFullScreen(
                 movie = movie,
                 isFav = isFav,
-                onToggleFavorite = {
-                    if (isFav) {
-                        viewModel.removeFavorite(movie.name)
-                        movie.url?.let { viewModel.removeFavorite(it) }
-                    } else {
-                        viewModel.addFavorite(
-                            id = movie.name,
-                            title = movie.name,
-                            type = "movie",
-                            url = movie.url ?: "",
-                            logo = movie.logo
-                        )
-                    }
-                },
+                onToggleFavorite = { viewModel.toggleFavorite(movie) },
                 onPlay = {
                     scope.launch {
                         isResolving = true

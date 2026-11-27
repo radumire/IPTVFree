@@ -64,7 +64,10 @@ class SeriesViewModel(application: Application) : AndroidViewModel(application) 
             iptvRepo.favoriteItems.collect { favs ->
                 val activeId = sessionRepo.activePlaylist.value?.id
                 val filtered = if (activeId != null) favs.filter { it.playlistId == activeId } else emptyList()
-                val favIds = filtered.filter { it.type == "series" }.flatMap { listOfNotNull(it.id, it.url, it.title) }.toSet()
+                val favIds = filtered.filter { IptvRepository.normalizeFavoriteType(it.type) == "series" }
+                    .flatMap { listOfNotNull(it.id, it.url.takeIf { u -> u.isNotBlank() }, it.seriesId, it.stalkerCmd, it.title.takeIf { t -> t.isNotBlank() }) }
+                    .filter { it.isNotBlank() }
+                    .toSet()
                 _uiState.update { state -> state.copy(favoriteIds = favIds) }
             }
         }
@@ -185,7 +188,7 @@ class SeriesViewModel(application: Application) : AndroidViewModel(application) 
             "m3u_${item.name}"
         }
         val isRemoteApi = pl != null && (pl.type.lowercase() in listOf("xtream", "m3u", "stalker", "mac"))
-        val cached = if (isRemoteApi) iptvRepo.getCachedEpisodes(cacheKey) else null
+        val cached = if (isRemoteApi) iptvRepo.getCachedEpisodesAsync(cacheKey) else null
         if (cached != null) {
             return@withContext cached
         }
@@ -358,13 +361,7 @@ class SeriesViewModel(application: Application) : AndroidViewModel(application) 
     fun toggleFavorite(item: IptvItem) {
         viewModelScope.launch {
             val pl = sessionRepo.activePlaylist.value ?: return@launch
-            val id = item.name
-            if (_uiState.value.favoriteIds.contains(id) || (item.url != null && _uiState.value.favoriteIds.contains(item.url))) {
-                iptvRepo.removeFavorite(id, pl.id)
-                item.url?.let { iptvRepo.removeFavorite(it, pl.id) }
-            } else {
-                iptvRepo.addFavorite(id, item.name, "series", item.url ?: "", item.logo, pl.id)
-            }
+            iptvRepo.toggleFavoriteItem(item, "series", pl.id)
         }
     }
 

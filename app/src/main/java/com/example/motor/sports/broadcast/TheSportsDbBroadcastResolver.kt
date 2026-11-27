@@ -11,6 +11,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
 import java.net.URLEncoder
+import java.text.Normalizer
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
 import java.util.concurrent.ConcurrentHashMap
@@ -93,6 +94,7 @@ class TheSportsDbBroadcastResolver(
         const val TTL_NO_EVENT_MS = 30 * 60 * 1000L        // 30 minutos para eventos no encontrados
         const val TTL_NO_TV_MS = 15 * 60 * 1000L           // 15 minutos para eventos sin TV (pueden añadirse más tarde)
         const val TTL_ERROR_MS = 5 * 60 * 1000L            // 5 minutos ante errores de red o servidor
+        private val DIACRITICS_REGEX = "\\p{InCombiningDiacriticalMarks}+".toRegex()
 
         @Volatile
         private var instance: TheSportsDbBroadcastResolver? = null
@@ -420,10 +422,14 @@ class TheSportsDbBroadcastResolver(
         return channels
     }
 
-    private fun sanitizeTeamNameForQuery(teamName: String): String {
-        return teamName.trim()
+    internal fun sanitizeTeamNameForQuery(teamName: String): String {
+        val nfd = Normalizer.normalize(teamName.trim(), Normalizer.Form.NFD)
+        val ascii = DIACRITICS_REGEX.replace(nfd, "")
+        return ascii
             .replace("\\s+".toRegex(), "_")
             .replace("[^a-zA-Z0-9_]".toRegex(), "")
+            .replace("_+".toRegex(), "_")
+            .trim('_')
     }
 
     private fun buildCacheKey(event: SportsEvent): String {

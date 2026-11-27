@@ -18,6 +18,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.draw.clip
@@ -45,7 +46,6 @@ import com.example.interfaz.components.TvIconButton
 import com.example.interfaz.components.TV_FOCUSED_BG
 import com.example.interfaz.components.TV_FOCUSED_TEXT
 import com.example.interfaz.components.TV_FOCUSED_BORDER
-import com.example.interfaz.components.rememberTvInitialFocusRequester
 import com.example.interfaz.components.TvQrScannerDialog
 import com.example.interfaz.ParentalPinSettingsCard
 import android.Manifest
@@ -69,18 +69,26 @@ fun SettingsScreen(
     val lang = settingsObj.lang
 
     var activeCategory by remember { mutableStateOf("general") }
-    val initialFocusRequester = rememberTvInitialFocusRequester()
+    val activeCategoryFocusRequester = remember { FocusRequester() }
     
     var activeManageCategoriesType by remember { mutableStateOf<String?>(null) } // "tv", "movies", "series"
+    var showInterfaceSelector by remember { mutableStateOf(false) }
     var showSyncDialog by remember { mutableStateOf(false) }
 
-    // Capture back button to return to Home when not managing categories
-    androidx.activity.compose.BackHandler(enabled = activeManageCategoriesType == null) {
+    // Capture back button to return to Home when not in full-screen subpages
+    androidx.activity.compose.BackHandler(enabled = activeManageCategoriesType == null && !showInterfaceSelector) {
         onBack()
     }
 
-    LaunchedEffect(activeManageCategoriesType) {
-        onFullScreenChange(activeManageCategoriesType != null)
+    LaunchedEffect(activeManageCategoriesType, showInterfaceSelector) {
+        val isOverlayOpen = activeManageCategoriesType != null || showInterfaceSelector
+        onFullScreenChange(isOverlayOpen)
+        if (!isOverlayOpen) {
+            delay(120L)
+            try {
+                activeCategoryFocusRequester.requestFocus()
+            } catch (_: Exception) {}
+        }
     }
 
     DisposableEffect(Unit) {
@@ -105,6 +113,20 @@ fun SettingsScreen(
     val seriesCategories = remember(seriesPrecomputed) {
         val groups = seriesPrecomputed?.groups ?: emptyList()
         groups.filter { it != "Todos" && it != "Favoritos" }
+    }
+
+    if (showInterfaceSelector) {
+        InterfaceSelectorFullScreen(
+            selectedLayout = settingsObj.homeLayout,
+            onSelectInterface = { selectedLayout ->
+                viewModel.updateCurrentProfileField(settings = settingsObj.copy(homeLayout = selectedLayout))
+                showInterfaceSelector = false
+            },
+            onBack = { showInterfaceSelector = false },
+            theme = theme,
+            lang = lang
+        )
+        return
     }
 
     if (activeManageCategoriesType != null) {
@@ -186,6 +208,7 @@ fun SettingsScreen(
             
             val categories = listOf(
                 Triple("general", Translator.translate("general", lang), Icons.Default.Tune),
+                Triple("interface", Translator.translate("home_interface", lang), Icons.Default.Dashboard),
                 Triple("categories", Translator.translate("categories", lang), Icons.Default.Category),
                 Triple("themes", Translator.translate("themes", lang), Icons.Default.ColorLens),
                 Triple("subtitles", Translator.translate("subtitles", lang), Icons.Default.Subtitles),
@@ -207,6 +230,7 @@ fun SettingsScreen(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .testTag("settings_category_$catId")
                         .tvCardFocusable(
                             shape = RoundedCornerShape(8.dp),
                             scaleFocused = 1.03f,
@@ -215,12 +239,14 @@ fun SettingsScreen(
                             focusedBackgroundColor = parseHexColor(theme.accent).copy(alpha = 0.35f),
                             unfocusedBorderColor = if (isSelected) parseHexColor(theme.accentLight).copy(alpha = 0.8f) else Color.White.copy(alpha = 0.12f),
                             focusedBorderColor = parseHexColor(theme.accent),
-                            focusRequester = if (index == 0) initialFocusRequester else null,
+                            focusRequester = if (isSelected) activeCategoryFocusRequester else null,
                             onFocusChange = { isCatFocused = it },
                             onClick = {
                                 activeCategory = catId
                                 if (catId == "sync") {
                                     showSyncDialog = true
+                                } else if (catId == "interface") {
+                                    showInterfaceSelector = true
                                 }
                             }
                         )
@@ -298,19 +324,25 @@ fun SettingsScreen(
                         onCheckedChange = { viewModel.updateCurrentProfileField(settings = settingsObj.copy(notifications = it)) },
                         theme = theme
                     )
+                }
 
-                    SettingsSelectorRow(
-                        title = Translator.translate("home_interface", lang),
-                        subtitle = Translator.translate("home_interface_desc", lang),
-                        selectedValue = settingsObj.homeLayout,
-                        options = listOf(
-                            "vivo_glass" to Translator.translate("interface_vivo", lang),
-                            "classic_tiles" to Translator.translate("interface_classic", lang),
-                            "modern" to Translator.translate("interface_modern", lang),
-                            "cinema_bar" to Translator.translate("interface_cinema", lang)
-                        ),
-                        onSelected = { viewModel.updateCurrentProfileField(settings = settingsObj.copy(homeLayout = it)) },
-                        theme = theme
+                "interface" -> {
+                    SettingsHeader(
+                        title = Translator.translate("interface_selector_title", lang),
+                        subtitle = Translator.translate("interface_selector_subtitle", lang, HOME_INTERFACE_OPTIONS.size)
+                    )
+
+                    val activeOption = HOME_INTERFACE_OPTIONS.find { it.id == settingsObj.homeLayout } ?: HOME_INTERFACE_OPTIONS.first()
+                    val activeInterfaceName = Translator.translate(activeOption.titleKey, lang)
+                    val activeInterfaceDesc = Translator.translate(activeOption.descKey, lang)
+
+                    SettingsActionRow(
+                        title = activeInterfaceName,
+                        subtitle = activeInterfaceDesc,
+                        buttonText = Translator.translate("change", lang),
+                        onClick = { showInterfaceSelector = true },
+                        theme = theme,
+                        buttonModifier = Modifier.testTag("settings_interface_button")
                     )
                 }
 
@@ -942,7 +974,8 @@ fun SettingsActionRow(
     subtitle: String,
     buttonText: String,
     onClick: () -> Unit,
-    theme: AppThemeColors
+    theme: AppThemeColors,
+    buttonModifier: Modifier = Modifier
 ) {
     Card(
         colors = CardDefaults.cardColors(containerColor = parseHexColor(theme.surface)),
@@ -960,7 +993,7 @@ fun SettingsActionRow(
             }
             TvButton(
                 onClick = onClick,
-                modifier = Modifier.border(
+                modifier = buttonModifier.border(
                     width = 1.dp,
                     color = Color.White.copy(alpha = 0.20f),
                     shape = RoundedCornerShape(8.dp)

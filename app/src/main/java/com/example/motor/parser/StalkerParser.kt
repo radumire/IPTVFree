@@ -17,7 +17,9 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import okhttp3.Request
 import java.util.ArrayList
@@ -50,29 +52,42 @@ object StalkerParser {
         val short: String
     )
 
+    private fun sha256HexUpper(input: String): String {
+        return try {
+            val digest = java.security.MessageDigest.getInstance("SHA-256")
+            digest.digest(input.toByteArray(Charsets.UTF_8))
+                .joinToString("") { "%02X".format(it) }
+        } catch (_: Exception) {
+            input.hashCode().toUInt().toString(16).uppercase().padStart(64, '0')
+        }
+    }
+
+    internal fun resolveSerialNumber(mac: String, customSerial: String = ""): String {
+        val cleanedCustom = customSerial.replace(":", "").replace("-", "").trim().uppercase()
+        if (cleanedCustom.isNotEmpty()) {
+            return cleanedCustom
+        }
+        val macHex = mac.replace(":", "").replace("-", "").trim().uppercase()
+        val suffix = if (macHex.length >= 6) macHex.takeLast(6) else macHex.padStart(6, '0')
+        return "001A79$suffix"
+    }
+
     fun generateDeviceId(mac: String, serialNumber: String, model: String): DeviceIdResult {
-        val macClean = mac.replace(":", "").uppercase()
-        val serialClean = serialNumber.replace(":", "")
+        val macClean = mac.replace(":", "").replace("-", "").trim().uppercase()
+        val serialClean = resolveSerialNumber(mac, serialNumber)
         val serialCleanLast10 = if (serialClean.length >= 10) {
-            serialClean.substring(serialClean.length - 10)
+            serialClean.takeLast(10)
         } else {
             serialClean
         }
-        // Timestamp realista basado en época reciente para compatibilidad con middlewares estrictos
-        val epochSeconds = (System.currentTimeMillis() / 1000L).toString()
-        val deviceId = "$macClean:$serialCleanLast10:$model:$epochSeconds"
+        // Determinístico por dispositivo/MAC durante toda la sesión (sin marcas de tiempo cambiantes)
+        val deviceId = sha256HexUpper("$macClean|$serialClean|$model")
         return DeviceIdResult(deviceId, macClean, serialCleanLast10)
     }
 
     fun generateDeviceId2(deviceId: String, mac: String): String {
-        val macClean = mac.replace(":", "").uppercase()
-        var hash = 0
-        for (i in 0 until deviceId.length) {
-            val charCode = deviceId[i].code
-            hash = ((hash shl 5) - hash) + charCode
-        }
-        val uHash = java.lang.Long.toUnsignedString(hash.toLong() and 0xFFFFFFFFL, 36).uppercase()
-        return "${macClean}_$uHash"
+        val macClean = mac.replace(":", "").replace("-", "").trim().uppercase()
+        return sha256HexUpper("$deviceId|$macClean|v2")
     }
 
     fun generateSignature(
@@ -85,10 +100,11 @@ object StalkerParser {
         imageVersion: String,
         vendor: String
     ): String {
-        val macClean = mac.replace(":", "").uppercase()
+        val macClean = mac.replace(":", "").replace("-", "").trim().uppercase()
+        val serialClean = resolveSerialNumber(mac, serialNumber)
         val baseString = listOf(
             macClean,
-            serialNumber,
+            serialClean,
             model,
             hwVersion,
             swVersion,
@@ -96,39 +112,12 @@ object StalkerParser {
             imageVersion,
             vendor
         ).joinToString("|")
-
-        var hash1 = 0
-        var hash2 = 0
-
-        for (i in 0 until baseString.length) {
-            val char = baseString[i].code
-            hash1 = ((hash1 shl 5) - hash1) + char
-            if (i % 2 == 0) {
-                hash2 = ((hash2 shl 3) - hash2) + char
-            }
-        }
-
-        val absHash1 = kotlin.math.abs(hash1.toLong())
-        val absHash2 = kotlin.math.abs(hash2.toLong())
-
-        val signature1 = absHash1.toString(16).uppercase()
-        val signature2 = absHash2.toString(16).uppercase()
-
-        return signature1.padStart(8, '0') + signature2.padStart(8, '0')
+        return sha256HexUpper(baseString)
     }
 
     fun generateApiSignature(token: String, random: String, mac: String): String {
-        val macClean = mac.replace(":", "").uppercase()
-        val baseString = "$token|$random|$macClean"
-
-        var hash = 0
-        for (i in 0 until baseString.length) {
-            val char = baseString[i].code
-            hash = ((hash shl 5) - hash) + char
-        }
-
-        val absHash = kotlin.math.abs(hash.toLong())
-        return absHash.toString(16).uppercase()
+        val macClean = mac.replace(":", "").replace("-", "").trim().uppercase()
+        return sha256HexUpper("$token|$random|$macClean")
     }
 
     internal fun URLParamEncode(s: String): String {
@@ -328,17 +317,248 @@ object StalkerParser {
         return res
     }
 
+    private val reservedStalkerCookieNames = setOf("mac", "stb_lang", "timezone", "token")
+    private val portalSessionCookies = ConcurrentHashMap<String, ConcurrentHashMap<String, String>>()
+
+    internal fun clearPortalCookiesForTests() {
+        portalSessionCookies.clear()
+    }
+
+    internal fun sanitizeSchemeAndPort(rawUrl: String): String {
+        var url = rawUrl.trim()
+        if (url.isEmpty()) return ""
+        if (!url.startsWith("http://", ignoreCase = true) && !url.startsWith("https://", ignoreCase = true)) {
+            url = "http://$url"
+        }
+        if (url.startsWith("https://", ignoreCase = true) && Regex("(?i)^https://[^/:?#]+:80(?:/|$|\\?)").containsMatchIn(url)) {
+            url = "http" + url.substring(5)
+        }
+        return try {
+            val encodedForUri = url.replace(" ", "%20")
+            val uri = java.net.URI(encodedForUri)
+            val scheme = (uri.scheme ?: "http").lowercase()
+            val host = uri.host
+            if (!host.isNullOrBlank()) {
+                val rawPort = uri.port
+                val portStr = when {
+                    rawPort == -1 -> ""
+                    scheme == "http" && rawPort == 80 -> ""
+                    scheme == "https" && rawPort == 443 -> ""
+                    else -> ":$rawPort"
+                }
+                val path = uri.rawPath ?: ""
+                val query = uri.rawQuery?.takeIf { it.isNotBlank() }?.let { "?$it" } ?: ""
+                "$scheme://$host$portStr$path$query"
+            } else {
+                url
+            }
+        } catch (_: Exception) {
+            url
+        }
+    }
+
+    internal fun extractPortalOrigin(portalUrl: String): String {
+        val cleaned = sanitizeSchemeAndPort(portalUrl)
+        return try {
+            val uri = java.net.URI(cleaned.replace(" ", "%20"))
+            val scheme = (uri.scheme ?: "http").lowercase()
+            val host = uri.host
+            if (!host.isNullOrBlank()) {
+                val portStr = when {
+                    uri.port == -1 -> ""
+                    scheme == "http" && uri.port == 80 -> ""
+                    scheme == "https" && uri.port == 443 -> ""
+                    else -> ":${uri.port}"
+                }
+                "$scheme://$host$portStr"
+            } else {
+                cleaned.substringBefore("/c/").substringBefore("/portal").substringBefore("/server").removeSuffix("/")
+            }
+        } catch (_: Exception) {
+            cleaned.substringBefore("/c/").substringBefore("/portal").substringBefore("/server").removeSuffix("/")
+        }
+    }
+
+    internal fun derivePortalReferer(portalUrl: String): String {
+        val cleaned = sanitizeSchemeAndPort(portalUrl)
+        val origin = extractPortalOrigin(cleaned)
+        if (origin.isBlank()) return ""
+        return try {
+            val uri = java.net.URI(cleaned.replace(" ", "%20"))
+            val rawPath = uri.rawPath ?: ""
+            val baseSubPath = when {
+                rawPath.contains("/stalker_portal/", ignoreCase = true) ||
+                    rawPath.equals("/stalker_portal", ignoreCase = true) -> "/stalker_portal"
+                rawPath.contains("/ministra/", ignoreCase = true) ||
+                    rawPath.equals("/ministra", ignoreCase = true) -> "/ministra"
+                else -> {
+                    val stripped = rawPath
+                        .replace(Regex("(?i)/server/load\\.php$"), "")
+                        .replace(Regex("(?i)/c/portal\\.php$"), "")
+                        .replace(Regex("(?i)/portal\\.php$"), "")
+                        .replace(Regex("(?i)/c(?:/index\\.html)?/?$"), "")
+                        .removeSuffix("/")
+                    if (stripped.isNotBlank() && stripped != "/") stripped else ""
+                }
+            }
+            "$origin$baseSubPath/c/"
+        } catch (_: Exception) {
+            "$origin/c/"
+        }
+    }
+
+    internal fun buildStalkerPortalCandidates(rawHost: String, savedPortalUrl: String? = null): List<String> {
+        val candidates = LinkedHashSet<String>()
+        if (!savedPortalUrl.isNullOrBlank()) {
+            val normSaved = sanitizeSchemeAndPort(savedPortalUrl).removeSuffix("/")
+            if (normSaved.isNotEmpty()) candidates.add(normSaved)
+        }
+
+        val cleanedInput = sanitizeSchemeAndPort(rawHost)
+        if (cleanedInput.isBlank()) return candidates.toList()
+
+        val uri = try { java.net.URI(cleanedInput.replace(" ", "%20")) } catch (_: Exception) { null }
+        val origin = extractPortalOrigin(cleanedInput).removeSuffix("/")
+        val rawPath = (uri?.rawPath ?: "").trim()
+        val rawQuery = uri?.rawQuery?.takeIf { it.isNotBlank() }?.let { "?$it" } ?: ""
+        val lowerPath = rawPath.lowercase()
+
+        val hasExplicitPhp = lowerPath.contains(".php") || rawQuery.isNotEmpty()
+        if (hasExplicitPhp || lowerPath.endsWith("/portal")) {
+            val explicitUrl = "$origin${rawPath.removeSuffix("/")}$rawQuery"
+            if (explicitUrl.isNotBlank()) candidates.add(explicitUrl)
+        }
+
+        val baseSubPath = rawPath
+            .replace(Regex("(?i)/server/load\\.php$"), "")
+            .replace(Regex("(?i)/c/portal\\.php$"), "")
+            .replace(Regex("(?i)/portal\\.php$"), "")
+            .replace(Regex("(?i)/c(?:/index\\.html)?/?$"), "")
+            .replace(Regex("(?i)/index\\.html$"), "")
+            .removeSuffix("/")
+
+        if (lowerPath.contains("/stalker_portal")) {
+            candidates.add("$origin/stalker_portal/server/load.php")
+            candidates.add("$origin/stalker_portal/c/portal.php")
+        } else if (lowerPath.contains("/ministra")) {
+            candidates.add("$origin/ministra/server/load.php")
+            candidates.add("$origin/stalker_portal/server/load.php")
+        } else if (baseSubPath.isNotEmpty() && baseSubPath != "/" && !baseSubPath.contains(".php")) {
+            candidates.add("$origin$baseSubPath/portal.php")
+            candidates.add("$origin$baseSubPath/server/load.php")
+        }
+
+        val standardEndpoints = listOf(
+            "$origin/portal.php",
+            "$origin/stalker_portal/server/load.php",
+            "$origin/server/load.php",
+            "$origin/c/portal.php"
+        )
+        candidates.addAll(standardEndpoints)
+        return candidates.toList()
+    }
+
+    private fun portalCookieBucketKey(portalUrl: String, macClean: String): String {
+        return "${extractPortalOrigin(portalUrl)}|$macClean"
+    }
+
+    internal fun getPortalCookiesSnapshot(portalUrl: String, mac: String): Map<String, String> {
+        val macClean = mac.trim().uppercase()
+        val bucket = portalSessionCookies[portalCookieBucketKey(portalUrl, macClean)] ?: return emptyMap()
+        return HashMap(bucket)
+    }
+
+    private fun captureSetCookies(portalUrl: String, macClean: String, setCookieHeaders: List<String>) {
+        if (setCookieHeaders.isEmpty()) return
+        val bucketKey = portalCookieBucketKey(portalUrl, macClean)
+        val bucket = portalSessionCookies.getOrPut(bucketKey) { ConcurrentHashMap() }
+        for (rawHeader in setCookieHeaders) {
+            val pairPart = rawHeader.substringBefore(";").trim()
+            val eqIdx = pairPart.indexOf('=')
+            if (eqIdx <= 0) continue
+            val name = pairPart.substring(0, eqIdx).trim()
+            val value = pairPart.substring(eqIdx + 1).trim()
+            val nameLower = name.lowercase()
+            if (nameLower in reservedStalkerCookieNames) continue
+            if (value.isEmpty() || value.equals("deleted", ignoreCase = true) || value.equals("null", ignoreCase = true)) {
+                bucket.remove(name)
+            } else {
+                bucket[name] = value
+            }
+        }
+    }
+
+    private fun buildCookieHeaderValue(portalUrl: String, macClean: String, token: String): String {
+        val sb = StringBuilder()
+        sb.append("mac=").append(macClean).append("; stb_lang=en; timezone=Europe/Madrid;")
+        if (token.isNotEmpty()) {
+            sb.append(" token=").append(token).append(";")
+        }
+        val extra = portalSessionCookies[portalCookieBucketKey(portalUrl, macClean)]
+        if (!extra.isNullOrEmpty()) {
+            extra.forEach { (k, v) ->
+                if (k.lowercase() !in reservedStalkerCookieNames && v.isNotBlank()) {
+                    sb.append(" ").append(k).append("=").append(v).append(";")
+                }
+            }
+        }
+        return sb.toString()
+    }
+
+    private fun warmUpPortalRefererCookies(refererUrl: String, macClean: String, device: StalkerDevice) {
+        if (refererUrl.isBlank()) return
+        try {
+            val reqBuilder = Request.Builder()
+                .url(refererUrl)
+                .header("User-Agent", device.userAgent)
+                .header("X-User-Agent", device.xUserAgent)
+                .header("Cookie", buildCookieHeaderValue(refererUrl, macClean, ""))
+                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            BaseEngine.client.newCall(reqBuilder.build()).execute().use { resp ->
+                captureSetCookies(refererUrl, macClean, resp.headers("Set-Cookie"))
+                resp.body?.close()
+            }
+        } catch (e: Exception) {
+            Log.d(TAG, "Warm-up GET $refererUrl failed (non-fatal): ${e.message}")
+        }
+    }
+
+    private fun classifyStalkerException(e: Exception): NetworkError {
+        if (e is NetworkError) return e
+        val msg = e.message?.lowercase() ?: ""
+        return when {
+            e is java.net.SocketTimeoutException || msg.contains("timeout") || msg.contains("timed out") ->
+                NetworkError.Timeout("Tiempo de espera agotado al conectar con el portal Stalker")
+            e is java.net.UnknownHostException || msg.contains("unable to resolve host") || msg.contains("unknownhost") || msg.contains("dns") ->
+                NetworkError.Dns("No se pudo resolver la dirección del portal Stalker")
+            e is javax.net.ssl.SSLException || msg.contains("tls") || msg.contains("ssl") || msg.contains("certificate") ->
+                NetworkError.TlsError("Error de certificado TLS/SSL al conectar con el portal")
+            e is java.net.ConnectException || msg.contains("econnrefused") || msg.contains("connection refused") || msg.contains("failed to connect") ->
+                NetworkError.ServerDown("El servidor rechazó la conexión o no está disponible")
+            else -> BaseEngine.classifyException(e)
+        }
+    }
+
+    private fun errorPriority(err: NetworkError): Int = when (err) {
+        is NetworkError.PortalBlockedMac -> 100
+        is NetworkError.Auth -> 90
+        is NetworkError.RateLimit -> 85
+        is NetworkError.TlsError -> 80
+        is NetworkError.Timeout -> 70
+        is NetworkError.ServerError -> 60
+        is NetworkError.ServerDown -> 50
+        is NetworkError.InvalidHandshake -> 40
+        is NetworkError.InvalidProfile -> 35
+        is NetworkError.NotFound -> 20
+        else -> 10
+    }
+
     private fun stalkerRequestWithResponse(portalUrl: String, mac: String, params: String, token: String?, device: StalkerDevice): StalkerHttpResponse {
         val macClean = mac.trim().uppercase()
         val finalToken = token ?: ""
         val tokenParam = if (finalToken.isNotEmpty()) "&token=${URLParamEncode(finalToken)}" else ""
 
-        val snVal = if (device.serialNumber.isNotBlank()) {
-            device.serialNumber
-        } else {
-            val suffix = if (macClean.length >= 6) macClean.substring(macClean.length - 6) else "123456"
-            "001A79$suffix"
-        }
+        val snVal = resolveSerialNumber(macClean, device.serialNumber)
 
         val deviceIdResult = generateDeviceId(macClean, snVal, device.hwVersion)
         val deviceId = deviceIdResult.primary
@@ -369,29 +589,25 @@ object StalkerParser {
         }
 
         val combinedParams = "$finalParams$tokenParam&JsHttpRequest=1-xml"
-        
-        var currentUrl = portalUrl
-        if (currentUrl.startsWith("https://", ignoreCase = true) && currentUrl.contains(":80")) {
-            currentUrl = "http" + currentUrl.substring(5)
-        }
 
+        val currentUrl = sanitizeSchemeAndPort(portalUrl)
         val url = if (currentUrl.contains("?")) {
             "$currentUrl&$combinedParams"
         } else {
             "$currentUrl?$combinedParams"
         }
 
-        val cookieHeaderVal = if (finalToken.isNotEmpty()) {
-            "mac=$macClean; stb_lang=en; timezone=Europe/Madrid; token=$finalToken;"
-        } else {
-            "mac=$macClean; stb_lang=en; timezone=Europe/Madrid;"
+        val cookieHeaderVal = buildCookieHeaderValue(currentUrl, macClean, finalToken)
+        val refererVal = derivePortalReferer(currentUrl)
+        val headers = LinkedHashMap<String, String>().apply {
+            put("User-Agent", device.userAgent)
+            put("Cookie", cookieHeaderVal)
+            put("X-User-Agent", device.xUserAgent)
+            put("Accept", "*/*")
+            if (refererVal.isNotBlank()) {
+                put("Referer", refererVal)
+            }
         }
-        val headers = mapOf(
-            "User-Agent" to device.userAgent,
-            "Cookie" to cookieHeaderVal,
-            "X-User-Agent" to device.xUserAgent,
-            "Accept" to "*/*"
-        )
         try {
             val reqBuilder = Request.Builder().url(url)
             headers.forEach { (k, v) ->
@@ -404,6 +620,7 @@ object StalkerParser {
             }
 
             BaseEngine.client.newCall(reqBuilder.build()).execute().use { response ->
+                captureSetCookies(currentUrl, macClean, response.headers("Set-Cookie"))
                 val bodyStr = try {
                     response.body?.string() ?: ""
                 } catch (oom: OutOfMemoryError) {
@@ -440,8 +657,27 @@ object StalkerParser {
 
     private fun stalkerRequest(portalUrl: String, mac: String, params: String, token: String?, device: StalkerDevice): String {
         val resp = stalkerRequestWithResponse(portalUrl, mac, params, token, device)
+        val body = resp.body
+        if (resp.code == 401) {
+            throw NetworkError.TokenExpired("Token de sesión Stalker expirado (HTTP 401)")
+        }
+        if (resp.code == 403) {
+            val parsed = parseStalkerJsResponse(body.trim())
+            val js = parsed["js"] as? Map<*, *>
+            val blockMsg = (js?.get("block_msg") ?: parsed["block_msg"])?.toString()?.trim()
+            if (!blockMsg.isNullOrEmpty() && !blockMsg.equals("false", ignoreCase = true) && !blockMsg.equals("null", ignoreCase = true)) {
+                throw NetworkError.PortalBlockedMac("MAC bloqueada por el portal: $blockMsg")
+            }
+            throw NetworkError.Auth("Acceso denegado por el portal Stalker (HTTP 403)")
+        }
+        if (resp.code == 404 || resp.code == 410) {
+            throw NetworkError.NotFound("Endpoint o acción no disponible en el portal (HTTP ${resp.code})")
+        }
+        if (resp.code == 429) {
+            throw NetworkError.RateLimit("Límite de peticiones alcanzado en el portal (HTTP 429)")
+        }
         if (resp.code in 200..299) {
-            return resp.body
+            return body
         }
         throw NetworkError.ServerError(resp.code, "El portal Stalker devolvió un error (HTTP ${resp.code})")
     }
@@ -465,18 +701,16 @@ object StalkerParser {
 
     private fun extractListFromJsField(parsed: Map<String, Any?>): List<Any> {
         val jsObj = parsed["js"]
-        
-        // If jsObj is not null, try to extract list from it
-        if (jsObj != null) {
-            val list = extractListFromField(jsObj)
-            if (list.isNotEmpty()) return list
+
+        // If jsObj is present (object or array), extract strictly from it so an empty {"js":{"data":[]}}
+        // pagination envelope is never mistaken for a 1-item map containing "js".
+        if (jsObj != null && jsObj !is Boolean) {
+            return extractListFromField(jsObj)
         }
-        
-        // If jsObj is null or returned empty list, try to extract list from the root parsed map
-        val rootList = extractListFromField(parsed)
-        if (rootList.isNotEmpty()) return rootList
-        
-        return emptyList()
+
+        // Only if jsObj is null/boolean, try to extract list from the root parsed map (excluding "js")
+        val rootWithoutJs = if (parsed.containsKey("js")) parsed - "js" else parsed
+        return extractListFromField(rootWithoutJs)
     }
 
     private fun extractListFromField(obj: Any?): List<Any> {
@@ -534,12 +768,116 @@ object StalkerParser {
     }
 
     private fun stalkerRequestAndParse(portalUrl: String, mac: String, params: String, token: String?, device: StalkerDevice): Map<String, Any?> {
-        return try {
-            val json = stalkerRequest(portalUrl, mac, params, token, device)
-            parseStalkerJsResponse(json)
+        val json = try {
+            stalkerRequest(portalUrl, mac, params, token, device)
+        } catch (netErr: NetworkError) {
+            throw netErr
         } catch (e: Exception) {
-            Log.w(TAG, "stalkerRequestAndParse error for $params: ${e.message}")
-            emptyMap()
+            throw classifyStalkerException(e)
+        }
+
+        val trimmed = json.trim()
+        if (trimmed.isEmpty()) return emptyMap()
+
+        if (trimmed.startsWith("<html", ignoreCase = true) || trimmed.startsWith("<!doctype", ignoreCase = true)) {
+            throw NetworkError.InvalidStalkerResponse("El portal devolvió HTML en lugar de JSON")
+        }
+
+        val parsed = parseStalkerJsResponse(trimmed)
+        if (parsed.isEmpty()) {
+            val lower = trimmed.lowercase()
+            if (lower.contains("authorization failed") || lower.contains("token expired") || lower.contains("unauthorized") || lower.contains("access denied")) {
+                throw NetworkError.TokenExpired("Sesión Stalker expirada o no autorizada")
+            }
+            throw NetworkError.InvalidStalkerResponse("Respuesta JSON no válida del portal Stalker")
+        }
+
+        val jsVal = parsed["js"]
+        val jsMap = jsVal as? Map<*, *>
+        val blockMsg = (jsMap?.get("block_msg") ?: parsed["block_msg"])?.toString()?.trim()
+        if (!blockMsg.isNullOrEmpty() && !blockMsg.equals("false", ignoreCase = true) && !blockMsg.equals("null", ignoreCase = true)) {
+            throw NetworkError.PortalBlockedMac("MAC bloqueada por el portal: $blockMsg")
+        }
+
+        if (jsVal == null || jsVal is Boolean || jsVal is String) {
+            val errStr = (jsVal as? String ?: parsed["error"]?.toString() ?: parsed["message"]?.toString() ?: trimmed).lowercase()
+            if (errStr.contains("authorization failed") || errStr.contains("token expired") || errStr.contains("unauthorized") || errStr.contains("access denied")) {
+                throw NetworkError.TokenExpired("Sesión Stalker expirada o no autorizada")
+            }
+        }
+
+        return parsed
+    }
+
+    private class StalkerCatalogSession(
+        val host: String,
+        val mac: String,
+        initialSession: Map<String, Any>
+    ) {
+        @Volatile var portalUrl: String = initialSession["portalUrl"] as String
+        @Volatile var token: String = initialSession["token"] as String
+        @Volatile var device: StalkerDevice = (initialSession["device"] as? StalkerDevice) ?: StalkerDevice()
+        private val playlistId: Long? = (initialSession["playlistId"] as? Number)?.toLong()
+        private val refreshMutex = Mutex()
+
+        suspend fun requestParsed(
+            params: String,
+            maxRetries: Int = MAX_RETRIES_PER_PAGE
+        ): Map<String, Any?> {
+            var attempt = 0
+            var tokenRefreshAttempted = false
+            while (true) {
+                currentCoroutineContext().ensureActive()
+                attempt++
+                try {
+                    return stalkerRequestAndParse(portalUrl, mac, params, token, device)
+                } catch (blocked: NetworkError.PortalBlockedMac) {
+                    throw blocked
+                } catch (expired: NetworkError.TokenExpired) {
+                    if (!tokenRefreshAttempted) {
+                        tokenRefreshAttempted = true
+                        refreshSession(failedToken = token)
+                        attempt = 0
+                        continue
+                    }
+                    throw expired
+                } catch (authEx: NetworkError.Auth) {
+                    if (!tokenRefreshAttempted) {
+                        tokenRefreshAttempted = true
+                        refreshSession(failedToken = token)
+                        attempt = 0
+                        continue
+                    }
+                    throw authEx
+                } catch (notFound: NetworkError.NotFound) {
+                    // 404/410 indica acción o parámetro no soportado por este endpoint: fallar rápido al fallback
+                    throw notFound
+                } catch (e: Exception) {
+                    if (e is kotlinx.coroutines.CancellationException || e.cause is kotlinx.coroutines.CancellationException) {
+                        throw e
+                    }
+                    if (attempt > maxRetries) {
+                        throw e
+                    }
+                    val backoffMs = if (e is NetworkError.RateLimit) 450L * attempt else 150L * attempt
+                    delay(backoffMs)
+                }
+            }
+        }
+
+        private suspend fun refreshSession(failedToken: String) {
+            refreshMutex.withLock {
+                if (token != failedToken && token.isNotBlank()) {
+                    return
+                }
+                val newSession = performStalkerHandshake(host, mac, device, playlistId)
+                portalUrl = newSession["portalUrl"] as String
+                token = newSession["token"] as String
+                (newSession["device"] as? StalkerDevice)?.let { device = it }
+                if (playlistId != null) {
+                    PortalSessionRepository.getInstanceOrNull()?.setStalkerSession(playlistId.toString(), newSession)
+                }
+            }
         }
     }
 
@@ -554,7 +892,10 @@ object StalkerParser {
 
         val repo = PortalSessionRepository.getInstanceOrNull()
         val plKey = playlistId?.toString() ?: host
-        val savedCompatState = if (playlistId != null) repo?.getStalkerCompatState(playlistId.toString()) else null
+        val savedCompatState = if (playlistId != null) {
+            repo?.getStalkerCompatState(playlistId.toString())
+                ?.takeIf { it.host.trim().equals(host.trim(), ignoreCase = true) }
+        } else null
 
         // Modelos candidatos ordenados por prioridad:
         // 1. Si existe estado previo aprendido para este portal, probar ese primero.
@@ -594,40 +935,28 @@ object StalkerParser {
             }
         }
 
-        // Normalización y preparación de endpoints candidatos
-        var baseHost = host.trim()
-        if (baseHost.startsWith("https://", ignoreCase = true) && baseHost.contains(":80")) {
-            baseHost = "http" + baseHost.substring(5)
-        }
-        if (!baseHost.startsWith("http://", ignoreCase = true) && !baseHost.startsWith("https://", ignoreCase = true)) {
-            baseHost = "http://$baseHost"
-        }
-        baseHost = baseHost.removeSuffix("/")
-
-        val candidates = mutableListOf<String>()
-        if (savedCompatState != null && savedCompatState.resolvedPortalUrl.isNotBlank()) {
-            candidates.add(savedCompatState.resolvedPortalUrl)
-        }
-        if (baseHost.contains(".php") || baseHost.contains("/c/") || baseHost.endsWith("/portal") || baseHost.contains("?")) {
-            if (!candidates.contains(baseHost)) candidates.add(baseHost)
-        }
-        val standardEndpoints = listOf(
-            "$baseHost/portal.php",
-            "$baseHost/stalker_portal/server/load.php",
-            "$baseHost/server/load.php",
-            "$baseHost/c/portal.php"
-        )
-        for (ep in standardEndpoints) {
-            if (!candidates.contains(ep)) candidates.add(ep)
-        }
+        // Normalización URI y construcción inteligente de endpoints candidatos
+        val candidates = buildStalkerPortalCandidates(host, savedCompatState?.resolvedPortalUrl)
 
         var portalUrl: String? = null
         var token: String? = null
         var apiSignature = ""
+        var apiRandom = ""
         var activeDeviceModel = candidateModels.first()
         var activeDevice = device
         var activeProfileVariant = candidateProfiles.first()
-        var lastError: Exception? = null
+        var bestError: NetworkError? = null
+
+        fun recordError(err: NetworkError) {
+            val current = bestError
+            if (current == null || errorPriority(err) > errorPriority(current)) {
+                bestError = err
+            }
+        }
+
+        val deadEndpoints = HashSet<String>()
+        val jsonResponsiveEndpoints = LinkedHashSet<String>()
+        val warmedUpReferers = HashSet<String>()
 
         // FASE 1: HANDSHAKE DISCOVERY & NEGOCIACIÓN
         outerLoop@ for (modelCand in candidateModels) {
@@ -643,12 +972,7 @@ object StalkerParser {
                 modelCand.toStalkerDevice()
             }
 
-            val snVal = if (testDevice.serialNumber.isNotBlank()) {
-                testDevice.serialNumber
-            } else {
-                val suffix = if (macClean.length >= 6) macClean.substring(macClean.length - 6) else "123456"
-                "001A79$suffix"
-            }
+            val snVal = resolveSerialNumber(macClean, testDevice.serialNumber)
 
             val deviceIdResult = generateDeviceId(macClean, snVal, testDevice.hwVersion)
             val deviceId = deviceIdResult.primary
@@ -664,77 +988,169 @@ object StalkerParser {
                 vendor = testDevice.vendor
             )
 
-            for (cand in candidates) {
-                try {
-                    var currentCand = cand
-                    if (currentCand.startsWith("https://", ignoreCase = true) && currentCand.contains(":80")) {
-                        currentCand = "http" + currentCand.substring(5)
-                    }
+            // Priorizar endpoints que ya respondieron JSON válido y descartar los 404/410 definitivos
+            val modelCandidates = LinkedHashSet<String>().apply {
+                jsonResponsiveEndpoints.filterTo(this) { it !in deadEndpoints }
+                candidates.filterTo(this) { it !in deadEndpoints }
+            }
+            if (modelCandidates.isEmpty()) break
 
-                    val handshakeParamsCommon = "&device_id=${URLParamEncode(deviceId)}" +
-                            "&device_id2=${URLParamEncode(deviceId2)}" +
-                            "&signature=${URLParamEncode(signature)}" +
-                            "&hw_version=${URLParamEncode(testDevice.hwVersion)}" +
-                            "&hw_version_2=${URLParamEncode(testDevice.hwVersion2)}" +
-                            "&stb_type=${URLParamEncode(testDevice.hwVersion)}" +
-                            "&vendor=${URLParamEncode(testDevice.vendor)}" +
-                            "&image_version=${URLParamEncode(testDevice.imageVersion)}" +
-                            "&sn=${URLParamEncode(snVal)}"
+            var timeoutsInModel = 0
 
-                    val handshakes = listOf(
-                        "type=stb&action=handshake&token=&prehash=0$handshakeParamsCommon",
-                        "type=stb&action=create_token&token=&prehash=0$handshakeParamsCommon"
-                    )
+            for (cand in modelCandidates) {
+                if (cand in deadEndpoints) continue
+                var currentCand = sanitizeSchemeAndPort(cand)
+                val handshakeParamsCommon = "&device_id=${URLParamEncode(deviceId)}" +
+                        "&device_id2=${URLParamEncode(deviceId2)}" +
+                        "&signature=${URLParamEncode(signature)}" +
+                        "&hw_version=${URLParamEncode(testDevice.hwVersion)}" +
+                        "&hw_version_2=${URLParamEncode(testDevice.hwVersion2)}" +
+                        "&stb_type=${URLParamEncode(testDevice.hwVersion)}" +
+                        "&vendor=${URLParamEncode(testDevice.vendor)}" +
+                        "&image_version=${URLParamEncode(testDevice.imageVersion)}" +
+                        "&sn=${URLParamEncode(snVal)}"
 
-                    for (hParams in handshakes) {
-                        var httpResp: StalkerHttpResponse
-                        try {
-                            httpResp = stalkerRequestWithResponse(currentCand, macClean, hParams, null, testDevice)
+                val handshakes = listOf(
+                    "type=stb&action=handshake&token=&prehash=0$handshakeParamsCommon",
+                    "type=stb&action=create_token&token=&prehash=0$handshakeParamsCommon"
+                )
+
+                var endpointDead404 = false
+                for (hParams in handshakes) {
+                    if (endpointDead404) break
+                    try {
+                        var httpResp = try {
+                            stalkerRequestWithResponse(currentCand, macClean, hParams, null, testDevice)
                         } catch (e: Exception) {
                             val msg = e.message?.lowercase() ?: ""
                             if (currentCand.startsWith("https://", ignoreCase = true) &&
                                 (e is javax.net.ssl.SSLException || msg.contains("tls") || msg.contains("ssl") || msg.contains("certificate") || msg.contains("handshake") || msg.contains("unrecognized ssl message"))) {
                                 val fallbackCand = "http" + currentCand.substring(5)
                                 Log.w(TAG, "TLS/SSL error on stalker handshake for $currentCand, trying $fallbackCand")
-                                httpResp = stalkerRequestWithResponse(fallbackCand, macClean, hParams, null, testDevice)
                                 currentCand = fallbackCand
+                                stalkerRequestWithResponse(fallbackCand, macClean, hParams, null, testDevice)
                             } else {
                                 throw e
                             }
                         }
 
-                        val resp = httpResp.body
-                        val parsed = parseStalkerJsResponse(resp)
+                        var resp = httpResp.body
+                        var parsed = parseStalkerJsResponse(resp)
+
+                        // Si el servidor responde 403/HTML challenge sin cookies de sesión, hacer 1 warm-up GET /c/ y reintentar
+                        val refererUrl = derivePortalReferer(currentCand)
+                        if ((httpResp.code == 403 || (httpResp.code in 200..299 && parsed.isEmpty() && resp.contains("<html", ignoreCase = true))) &&
+                            refererUrl.isNotBlank() && warmedUpReferers.add(refererUrl)) {
+                            warmUpPortalRefererCookies(refererUrl, macClean, testDevice)
+                            httpResp = stalkerRequestWithResponse(currentCand, macClean, hParams, null, testDevice)
+                            resp = httpResp.body
+                            parsed = parseStalkerJsResponse(resp)
+                        }
+
                         val js = parsed["js"] as? Map<*, *>
-                        val t = js?.get("token")?.toString()
+                        val blockMsg = (js?.get("block_msg") ?: parsed["block_msg"])?.toString()?.trim()
+                        if (!blockMsg.isNullOrEmpty() && !blockMsg.equals("false", ignoreCase = true) && !blockMsg.equals("null", ignoreCase = true)) {
+                            throw NetworkError.PortalBlockedMac("MAC bloqueada por el portal: $blockMsg")
+                        }
+
+                        if (httpResp.code == 404 || httpResp.code == 410) {
+                            recordError(NetworkError.NotFound("Endpoint no encontrado (${httpResp.code})"))
+                            deadEndpoints.add(cand)
+                            deadEndpoints.add(currentCand)
+                            endpointDead404 = true
+                            break
+                        }
+
+                        if (httpResp.code == 401 || httpResp.code == 403) {
+                            recordError(NetworkError.Auth("Portal rechazó la autenticación MAC (HTTP ${httpResp.code})"))
+                            continue
+                        }
+                        if (httpResp.code == 429) {
+                            recordError(NetworkError.RateLimit("Demasiadas peticiones al portal (429)"))
+                            continue
+                        }
+                        if (httpResp.code >= 500) {
+                            recordError(NetworkError.ServerError(httpResp.code, "Error interno del portal Stalker (HTTP ${httpResp.code})"))
+                            continue
+                        }
+
+                        if (parsed.isNotEmpty()) {
+                            jsonResponsiveEndpoints.add(currentCand)
+                        } else if (httpResp.code in 200..299) {
+                            recordError(NetworkError.InvalidHandshake("El endpoint respondió sin JSON válido de Stalker"))
+                        }
+
+                        var t = (js?.get("token") ?: parsed["token"])?.toString()?.takeIf { it.isNotBlank() && !it.equals("null", ignoreCase = true) }
+                        var rand = (js?.get("random") ?: parsed["random"])?.toString()?.takeIf { it.isNotBlank() && !it.equals("null", ignoreCase = true) }
+
+                        // Challenge-response / prehash step si el portal devolvió random sin token
+                        if (t.isNullOrEmpty() && !rand.isNullOrEmpty() && hParams.contains("action=handshake")) {
+                            val prehashVal = sha256HexUpper("$rand|$macClean")
+                            val prehashParams = "type=stb&action=handshake&token=&prehash=${URLParamEncode(prehashVal)}$handshakeParamsCommon"
+                            val preResp = stalkerRequestWithResponse(currentCand, macClean, prehashParams, null, testDevice)
+                            val preParsed = parseStalkerJsResponse(preResp.body)
+                            val preJs = preParsed["js"] as? Map<*, *>
+                            val preBlock = (preJs?.get("block_msg") ?: preParsed["block_msg"])?.toString()?.trim()
+                            if (!preBlock.isNullOrEmpty() && !preBlock.equals("false", ignoreCase = true) && !preBlock.equals("null", ignoreCase = true)) {
+                                throw NetworkError.PortalBlockedMac("MAC bloqueada por el portal: $preBlock")
+                            }
+                            t = (preJs?.get("token") ?: preParsed["token"])?.toString()?.takeIf { it.isNotBlank() && !it.equals("null", ignoreCase = true) }
+                            val preRand = (preJs?.get("random") ?: preParsed["random"])?.toString()?.takeIf { it.isNotBlank() && !it.equals("null", ignoreCase = true) }
+                            if (!preRand.isNullOrEmpty()) rand = preRand
+                        }
+
                         if (!t.isNullOrEmpty()) {
                             token = t
                             portalUrl = currentCand
                             activeDeviceModel = modelCand
                             activeDevice = testDevice
-                            val rand = js["random"]?.toString()
                             if (!rand.isNullOrEmpty()) {
+                                apiRandom = rand
                                 apiSignature = generateApiSignature(t, rand, macClean)
                             }
                             break@outerLoop
+                        } else if (parsed.isNotEmpty()) {
+                            if (resp.contains("Authorization failed", ignoreCase = true) ||
+                                resp.contains("Access denied", ignoreCase = true) ||
+                                resp.contains("Unauthorized", ignoreCase = true)) {
+                                recordError(NetworkError.Auth("Acceso denegado por el portal para esta MAC"))
+                            } else {
+                                recordError(NetworkError.InvalidHandshake("El portal no devolvió token de sesión"))
+                            }
+                        }
+                    } catch (blocked: NetworkError.PortalBlockedMac) {
+                        throw blocked
+                    } catch (e: Exception) {
+                        if (e is kotlinx.coroutines.CancellationException || e.cause is kotlinx.coroutines.CancellationException) {
+                            throw e
+                        }
+                        val classified = classifyStalkerException(e)
+                        recordError(classified)
+                        when (classified) {
+                            is NetworkError.Dns,
+                            is NetworkError.ServerDown -> {
+                                // Mismo host/puerto no podrá responder en otros paths ni otros modelos
+                                throw classified
+                            }
+                            is NetworkError.Timeout -> {
+                                timeoutsInModel++
+                                break // pasar al siguiente endpoint o salir si todos timeout
+                            }
+                            else -> {}
                         }
                     }
-                } catch (e: Exception) {
-                    lastError = e
                 }
+            }
+            if (timeoutsInModel >= modelCandidates.size && jsonResponsiveEndpoints.isEmpty()) {
+                break@outerLoop
             }
         }
 
-        val finalPortalUrl = portalUrl ?: throw BaseEngine.classifyException(lastError ?: NetworkError.ServerDown("No se pudo contactar con el portal Stalker"))
+        val finalPortalUrl = portalUrl ?: throw (bestError ?: NetworkError.ServerDown("No se pudo contactar con el portal Stalker"))
         val finalToken = token ?: ""
 
         // FASE 2: GET_PROFILE NEGOCIACIÓN
-        val snVal = if (activeDevice.serialNumber.isNotBlank()) {
-            activeDevice.serialNumber
-        } else {
-            val suffix = if (macClean.length >= 6) macClean.substring(macClean.length - 6) else "123456"
-            "001A79$suffix"
-        }
+        val snVal = resolveSerialNumber(macClean, activeDevice.serialNumber)
         val deviceIdResult = generateDeviceId(macClean, snVal, activeDevice.hwVersion)
         val deviceId = deviceIdResult.primary
         val deviceId2 = generateDeviceId2(deviceId, macClean)
@@ -749,46 +1165,102 @@ object StalkerParser {
             vendor = activeDevice.vendor
         )
         val metrics = "{\"mac\":\"$macClean\",\"model\":\"${activeDevice.hwVersion}\",\"vendor\":\"${activeDevice.vendor}\"}"
-        val apiSigValue = apiSignature.ifEmpty { "262" }
+
+        fun isTruthyFlag(v: Any?): Boolean = when (v) {
+            null -> false
+            is Boolean -> v
+            is Number -> v.toInt() == 1
+            else -> {
+                val s = v.toString().trim()
+                s.equals("true", ignoreCase = true) || cleanNumberString(s) == "1"
+            }
+        }
 
         var profileSuccess = false
         var activeToken = finalToken
+        var profileAuthRejections = 0
 
         for (profVariant in candidateProfiles) {
-            val profileParams = when (profVariant) {
-                StalkerProfileVariant.STANDARD_V1 -> {
-                    "type=stb&action=get_profile&hd=1&ver=ImageDescription%3A%200%20version&num_banks=2" +
-                            "&stb_type=${URLParamEncode(activeDevice.hwVersion)}&image_version=${URLParamEncode(activeDevice.imageVersion)}" +
-                            "&auth_second_step=0&hw_version=${URLParamEncode(activeDevice.hwVersion)}&hw_version_2=${URLParamEncode(activeDevice.hwVersion2)}&not_valid_token=0" +
-                            "&device_id=${URLParamEncode(deviceId)}&device_id2=${URLParamEncode(deviceId2)}&signature=${URLParamEncode(signature)}&sn=${URLParamEncode(snVal)}" +
-                            "&metrics=${URLParamEncode(metrics)}&api_signature=${URLParamEncode(apiSigValue)}"
-                }
-                StalkerProfileVariant.SIMPLIFIED_V2 -> {
-                    "type=stb&action=get_profile&hd=1&num_banks=2" +
-                            "&stb_type=${URLParamEncode(activeDevice.hwVersion)}&image_version=${URLParamEncode(activeDevice.imageVersion)}" +
-                            "&auth_second_step=0&hw_version=${URLParamEncode(activeDevice.hwVersion)}&hw_version_2=${URLParamEncode(activeDevice.hwVersion2)}&not_valid_token=0" +
-                            "&device_id=${URLParamEncode(deviceId)}&device_id2=${URLParamEncode(deviceId2)}&signature=${URLParamEncode(signature)}&sn=${URLParamEncode(snVal)}" +
-                            "&metrics=${URLParamEncode(metrics)}&api_signature=${URLParamEncode(apiSigValue)}"
-                }
-                StalkerProfileVariant.MINISTRA_MODERN -> {
-                    "type=stb&action=get_profile&hd=1&client_type=STB&ver=5.1.0" +
-                            "&stb_type=${URLParamEncode(activeDevice.hwVersion)}&image_version=${URLParamEncode(activeDevice.imageVersion)}" +
-                            "&auth_second_step=0&hw_version=${URLParamEncode(activeDevice.hwVersion)}&hw_version_2=${URLParamEncode(activeDevice.hwVersion2)}&not_valid_token=0" +
-                            "&device_id=${URLParamEncode(deviceId)}&device_id2=${URLParamEncode(deviceId2)}&signature=${URLParamEncode(signature)}&sn=${URLParamEncode(snVal)}" +
-                            "&metrics=${URLParamEncode(metrics)}&api_signature=${URLParamEncode(apiSigValue)}"
+            fun buildProfileParams(authSecondStep: Int): String {
+                val apiSigValue = apiSignature.ifEmpty { "262" }
+                return when (profVariant) {
+                    StalkerProfileVariant.STANDARD_V1 -> {
+                        "type=stb&action=get_profile&hd=1&ver=ImageDescription%3A%200%20version&num_banks=2" +
+                                "&stb_type=${URLParamEncode(activeDevice.hwVersion)}&image_version=${URLParamEncode(activeDevice.imageVersion)}" +
+                                "&auth_second_step=$authSecondStep&hw_version=${URLParamEncode(activeDevice.hwVersion)}&hw_version_2=${URLParamEncode(activeDevice.hwVersion2)}&not_valid_token=0" +
+                                "&device_id=${URLParamEncode(deviceId)}&device_id2=${URLParamEncode(deviceId2)}&signature=${URLParamEncode(signature)}&sn=${URLParamEncode(snVal)}" +
+                                "&metrics=${URLParamEncode(metrics)}&api_signature=${URLParamEncode(apiSigValue)}"
+                    }
+                    StalkerProfileVariant.SIMPLIFIED_V2 -> {
+                        "type=stb&action=get_profile&hd=1&num_banks=2" +
+                                "&stb_type=${URLParamEncode(activeDevice.hwVersion)}&image_version=${URLParamEncode(activeDevice.imageVersion)}" +
+                                "&auth_second_step=$authSecondStep&hw_version=${URLParamEncode(activeDevice.hwVersion)}&hw_version_2=${URLParamEncode(activeDevice.hwVersion2)}&not_valid_token=0" +
+                                "&device_id=${URLParamEncode(deviceId)}&device_id2=${URLParamEncode(deviceId2)}&signature=${URLParamEncode(signature)}&sn=${URLParamEncode(snVal)}" +
+                                "&metrics=${URLParamEncode(metrics)}&api_signature=${URLParamEncode(apiSigValue)}"
+                    }
+                    StalkerProfileVariant.MINISTRA_MODERN -> {
+                        "type=stb&action=get_profile&hd=1&client_type=STB&ver=5.1.0" +
+                                "&stb_type=${URLParamEncode(activeDevice.hwVersion)}&image_version=${URLParamEncode(activeDevice.imageVersion)}" +
+                                "&auth_second_step=$authSecondStep&hw_version=${URLParamEncode(activeDevice.hwVersion)}&hw_version_2=${URLParamEncode(activeDevice.hwVersion2)}&not_valid_token=0" +
+                                "&device_id=${URLParamEncode(deviceId)}&device_id2=${URLParamEncode(deviceId2)}&signature=${URLParamEncode(signature)}&sn=${URLParamEncode(snVal)}" +
+                                "&metrics=${URLParamEncode(metrics)}&api_signature=${URLParamEncode(apiSigValue)}"
+                    }
                 }
             }
 
             try {
-                val profResp = stalkerRequest(finalPortalUrl, macClean, profileParams, finalToken, activeDevice)
-                val profParsed = parseStalkerJsResponse(profResp)
-                val jsProf = profParsed["js"] as? Map<*, *>
-
-                if (jsProf?.get("block_msg") != null) {
-                    throw NetworkError.PortalBlockedMac("MAC bloqueada por el portal: " + jsProf["block_msg"].toString())
+                var profHttp = stalkerRequestWithResponse(finalPortalUrl, macClean, buildProfileParams(0), activeToken, activeDevice)
+                if (profHttp.code == 401 || profHttp.code == 403) {
+                    val errParsed = parseStalkerJsResponse(profHttp.body)
+                    val errJs = errParsed["js"] as? Map<*, *>
+                    val blockMsg = (errJs?.get("block_msg") ?: errParsed["block_msg"])?.toString()?.trim()
+                    if (!blockMsg.isNullOrEmpty() && !blockMsg.equals("false", ignoreCase = true) && !blockMsg.equals("null", ignoreCase = true)) {
+                        throw NetworkError.PortalBlockedMac("MAC bloqueada por el portal: $blockMsg")
+                    }
+                    profileAuthRejections++
+                    continue
+                }
+                if (profHttp.code !in 200..299) {
+                    throw NetworkError.ServerError(profHttp.code, "El portal Stalker devolvió un error (HTTP ${profHttp.code})")
                 }
 
-                activeToken = jsProf?.get("token")?.toString()?.ifEmpty { finalToken } ?: finalToken
+                var profParsed = parseStalkerJsResponse(profHttp.body)
+                var jsProf = profParsed["js"] as? Map<*, *>
+
+                val blockMsg = (jsProf?.get("block_msg") ?: profParsed["block_msg"])?.toString()?.trim()
+                if (!blockMsg.isNullOrEmpty() && !blockMsg.equals("false", ignoreCase = true) && !blockMsg.equals("null", ignoreCase = true)) {
+                    throw NetworkError.PortalBlockedMac("MAC bloqueada por el portal: $blockMsg")
+                }
+
+                // Soporte de verificación auth_second_step=1 si el portal lo solicita explícitamente
+                val requiresSecondStep = isTruthyFlag(jsProf?.get("auth_second_step")) ||
+                    isTruthyFlag(jsProf?.get("not_valid_token"))
+                if (requiresSecondStep) {
+                    if (apiRandom.isNotBlank()) {
+                        apiSignature = generateApiSignature(activeToken, apiRandom, macClean)
+                    }
+                    profHttp = stalkerRequestWithResponse(finalPortalUrl, macClean, buildProfileParams(1), activeToken, activeDevice)
+                    if (profHttp.code == 401 || profHttp.code == 403) {
+                        profileAuthRejections++
+                        continue
+                    }
+                    if (profHttp.code in 200..299) {
+                        profParsed = parseStalkerJsResponse(profHttp.body)
+                        jsProf = profParsed["js"] as? Map<*, *>
+                        val blockMsg2 = (jsProf?.get("block_msg") ?: profParsed["block_msg"])?.toString()?.trim()
+                        if (!blockMsg2.isNullOrEmpty() && !blockMsg2.equals("false", ignoreCase = true) && !blockMsg2.equals("null", ignoreCase = true)) {
+                            throw NetworkError.PortalBlockedMac("MAC bloqueada por el portal: $blockMsg2")
+                        }
+                    }
+                }
+
+                val bodyLower = profHttp.body.lowercase()
+                if (profParsed.isEmpty() && (bodyLower.contains("authorization failed") || bodyLower.contains("access denied") || bodyLower.contains("unauthorized"))) {
+                    profileAuthRejections++
+                    continue
+                }
+
+                activeToken = jsProf?.get("token")?.toString()?.ifEmpty { activeToken } ?: activeToken
                 activeProfileVariant = profVariant
                 profileSuccess = true
                 break
@@ -797,6 +1269,10 @@ object StalkerParser {
             } catch (e: Exception) {
                 Log.w(TAG, "Profile variant $profVariant failed on $finalPortalUrl: ${e.message}")
             }
+        }
+
+        if (!profileSuccess && profileAuthRejections == candidateProfiles.size) {
+            throw NetworkError.Auth("El portal rechazó el perfil STB o la dirección MAC en get_profile")
         }
 
         // FASE 3: PERSISTENCIA DEL ESTADO APRENDIDO EN PortalSessionRepository
@@ -814,12 +1290,20 @@ object StalkerParser {
             repo.setStalkerCompatState(playlistId.toString(), stateToSave)
         }
 
-        return mapOf(
+        val capturedCookies = getPortalCookiesSnapshot(finalPortalUrl, macClean)
+        val resultMap = mutableMapOf<String, Any>(
             "portalUrl" to finalPortalUrl,
             "mac" to macClean,
             "token" to activeToken,
             "device" to activeDevice
         )
+        if (playlistId != null) {
+            resultMap["playlistId"] = playlistId
+        }
+        if (capturedCookies.isNotEmpty()) {
+            resultMap["cookies"] = capturedCookies
+        }
+        return resultMap
     }
 
     suspend fun fetchStalkerTv(
@@ -832,9 +1316,14 @@ object StalkerParser {
     ): List<IptvItem> {
 
         val sessionMap = existingSession ?: performStalkerHandshake(host, mac, device)
-        val finalPortalUrl = sessionMap["portalUrl"] as String
         val macClean = sessionMap["mac"] as String
-        val activeToken = sessionMap["token"] as String
+        val activeDevice = (sessionMap["device"] as? StalkerDevice) ?: device
+        val catalogSession = StalkerCatalogSession(
+            host = host,
+            mac = macClean,
+            initialSession = sessionMap + ("device" to activeDevice)
+        )
+        var unrecoveredAuthError: Exception? = null
 
         onProgress("Obteniendo categorías de TV...")
         var rawGenres = emptyList<Any>()
@@ -845,18 +1334,24 @@ object StalkerParser {
         for (params in genresAttempts) {
             currentCoroutineContext().ensureActive()
             try {
-                val genresParsed = stalkerRequestAndParse(finalPortalUrl, macClean, params, activeToken, device)
+                val genresParsed = catalogSession.requestParsed(params, maxRetries = 1)
                 val list = extractListFromJsField(genresParsed)
                 if (list.isNotEmpty()) {
                     rawGenres = list
                     break
                 }
+            } catch (blocked: NetworkError.PortalBlockedMac) {
+                throw blocked
             } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                if (e is NetworkError.TokenExpired || e is NetworkError.Auth) {
+                    unrecoveredAuthError = e
+                }
                 Log.e(TAG, "Error fetching ITV genres with params: $params", e)
             }
         }
 
-        val genreMap = HashMap<String, String>()
+        val genreMap = LinkedHashMap<String, String>()
         rawGenres.forEach { g ->
             val m = g as? Map<*, *> ?: return@forEach
             val id = m["id"]?.toString() ?: m["tv_genre_id"]?.toString() ?: ""
@@ -882,7 +1377,7 @@ object StalkerParser {
         for (params in chAttempts) {
             currentCoroutineContext().ensureActive()
             try {
-                val chParsed = stalkerRequestAndParse(finalPortalUrl, macClean, params, activeToken, device)
+                val chParsed = catalogSession.requestParsed(params)
                 val list = extractListFromJsField(chParsed)
                 if (list.isNotEmpty()) {
                     list.forEach { c ->
@@ -899,37 +1394,125 @@ object StalkerParser {
                         break
                     }
                 }
+            } catch (blocked: NetworkError.PortalBlockedMac) {
+                throw blocked
             } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                if (e is NetworkError.TokenExpired || e is NetworkError.Auth) {
+                    unrecoveredAuthError = e
+                }
                 Log.e(TAG, "Error fetching ITV channels with params: $params", e)
             }
         }
 
-        // Si get_all_channels falló y hay géneros, paginación adaptativa y concurrente
+        // Si get_all_channels falló y hay géneros, paginación adaptativa completa y concurrente por género
         if (rawChannels.isEmpty() && genreMap.isNotEmpty()) {
             fallbackUsed = "genres_pagination"
             tvStrategyUsed = "get_ordered_list_genre"
+
+            val probeGenreId = genreMap.keys.first()
+            var tvFilterKey = "genre"
+            var tvPageSizeParam = "&max_rows=$INITIAL_PAGE_SIZE"
+            var probeList = emptyList<Any>()
+            val probeConfigs = listOf(
+                "genre" to "&max_rows=$INITIAL_PAGE_SIZE",
+                "genre" to "&max_rows=$FALLBACK_PAGE_SIZE",
+                "genre" to "",
+                "category" to "&max_rows=$INITIAL_PAGE_SIZE",
+                "category" to ""
+            )
+            for ((fKey, sizeParam) in probeConfigs) {
+                currentCoroutineContext().ensureActive()
+                try {
+                    val probeParsed = catalogSession.requestParsed(
+                        "type=itv&action=get_ordered_list&$fKey=$probeGenreId&p=1$sizeParam",
+                        maxRetries = 1
+                    )
+                    val list = extractListFromJsField(probeParsed)
+                    if (list.isNotEmpty()) {
+                        tvFilterKey = fKey
+                        tvPageSizeParam = sizeParam
+                        probeList = list
+                        break
+                    }
+                } catch (blocked: NetworkError.PortalBlockedMac) {
+                    throw blocked
+                } catch (e: Exception) {
+                    if (e is kotlinx.coroutines.CancellationException) throw e
+                    if (e is NetworkError.TokenExpired || e is NetworkError.Auth) {
+                        unrecoveredAuthError = e
+                    }
+                }
+            }
+
+            val probeSeenKeys = HashSet<String>()
+            if (probeList.isNotEmpty()) {
+                probeList.forEach { c ->
+                    val m = c as? Map<*, *> ?: return@forEach
+                    val id = m["id"]?.toString() ?: m["number"]?.toString() ?: m["name"]?.toString() ?: ""
+                    val cmd = m["cmd"]?.toString() ?: m["url"]?.toString() ?: ""
+                    val key = "$id|$cmd"
+                    probeSeenKeys.add(key)
+                    if (seenChKeys.add(key)) {
+                        rawChannels.add(c)
+                    }
+                }
+            }
+
             val downloadSemaphore = Semaphore(MAX_CONCURRENT_REQUESTS)
             coroutineScope {
                 genreMap.keys.map { genreId ->
                     async(Dispatchers.IO) {
                         downloadSemaphore.withPermit {
-                            currentCoroutineContext().ensureActive()
-                            try {
-                                val chParsed = stalkerRequestAndParse(finalPortalUrl, macClean, "type=itv&action=get_ordered_list&genre=$genreId&p=1&max_rows=$INITIAL_PAGE_SIZE", activeToken, device)
+                            val seenInGenre = if (genreId == probeGenreId && probeList.isNotEmpty()) {
+                                HashSet(probeSeenKeys)
+                            } else {
+                                HashSet()
+                            }
+                            var gPage = if (genreId == probeGenreId && probeList.isNotEmpty()) 2 else 1
+                            var gHasMore = true
+                            while (gHasMore && gPage <= 1000) {
+                                currentCoroutineContext().ensureActive()
+                                val chParsed = try {
+                                    catalogSession.requestParsed(
+                                        "type=itv&action=get_ordered_list&$tvFilterKey=$genreId&p=$gPage$tvPageSizeParam"
+                                    )
+                                } catch (blocked: NetworkError.PortalBlockedMac) {
+                                    throw blocked
+                                } catch (e: Exception) {
+                                    if (e is kotlinx.coroutines.CancellationException) throw e
+                                    if (e is NetworkError.TokenExpired || e is NetworkError.Auth) {
+                                        unrecoveredAuthError = e
+                                    }
+                                    Log.e(TAG, "Error fetching channels for genre $genreId page $gPage", e)
+                                    gHasMore = false
+                                    break
+                                }
                                 val list = extractListFromJsField(chParsed)
-                                synchronized(rawChannels) {
-                                    list.forEach { c ->
-                                        val m = c as? Map<*, *> ?: return@forEach
-                                        val id = m["id"]?.toString() ?: m["number"]?.toString() ?: m["name"]?.toString() ?: ""
-                                        val cmd = m["cmd"]?.toString() ?: m["url"]?.toString() ?: ""
-                                        val key = "$id|$cmd"
-                                        if (seenChKeys.add(key)) {
-                                            rawChannels.add(c)
+                                if (list.isEmpty()) {
+                                    gHasMore = false
+                                } else {
+                                    var genreNewCount = 0
+                                    synchronized(rawChannels) {
+                                        list.forEach { c ->
+                                            val m = c as? Map<*, *> ?: return@forEach
+                                            val id = m["id"]?.toString() ?: m["number"]?.toString() ?: m["name"]?.toString() ?: ""
+                                            val cmd = m["cmd"]?.toString() ?: m["url"]?.toString() ?: ""
+                                            val key = "$id|$cmd"
+                                            if (seenInGenre.add(key)) {
+                                                genreNewCount++
+                                            }
+                                            if (seenChKeys.add(key)) {
+                                                rawChannels.add(c)
+                                            }
                                         }
                                     }
+                                    if (genreNewCount == 0) {
+                                        gHasMore = false
+                                    } else {
+                                        gPage++
+                                    }
                                 }
-                            } catch (e: Exception) {
-                                Log.e(TAG, "Error fetching channels for genre $genreId", e)
                             }
                         }
                     }
@@ -945,11 +1528,36 @@ object StalkerParser {
             var chHasMore = true
             while (chHasMore && chPage <= 1000) {
                 currentCoroutineContext().ensureActive()
-                val chParsed = stalkerRequestAndParse(finalPortalUrl, macClean, "type=itv&action=get_ordered_list&genre=0&p=$chPage&max_rows=$INITIAL_PAGE_SIZE", activeToken, device)
-                var list = extractListFromJsField(chParsed)
+                var list: List<Any> = emptyList()
+                try {
+                    val chParsed = catalogSession.requestParsed(
+                        "type=itv&action=get_ordered_list&genre=0&p=$chPage&max_rows=$INITIAL_PAGE_SIZE"
+                    )
+                    list = extractListFromJsField(chParsed)
+                } catch (blocked: NetworkError.PortalBlockedMac) {
+                    throw blocked
+                } catch (e: Exception) {
+                    if (e is kotlinx.coroutines.CancellationException) throw e
+                    if (e is NetworkError.TokenExpired || e is NetworkError.Auth) {
+                        unrecoveredAuthError = e
+                    }
+                }
                 if (list.isEmpty()) {
-                    val chParsedAlt = stalkerRequestAndParse(finalPortalUrl, macClean, "type=itv&action=get_ordered_list&p=$chPage", activeToken, device)
-                    list = extractListFromJsField(chParsedAlt)
+                    try {
+                        val chParsedAlt = catalogSession.requestParsed(
+                            "type=itv&action=get_ordered_list&p=$chPage"
+                        )
+                        list = extractListFromJsField(chParsedAlt)
+                    } catch (blocked: NetworkError.PortalBlockedMac) {
+                        throw blocked
+                    } catch (e: Exception) {
+                        if (e is kotlinx.coroutines.CancellationException) throw e
+                        if (e is NetworkError.TokenExpired || e is NetworkError.Auth) {
+                            unrecoveredAuthError = e
+                        }
+                        chHasMore = false
+                        break
+                    }
                 }
                 if (list.isEmpty()) {
                     chHasMore = false
@@ -972,6 +1580,10 @@ object StalkerParser {
                     }
                 }
             }
+        }
+
+        if (rawChannels.isEmpty() && unrecoveredAuthError != null) {
+            throw unrecoveredAuthError!!
         }
 
         val channels = ArrayList<IptvItem>(rawChannels.size)
@@ -1033,9 +1645,13 @@ object StalkerParser {
     ): List<IptvItem> {
 
         val sessionMap = existingSession ?: performStalkerHandshake(host, mac, device)
-        val finalPortalUrl = sessionMap["portalUrl"] as String
         val macClean = sessionMap["mac"] as String
-        val activeToken = sessionMap["token"] as String
+        val activeDevice = (sessionMap["device"] as? StalkerDevice) ?: device
+        val catalogSession = StalkerCatalogSession(
+            host = host,
+            mac = macClean,
+            initialSession = sessionMap + ("device" to activeDevice)
+        )
 
         onProgress("Obteniendo categorías VOD...")
         var rawVodCats = emptyList<Any>()
@@ -1044,14 +1660,18 @@ object StalkerParser {
             "type=vod&action=get_genres"
         )
         for (params in vodCatAttempts) {
+            currentCoroutineContext().ensureActive()
             try {
-                val vodCatParsed = stalkerRequestAndParse(finalPortalUrl, macClean, params, activeToken, device)
+                val vodCatParsed = catalogSession.requestParsed(params, maxRetries = 1)
                 val list = extractListFromJsField(vodCatParsed)
                 if (list.isNotEmpty()) {
                     rawVodCats = list
                     break
                 }
+            } catch (blocked: NetworkError.PortalBlockedMac) {
+                throw blocked
             } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
                 Log.e(TAG, "Error fetching VOD categories with params: $params", e)
             }
         }
@@ -1083,74 +1703,51 @@ object StalkerParser {
             val probeCatName = vodCatMap[probeCatId] ?: probeCatId
 
             var detected = false
+            var probeList = emptyList<Any>()
 
-            // Estrategia 1: category con INITIAL_PAGE_SIZE (100)
-            pagesRequested.incrementAndGet()
-            var probeParsed = stalkerRequestAndParse(finalPortalUrl, macClean, "type=vod&action=get_ordered_list&category=$probeCatId&p=1&max_rows=$INITIAL_PAGE_SIZE", activeToken, device)
-            var probeList = extractListFromJsField(probeParsed)
-
-            if (probeList.isNotEmpty()) {
-                pagesCompleted.incrementAndGet()
-                activeStrategy = "category"
-                fallbackUsed = "none"
-                detected = true
-            } else {
-                // Estrategia 2: genre con INITIAL_PAGE_SIZE
+            val vodProbeConfigs = listOf(
+                Triple("category", "&max_rows=$INITIAL_PAGE_SIZE", "none"),
+                Triple("genre", "&max_rows=$INITIAL_PAGE_SIZE", "genre"),
+                Triple("category", "&max_rows=$FALLBACK_PAGE_SIZE", "fallback_page_size_50"),
+                Triple("category", "", "no_max_rows"),
+                Triple("genre", "", "no_max_rows_genre")
+            )
+            for ((strategyKey, sizeParam, fbLabel) in vodProbeConfigs) {
+                currentCoroutineContext().ensureActive()
                 pagesRequested.incrementAndGet()
-                probeParsed = stalkerRequestAndParse(finalPortalUrl, macClean, "type=vod&action=get_ordered_list&genre=$probeCatId&p=1&max_rows=$INITIAL_PAGE_SIZE", activeToken, device)
-                probeList = extractListFromJsField(probeParsed)
-                if (probeList.isNotEmpty()) {
-                    pagesCompleted.incrementAndGet()
-                    activeStrategy = "genre"
-                    fallbackUsed = "genre"
-                    detected = true
+                try {
+                    val probeParsed = catalogSession.requestParsed(
+                        "type=vod&action=get_ordered_list&$strategyKey=$probeCatId&p=1$sizeParam",
+                        maxRetries = 1
+                    )
+                    val list = extractListFromJsField(probeParsed)
+                    if (list.isNotEmpty()) {
+                        pagesCompleted.incrementAndGet()
+                        probeList = list
+                        activeStrategy = strategyKey
+                        fallbackUsed = fbLabel
+                        pageSizeParam = sizeParam
+                        activePageSize = when (sizeParam) {
+                            "&max_rows=$INITIAL_PAGE_SIZE" -> INITIAL_PAGE_SIZE
+                            "&max_rows=$FALLBACK_PAGE_SIZE" -> FALLBACK_PAGE_SIZE
+                            else -> list.size
+                        }
+                        detected = true
+                        break
+                    }
+                } catch (blocked: NetworkError.PortalBlockedMac) {
+                    throw blocked
+                } catch (e: Exception) {
+                    if (e is kotlinx.coroutines.CancellationException) throw e
+                    pagesFailed.incrementAndGet()
                 }
             }
-
-            // Si falló con max_rows=100, probar con 50 o sin max_rows
-            if (!detected) {
-                pagesRequested.incrementAndGet()
-                probeParsed = stalkerRequestAndParse(finalPortalUrl, macClean, "type=vod&action=get_ordered_list&category=$probeCatId&p=1&max_rows=$FALLBACK_PAGE_SIZE", activeToken, device)
-                probeList = extractListFromJsField(probeParsed)
-                if (probeList.isNotEmpty()) {
-                    pagesCompleted.incrementAndGet()
-                    activeStrategy = "category"
-                    fallbackUsed = "fallback_page_size_50"
-                    activePageSize = FALLBACK_PAGE_SIZE
-                    pageSizeParam = "&max_rows=$FALLBACK_PAGE_SIZE"
-                    detected = true
-                } else {
-                    // Probar sin max_rows (comportamiento clásico)
-                    pagesRequested.incrementAndGet()
-                    probeParsed = stalkerRequestAndParse(finalPortalUrl, macClean, "type=vod&action=get_ordered_list&category=$probeCatId&p=1", activeToken, device)
-                    probeList = extractListFromJsField(probeParsed)
-                    if (probeList.isNotEmpty()) {
-                        pagesCompleted.incrementAndGet()
-                        activeStrategy = "category"
-                        fallbackUsed = "no_max_rows"
-                        activePageSize = probeList.size
-                        pageSizeParam = ""
-                        detected = true
-                    } else {
-                        // Último intento de detección: sin max_rows con genre
-                        pagesRequested.incrementAndGet()
-                        probeParsed = stalkerRequestAndParse(finalPortalUrl, macClean, "type=vod&action=get_ordered_list&genre=$probeCatId&p=1", activeToken, device)
-                        probeList = extractListFromJsField(probeParsed)
-                        if (probeList.isNotEmpty()) {
-                            pagesCompleted.incrementAndGet()
-                            activeStrategy = "genre"
-                            fallbackUsed = "no_max_rows_genre"
-                            activePageSize = probeList.size
-                            pageSizeParam = ""
-                            detected = true
-                        } else {
-                            pagesFailed.incrementAndGet()
-                        }
-                    }
-                }
+            if (!detected && probeList.isEmpty()) {
+                pagesFailed.incrementAndGet()
             }
 
             // Procesar la página detectada si trajo items para no perderla
+            val probeSeenInCat = HashSet<String>()
             if (probeList.isNotEmpty()) {
                 val catName = vodCatMap[probeCatId] ?: "General"
                 probeList.forEach { mo ->
@@ -1159,6 +1756,7 @@ object StalkerParser {
                     val cmd = m["cmd"]?.toString() ?: ""
                     val id = m["id"]?.toString() ?: m["movie_id"]?.toString() ?: m["vod_id"]?.toString() ?: ""
                     val key = if (id.isNotEmpty()) "$id|$cmd" else "$name|$cmd"
+                    probeSeenInCat.add(key)
                     if (seenMovies.add(key)) {
                         val cId = m["category_id"]?.toString() ?: m["genre_id"]?.toString() ?: probeCatId
                         movies.add(IptvItem(
@@ -1179,6 +1777,11 @@ object StalkerParser {
                 vodCatMap.entries.map { (catId, catName) ->
                     async(Dispatchers.IO) {
                         downloadSemaphore.withPermit {
+                            val seenInCat = if (catId == probeCatId && probeList.isNotEmpty()) {
+                                HashSet(probeSeenInCat)
+                            } else {
+                                HashSet()
+                            }
                             var catPage = if (catId == probeCatId && probeList.isNotEmpty()) 2 else 1
                             var catHasMore = true
                             while (catHasMore && catPage <= 1000) {
@@ -1187,38 +1790,34 @@ object StalkerParser {
                                 pagesRequested.incrementAndGet()
 
                                 var rawMovies = emptyList<Any>()
-                                var attempt = 0
                                 var success = false
-                                val pageReqStart = System.currentTimeMillis()
-                                while (attempt <= MAX_RETRIES_PER_PAGE && !success) {
-                                    attempt++
-                                    try {
-                                        val vodParsed = stalkerRequestAndParse(finalPortalUrl, macClean, queryParams, activeToken, device)
-                                        rawMovies = extractListFromJsField(vodParsed)
-                                        success = true
-                                        pagesCompleted.incrementAndGet()
-                                    } catch (e: Exception) {
-                                        if (attempt > MAX_RETRIES_PER_PAGE) {
-                                            pagesFailed.incrementAndGet()
-                                            Log.w(TAG, "Failed page $catPage for cat $catId after retries: ${e.message}")
-                                        } else {
-                                            delay(150)
-                                        }
-                                    }
+                                try {
+                                    val vodParsed = catalogSession.requestParsed(queryParams)
+                                    rawMovies = extractListFromJsField(vodParsed)
+                                    success = true
+                                    pagesCompleted.incrementAndGet()
+                                } catch (blocked: NetworkError.PortalBlockedMac) {
+                                    throw blocked
+                                } catch (e: Exception) {
+                                    if (e is kotlinx.coroutines.CancellationException) throw e
+                                    pagesFailed.incrementAndGet()
+                                    Log.w(TAG, "Failed page $catPage for cat $catId after retries: ${e.message}")
                                 }
 
-                                if (rawMovies.isEmpty()) {
+                                if (!success || rawMovies.isEmpty()) {
                                     catHasMore = false
                                 } else {
-                                    var newCount = 0
+                                    var catNewCount = 0
                                     rawMovies.forEach { mo ->
                                         val m = mo as? Map<*, *> ?: return@forEach
                                         val name = m["name"]?.toString() ?: m["title"]?.toString() ?: "Sin nombre"
                                         val cmd = m["cmd"]?.toString() ?: ""
                                         val id = m["id"]?.toString() ?: m["movie_id"]?.toString() ?: m["vod_id"]?.toString() ?: ""
                                         val key = if (id.isNotEmpty()) "$id|$cmd" else "$name|$cmd"
+                                        if (seenInCat.add(key)) {
+                                            catNewCount++
+                                        }
                                         if (seenMovies.add(key)) {
-                                            newCount++
                                             val cId = m["category_id"]?.toString() ?: m["genre_id"]?.toString() ?: catId
                                             movies.add(IptvItem(
                                                 name = name,
@@ -1231,7 +1830,7 @@ object StalkerParser {
                                         }
                                     }
 
-                                    if (newCount == 0) {
+                                    if (catNewCount == 0) {
                                         catHasMore = false
                                     } else {
                                         catPage++
@@ -1263,11 +1862,18 @@ object StalkerParser {
             )
             var chosenGlobalPrefix = globalStrategies.first()
             for (strategy in globalStrategies) {
-                val testParsed = stalkerRequestAndParse(finalPortalUrl, macClean, "$strategy&p=1$pageSizeParam", activeToken, device)
-                val testList = extractListFromJsField(testParsed)
-                if (testList.isNotEmpty()) {
-                    chosenGlobalPrefix = strategy
-                    break
+                currentCoroutineContext().ensureActive()
+                try {
+                    val testParsed = catalogSession.requestParsed("$strategy&p=1$pageSizeParam", maxRetries = 1)
+                    val testList = extractListFromJsField(testParsed)
+                    if (testList.isNotEmpty()) {
+                        chosenGlobalPrefix = strategy
+                        break
+                    }
+                } catch (blocked: NetworkError.PortalBlockedMac) {
+                    throw blocked
+                } catch (e: Exception) {
+                    if (e is kotlinx.coroutines.CancellationException) throw e
                 }
             }
 
@@ -1277,15 +1883,20 @@ object StalkerParser {
                 currentCoroutineContext().ensureActive()
                 pagesRequested.incrementAndGet()
                 var rawMovies = emptyList<Any>()
+                var pageOk = false
                 try {
-                    val vodParsed = stalkerRequestAndParse(finalPortalUrl, macClean, "$chosenGlobalPrefix&p=$mPage$pageSizeParam", activeToken, device)
+                    val vodParsed = catalogSession.requestParsed("$chosenGlobalPrefix&p=$mPage$pageSizeParam")
                     rawMovies = extractListFromJsField(vodParsed)
+                    pageOk = true
                     pagesCompleted.incrementAndGet()
+                } catch (blocked: NetworkError.PortalBlockedMac) {
+                    throw blocked
                 } catch (e: Exception) {
+                    if (e is kotlinx.coroutines.CancellationException) throw e
                     pagesFailed.incrementAndGet()
                 }
 
-                if (rawMovies.isEmpty()) {
+                if (!pageOk || rawMovies.isEmpty()) {
                     mHasMore = false
                 } else {
                     var newCount = 0
@@ -1333,9 +1944,13 @@ object StalkerParser {
     ): List<IptvItem> {
 
         val sessionMap = existingSession ?: performStalkerHandshake(host, mac, device)
-        val finalPortalUrl = sessionMap["portalUrl"] as String
         val macClean = sessionMap["mac"] as String
-        val activeToken = sessionMap["token"] as String
+        val activeDevice = (sessionMap["device"] as? StalkerDevice) ?: device
+        val catalogSession = StalkerCatalogSession(
+            host = host,
+            mac = macClean,
+            initialSession = sessionMap + ("device" to activeDevice)
+        )
 
         onProgress("Obteniendo categorías de series...")
         var rawSeriesCats = emptyList<Any>()
@@ -1348,13 +1963,16 @@ object StalkerParser {
         for (params in seriesCatAttempts) {
             currentCoroutineContext().ensureActive()
             try {
-                val seriesCatParsed = stalkerRequestAndParse(finalPortalUrl, macClean, params, activeToken, device)
+                val seriesCatParsed = catalogSession.requestParsed(params, maxRetries = 1)
                 val list = extractListFromJsField(seriesCatParsed)
                 if (list.isNotEmpty()) {
                     rawSeriesCats = list
                     break
                 }
+            } catch (blocked: NetworkError.PortalBlockedMac) {
+                throw blocked
             } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
                 Log.e(TAG, "Error fetching series categories with params: $params", e)
             }
         }
@@ -1394,9 +2012,10 @@ object StalkerParser {
 
             var probeList = emptyList<Any>()
             for ((idx, prefix) in candidatePrefixes.withIndex()) {
+                currentCoroutineContext().ensureActive()
                 pagesRequested.incrementAndGet()
                 try {
-                    val probeParsed = stalkerRequestAndParse(finalPortalUrl, macClean, "$prefix$probeCatId&p=1&max_rows=$INITIAL_PAGE_SIZE", activeToken, device)
+                    val probeParsed = catalogSession.requestParsed("$prefix$probeCatId&p=1&max_rows=$INITIAL_PAGE_SIZE", maxRetries = 1)
                     val list = extractListFromJsField(probeParsed)
                     if (list.isNotEmpty()) {
                         pagesCompleted.incrementAndGet()
@@ -1406,7 +2025,10 @@ object StalkerParser {
                         detected = true
                         break
                     }
+                } catch (blocked: NetworkError.PortalBlockedMac) {
+                    throw blocked
                 } catch (e: Exception) {
+                    if (e is kotlinx.coroutines.CancellationException) throw e
                     pagesFailed.incrementAndGet()
                 }
             }
@@ -1414,9 +2036,10 @@ object StalkerParser {
             // Si falló con max_rows=100, probar con 50 o sin max_rows
             if (!detected) {
                 for (prefix in candidatePrefixes) {
+                    currentCoroutineContext().ensureActive()
                     pagesRequested.incrementAndGet()
                     try {
-                        val probeParsed = stalkerRequestAndParse(finalPortalUrl, macClean, "$prefix$probeCatId&p=1&max_rows=$FALLBACK_PAGE_SIZE", activeToken, device)
+                        val probeParsed = catalogSession.requestParsed("$prefix$probeCatId&p=1&max_rows=$FALLBACK_PAGE_SIZE", maxRetries = 1)
                         val list = extractListFromJsField(probeParsed)
                         if (list.isNotEmpty()) {
                             pagesCompleted.incrementAndGet()
@@ -1428,7 +2051,10 @@ object StalkerParser {
                             detected = true
                             break
                         }
+                    } catch (blocked: NetworkError.PortalBlockedMac) {
+                        throw blocked
                     } catch (e: Exception) {
+                        if (e is kotlinx.coroutines.CancellationException) throw e
                         pagesFailed.incrementAndGet()
                     }
                 }
@@ -1436,9 +2062,10 @@ object StalkerParser {
 
             if (!detected) {
                 for (prefix in candidatePrefixes) {
+                    currentCoroutineContext().ensureActive()
                     pagesRequested.incrementAndGet()
                     try {
-                        val probeParsed = stalkerRequestAndParse(finalPortalUrl, macClean, "$prefix$probeCatId&p=1", activeToken, device)
+                        val probeParsed = catalogSession.requestParsed("$prefix$probeCatId&p=1", maxRetries = 1)
                         val list = extractListFromJsField(probeParsed)
                         if (list.isNotEmpty()) {
                             pagesCompleted.incrementAndGet()
@@ -1450,13 +2077,17 @@ object StalkerParser {
                             detected = true
                             break
                         }
+                    } catch (blocked: NetworkError.PortalBlockedMac) {
+                        throw blocked
                     } catch (e: Exception) {
+                        if (e is kotlinx.coroutines.CancellationException) throw e
                         pagesFailed.incrementAndGet()
                     }
                 }
             }
 
             // Procesar la página detectada si trajo items para no perderla
+            val probeSeenInCat = HashSet<String>()
             if (probeList.isNotEmpty()) {
                 val catName = seriesCatMap[probeCatId] ?: "General"
                 probeList.forEach { se ->
@@ -1478,6 +2109,7 @@ object StalkerParser {
                         }
                     }
                     val key = if (cleanId.isNotEmpty()) "$cleanId|$cmd" else "$name|$cmd"
+                    probeSeenInCat.add(key)
                     if (seenSeries.add(key)) {
                         val cId = m["category_id"]?.toString() ?: m["genre_id"]?.toString() ?: probeCatId
                         series.add(IptvItem(
@@ -1499,6 +2131,11 @@ object StalkerParser {
                 seriesCatMap.entries.map { (catId, catName) ->
                     async(Dispatchers.IO) {
                         downloadSemaphore.withPermit {
+                            val seenInCat = if (catId == probeCatId && probeList.isNotEmpty()) {
+                                HashSet(probeSeenInCat)
+                            } else {
+                                HashSet()
+                            }
                             var sCatPage = if (catId == probeCatId && probeList.isNotEmpty()) 2 else 1
                             var sCatHasMore = true
                             while (sCatHasMore && sCatPage <= 1000) {
@@ -1507,29 +2144,24 @@ object StalkerParser {
                                 pagesRequested.incrementAndGet()
 
                                 var rawSeries = emptyList<Any>()
-                                var attempt = 0
                                 var success = false
-                                while (attempt <= MAX_RETRIES_PER_PAGE && !success) {
-                                    attempt++
-                                    try {
-                                        val seriesParsed = stalkerRequestAndParse(finalPortalUrl, macClean, queryParams, activeToken, device)
-                                        rawSeries = extractListFromJsField(seriesParsed)
-                                        success = true
-                                        pagesCompleted.incrementAndGet()
-                                    } catch (e: Exception) {
-                                        if (attempt > MAX_RETRIES_PER_PAGE) {
-                                            pagesFailed.incrementAndGet()
-                                            Log.w(TAG, "Failed page $sCatPage for series cat $catId after retries: ${e.message}")
-                                        } else {
-                                            delay(150)
-                                        }
-                                    }
+                                try {
+                                    val seriesParsed = catalogSession.requestParsed(queryParams)
+                                    rawSeries = extractListFromJsField(seriesParsed)
+                                    success = true
+                                    pagesCompleted.incrementAndGet()
+                                } catch (blocked: NetworkError.PortalBlockedMac) {
+                                    throw blocked
+                                } catch (e: Exception) {
+                                    if (e is kotlinx.coroutines.CancellationException) throw e
+                                    pagesFailed.incrementAndGet()
+                                    Log.w(TAG, "Failed page $sCatPage for series cat $catId after retries: ${e.message}")
                                 }
 
-                                if (rawSeries.isEmpty()) {
+                                if (!success || rawSeries.isEmpty()) {
                                     sCatHasMore = false
                                 } else {
-                                    var newCount = 0
+                                    var catNewCount = 0
                                     rawSeries.forEach { se ->
                                         val m = se as? Map<*, *> ?: return@forEach
                                         val name = m["name"]?.toString() ?: m["title"]?.toString() ?: "Sin nombre"
@@ -1549,8 +2181,10 @@ object StalkerParser {
                                             }
                                         }
                                         val key = if (cleanId.isNotEmpty()) "$cleanId|$cmd" else "$name|$cmd"
+                                        if (seenInCat.add(key)) {
+                                            catNewCount++
+                                        }
                                         if (seenSeries.add(key)) {
-                                            newCount++
                                             val cId = m["category_id"]?.toString() ?: m["genre_id"]?.toString() ?: catId
                                             series.add(IptvItem(
                                                 name = name,
@@ -1564,7 +2198,7 @@ object StalkerParser {
                                         }
                                     }
 
-                                    if (newCount == 0) {
+                                    if (catNewCount == 0) {
                                         sCatHasMore = false
                                     } else {
                                         sCatPage++
@@ -1597,11 +2231,18 @@ object StalkerParser {
             )
             var chosenGlobalPrefix = globalStrategies.first()
             for (strategy in globalStrategies) {
-                val testParsed = stalkerRequestAndParse(finalPortalUrl, macClean, "$strategy&p=1$pageSizeParam", activeToken, device)
-                val testList = extractListFromJsField(testParsed)
-                if (testList.isNotEmpty()) {
-                    chosenGlobalPrefix = strategy
-                    break
+                currentCoroutineContext().ensureActive()
+                try {
+                    val testParsed = catalogSession.requestParsed("$strategy&p=1$pageSizeParam", maxRetries = 1)
+                    val testList = extractListFromJsField(testParsed)
+                    if (testList.isNotEmpty()) {
+                        chosenGlobalPrefix = strategy
+                        break
+                    }
+                } catch (blocked: NetworkError.PortalBlockedMac) {
+                    throw blocked
+                } catch (e: Exception) {
+                    if (e is kotlinx.coroutines.CancellationException) throw e
                 }
             }
 
@@ -1611,15 +2252,20 @@ object StalkerParser {
                 currentCoroutineContext().ensureActive()
                 pagesRequested.incrementAndGet()
                 var rawSeries = emptyList<Any>()
+                var pageOk = false
                 try {
-                    val seriesParsed = stalkerRequestAndParse(finalPortalUrl, macClean, "$chosenGlobalPrefix&p=$sPage$pageSizeParam", activeToken, device)
+                    val seriesParsed = catalogSession.requestParsed("$chosenGlobalPrefix&p=$sPage$pageSizeParam")
                     rawSeries = extractListFromJsField(seriesParsed)
+                    pageOk = true
                     pagesCompleted.incrementAndGet()
+                } catch (blocked: NetworkError.PortalBlockedMac) {
+                    throw blocked
                 } catch (e: Exception) {
+                    if (e is kotlinx.coroutines.CancellationException) throw e
                     pagesFailed.incrementAndGet()
                 }
 
-                if (rawSeries.isEmpty()) {
+                if (!pageOk || rawSeries.isEmpty()) {
                     sHasMore = false
                 } else {
                     var newCount = 0
@@ -2410,7 +3056,7 @@ object StalkerParser {
                 .replace(Regex("(?i)(?:temporada|season|saison|staffel|temp)\\s*\\d+"), "")
                 .replace(Regex("(?i)(?:capitulo|capítulo|episodio|episode|ep|cap)\\s*\\d+"), "")
                 .trim().removePrefix(":").removePrefix("-").trim()
-            val isOnlyEpNum = cleanTitleStr == epNum || cleanTitleStr == String.format("%02d", epNum.toIntOrNull() ?: -1)
+            val isOnlyEpNum = cleanTitleStr == epNum || cleanTitleStr == String.format(java.util.Locale.ROOT, "%02d", epNum.toIntOrNull() ?: -1)
             val title = if (cleanTitleStr.isNotEmpty() && !isOnlyEpNum) "S$seasonNum E$epNum: $cleanTitleStr" else "S$seasonNum E$epNum"
 
             val desc = (epMap["info"] as? Map<*, *>)?.get("plot")?.toString()

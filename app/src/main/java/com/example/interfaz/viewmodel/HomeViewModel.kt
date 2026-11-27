@@ -277,9 +277,30 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun removeFavoriteById(id: String) {
+        viewModelScope.launch {
+            val plId = sessionRepo.activePlaylist.value?.id
+            iptvRepo.removeFavoriteById(id, plId)
+        }
+    }
+
+    fun toggleFavoriteItem(item: IptvItem, type: String) {
+        viewModelScope.launch {
+            val plId = sessionRepo.activePlaylist.value?.id ?: return@launch
+            iptvRepo.toggleFavoriteItem(item, type, plId)
+        }
+    }
+
     suspend fun isFavorite(id: String): Boolean {
         val plId = sessionRepo.activePlaylist.value?.id
         return iptvRepo.isFavorite(id, plId)
+    }
+
+    fun getFavoriteTvChannelPeers(favorites: List<FavoriteItem>): List<IptvItem> {
+        val tvCatalog = _liveChannels.value
+        return favorites
+            .filter { IptvRepository.normalizeFavoriteType(it.type) == "tv" }
+            .map { IptvRepository.resolveCatalogItemForFavorite(it, tvCatalog) }
     }
 
     fun deletePlaybackHistory(src: String) {
@@ -355,11 +376,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
 
     suspend fun resolveFavorite(fav: FavoriteItem): FavoriteResolution = withContext(Dispatchers.IO) {
         val pl = sessionRepo.activePlaylist.value
-        val cacheType = when (fav.type.lowercase()) {
-            "tv", "live" -> "tv"
-            "series" -> "series"
-            else -> "movie"
-        }
+        val cacheType = IptvRepository.normalizeFavoriteType(fav.type)
 
         val catalogMap: Map<String, List<IptvItem>> = if (pl != null) {
             if (cacheType == "tv" && _liveChannels.value.isNotEmpty()) {
@@ -370,16 +387,14 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
         } else emptyMap()
 
         val matchedItem = catalogMap.values.asSequence().flatten().firstOrNull { item ->
-            item.name == fav.title ||
-                item.name == fav.id ||
-                (!item.tvgId.isNullOrBlank() && item.tvgId == fav.id) ||
-                (!item.seriesId.isNullOrBlank() && item.seriesId == fav.id) ||
-                (!item.url.isNullOrBlank() && fav.url.isNotBlank() && item.url == fav.url)
+            IptvRepository.matchesFavorite(item, cacheType, fav)
         }
 
+        val effectiveItem = matchedItem ?: IptvRepository.toFallbackIptvItem(fav)
+
         if (cacheType == "series") {
-            if (matchedItem != null) {
-                return@withContext FavoriteResolution.OpenSeries(matchedItem)
+            if (matchedItem != null || !effectiveItem.seriesId.isNullOrBlank() || !effectiveItem.stalkerCmd.isNullOrBlank()) {
+                return@withContext FavoriteResolution.OpenSeries(effectiveItem)
             }
             if (fav.url.isNotBlank() && pl != null) {
                 return@withContext try {
@@ -400,31 +415,35 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
         val mediaType = if (cacheType == "tv") "live" else "vod"
         val playType = if (cacheType == "tv") "live" else "movie"
 
-        if (matchedItem != null && pl != null) {
+        val hasDirectPlaySource = matchedItem != null ||
+            !effectiveItem.stalkerCmd.isNullOrBlank() ||
+            !effectiveItem.url.isNullOrBlank()
+
+        if (hasDirectPlaySource && pl != null) {
             return@withContext try {
-                val (resolvedUrl, headers) = iptvRepo.resolveStreamUrl(pl, matchedItem, mediaType)
+                val (resolvedUrl, headers) = iptvRepo.resolveStreamUrl(pl, effectiveItem, mediaType)
                 if (resolvedUrl.isNotBlank()) {
                     FavoriteResolution.PlayStream(
                         url = resolvedUrl,
-                        title = matchedItem.name,
+                        title = effectiveItem.name,
                         type = playType,
                         headers = headers,
-                        drmScheme = matchedItem.drmScheme,
-                        drmLicenseUrl = matchedItem.drmLicenseUrl
+                        drmScheme = effectiveItem.drmScheme,
+                        drmLicenseUrl = effectiveItem.drmLicenseUrl
                     )
                 } else {
                     FavoriteResolution.Error("No se pudo obtener el enlace de reproducción")
                 }
             } catch (e: Exception) {
-                val fallbackUrl = matchedItem.url?.takeIf { it.isNotBlank() } ?: fav.url.takeIf { it.isNotBlank() }
+                val fallbackUrl = effectiveItem.url?.takeIf { it.isNotBlank() } ?: fav.url.takeIf { it.isNotBlank() }
                 if (fallbackUrl != null) {
                     FavoriteResolution.PlayStream(
                         url = fallbackUrl,
-                        title = matchedItem.name,
+                        title = effectiveItem.name,
                         type = playType,
                         headers = iptvRepo.getStreamHeaders(pl),
-                        drmScheme = matchedItem.drmScheme,
-                        drmLicenseUrl = matchedItem.drmLicenseUrl
+                        drmScheme = effectiveItem.drmScheme,
+                        drmLicenseUrl = effectiveItem.drmLicenseUrl
                     )
                 } else {
                     FavoriteResolution.Error("No se pudo resolver el favorito: ${e.message ?: "error"}")
@@ -434,7 +453,14 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
 
         if (fav.url.isNotBlank()) {
             val headers = iptvRepo.getStreamHeaders(pl)
-            return@withContext FavoriteResolution.PlayStream(fav.url, fav.title, playType, headers)
+            return@withContext FavoriteResolution.PlayStream(
+                url = fav.url,
+                title = fav.title,
+                type = playType,
+                headers = headers,
+                drmScheme = fav.drmScheme,
+                drmLicenseUrl = fav.drmLicenseUrl
+            )
         }
 
         FavoriteResolution.Error("Elemento favorito no disponible en la lista activa")

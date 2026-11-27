@@ -25,14 +25,7 @@ class StalkerSource(
             session = sessionRepo.getStalkerSession(plIdStr)
         }
 
-        val compatState = sessionRepo.getStalkerCompatState(plIdStr)
-        val device = if (playlist.stalkerDeviceJson.isNotBlank()) {
-            try { JsonUtils.stalkerDeviceFromJson(playlist.stalkerDeviceJson) } catch (e: Exception) { StalkerDevice() }
-        } else if (compatState != null) {
-            compatState.deviceModel.toStalkerDevice()
-        } else {
-            (session?.get("device") as? StalkerDevice) ?: StalkerDevice()
-        }
+        val device = resolveEffectiveDevice(playlist, session)
         val result = mutableMapOf<String, List<IptvItem>>()
 
         try {
@@ -69,14 +62,7 @@ class StalkerSource(
             session = sessionRepo.getStalkerSession(plIdStr)
         }
 
-        val compatState = sessionRepo.getStalkerCompatState(plIdStr)
-        val device = if (playlist.stalkerDeviceJson.isNotBlank()) {
-            try { JsonUtils.stalkerDeviceFromJson(playlist.stalkerDeviceJson) } catch (e: Exception) { StalkerDevice() }
-        } else if (compatState != null) {
-            compatState.deviceModel.toStalkerDevice()
-        } else {
-            (session?.get("device") as? StalkerDevice) ?: StalkerDevice()
-        }
+        val device = resolveEffectiveDevice(playlist, session)
         val result = mutableMapOf<String, List<IptvItem>>()
 
         try {
@@ -113,14 +99,7 @@ class StalkerSource(
             session = sessionRepo.getStalkerSession(plIdStr)
         }
 
-        val compatState = sessionRepo.getStalkerCompatState(plIdStr)
-        val device = if (playlist.stalkerDeviceJson.isNotBlank()) {
-            try { JsonUtils.stalkerDeviceFromJson(playlist.stalkerDeviceJson) } catch (e: Exception) { StalkerDevice() }
-        } else if (compatState != null) {
-            compatState.deviceModel.toStalkerDevice()
-        } else {
-            (session?.get("device") as? StalkerDevice) ?: StalkerDevice()
-        }
+        val device = resolveEffectiveDevice(playlist, session)
         val result = mutableMapOf<String, List<IptvItem>>()
 
         try {
@@ -161,7 +140,7 @@ class StalkerSource(
         val portalUrl = session["portalUrl"] as? String ?: return@withContext emptyList()
         val mac = session["mac"] as? String ?: return@withContext emptyList()
         val token = session["token"] as? String ?: ""
-        val device = session["device"] as? StalkerDevice ?: return@withContext emptyList()
+        val device = (session["device"] as? StalkerDevice) ?: resolveEffectiveDevice(playlist, session)
 
         try {
             StalkerParser.fetchStalkerSeriesEpisodes(portalUrl, mac, seriesId, token, device, seriesCmd)
@@ -208,24 +187,34 @@ class StalkerSource(
 
     fun buildHeaders(playlist: Playlist, session: Map<String, Any>? = null): Map<String, String> {
         val targetSession = session ?: sessionRepo.getStalkerSession(playlist.id.toString())
-        val compatState = sessionRepo.getStalkerCompatState(playlist.id.toString())
         val macClean = playlist.mac.trim().uppercase()
-        val device = if (playlist.stalkerDeviceJson.isNotBlank()) {
-            try { JsonUtils.stalkerDeviceFromJson(playlist.stalkerDeviceJson) } catch (e: Exception) { StalkerDevice() }
-        } else if (compatState != null) {
-            compatState.deviceModel.toStalkerDevice()
-        } else {
-            (targetSession?.get("device") as? StalkerDevice) ?: StalkerDevice()
-        }
+        val device = resolveEffectiveDevice(playlist, targetSession)
         val token = (targetSession?.get("token") as? String) ?: ""
         val userAgent = if (device.userAgent.isNotBlank()) device.userAgent else "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 (KHTML, like Gecko) MAG200 stbapp ver: 2 rev: 250 Safari/533.3"
-        val cookieHeader = if (macClean.isNotEmpty()) {
-            if (token.isNotEmpty()) "mac=$macClean; stb_lang=en; timezone=Europe/Madrid; token=$token;"
-            else "mac=$macClean; stb_lang=en; timezone=Europe/Madrid;"
-        } else ""
 
         val portalUrl = (targetSession?.get("portalUrl") as? String) ?: playlist.host
-        val portalBase = portalUrl.substringBefore("/c/").substringBefore("/portal").substringBefore("/server").removeSuffix("/")
+        @Suppress("UNCHECKED_CAST")
+        val extraCookies = (targetSession?.get("cookies") as? Map<String, String>)
+            ?: StalkerParser.getPortalCookiesSnapshot(portalUrl, macClean)
+
+        val cookieParts = ArrayList<String>()
+        if (macClean.isNotEmpty()) {
+            cookieParts.add("mac=$macClean")
+            cookieParts.add("stb_lang=en")
+            cookieParts.add("timezone=Europe/Madrid")
+            if (token.isNotEmpty()) {
+                cookieParts.add("token=$token")
+            }
+        }
+        val reserved = setOf("mac", "stb_lang", "timezone", "token")
+        extraCookies.forEach { (k, v) ->
+            if (k.lowercase() !in reserved && v.isNotBlank()) {
+                cookieParts.add("$k=$v")
+            }
+        }
+        val cookieHeader = if (cookieParts.isNotEmpty()) cookieParts.joinToString("; ") + ";" else ""
+
+        val referer = StalkerParser.derivePortalReferer(portalUrl)
 
         val headers = mutableMapOf(
             "User-Agent" to userAgent,
@@ -235,8 +224,8 @@ class StalkerSource(
         if (cookieHeader.isNotEmpty()) {
             headers["Cookie"] = cookieHeader
         }
-        if (portalBase.isNotBlank()) {
-            headers["Referer"] = "$portalBase/c/"
+        if (referer.isNotBlank()) {
+            headers["Referer"] = referer
         }
         return headers
     }
@@ -282,7 +271,8 @@ class StalkerSource(
                 }
             }
         }
-        val headers = buildHeaders(playlist, session)
+        val latestSession = sessionRepo.getStalkerSession(plIdStr) ?: session
+        val headers = buildHeaders(playlist, latestSession)
 
         Pair(resolvedUrl, headers)
     }
@@ -342,5 +332,20 @@ class StalkerSource(
         existingSession: Map<String, Any>? = null
     ): List<IptvItem> = withContext(Dispatchers.IO) {
         StalkerParser.fetchStalkerSeries(host, mac, device, onProgress, onPartialUpdate, existingSession)
+    }
+
+    internal fun resolveEffectiveDevice(playlist: Playlist, session: Map<String, Any>?): StalkerDevice {
+        val sessionDevice = session?.get("device") as? StalkerDevice
+        if (sessionDevice != null) {
+            return sessionDevice
+        }
+        val configuredDevice = if (playlist.stalkerDeviceJson.isNotBlank()) {
+            try { JsonUtils.stalkerDeviceFromJson(playlist.stalkerDeviceJson) } catch (_: Exception) { null }
+        } else null
+        val compatState = sessionRepo.getStalkerCompatState(playlist.id.toString())
+        if (compatState != null) {
+            return compatState.deviceModel.toStalkerDevice(configuredDevice?.serialNumber ?: "")
+        }
+        return configuredDevice ?: StalkerDevice()
     }
 }

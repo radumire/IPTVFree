@@ -44,7 +44,7 @@ object ParentalControl {
 
     // Adult category/group keywords regex (always restricted regardless of age threshold)
     private val ADULT_GROUP_REGEX = Regex(
-        """(?i)(^|[^\w])(adult[os]?|xxx|porn[o]?|erotic[ao]?|nsfw|playboy|penthouse|venus|brazzers|hustler|redlight|dorcel|man-x|vivid|hardcore)($|[^\w])"""
+        """(?i)(^|[^\w])(adult(?:o?s|a?s)?|xxx|porn[o]?|erotic[ao]?|nsfw|playboy|penthouse|venus|brazzers|hustler|redlight|dorcel|man-x|vivid|hardcore)($|[^\w])"""
     )
 
     // Channel name adult keywords regex (conservative to prevent false positives)
@@ -152,7 +152,8 @@ fun ParentalPinDialog(
     expectedPin: String,
     onDismiss: () -> Unit,
     onSuccess: () -> Unit,
-    theme: AppThemeColors
+    theme: AppThemeColors,
+    lang: String = "es"
 ) {
     var enteredPin by remember { mutableStateOf("") }
     var pinError by remember { mutableStateOf(false) }
@@ -183,7 +184,7 @@ fun ParentalPinDialog(
                 )
 
                 Text(
-                    text = "Control Parental",
+                    text = Translator.translate("parental", lang),
                     color = Color.White,
                     fontSize = 17.sp,
                     fontWeight = FontWeight.Bold
@@ -191,9 +192,17 @@ fun ParentalPinDialog(
 
                 Text(
                     text = if (expectedPin.trim().isEmpty()) {
-                        "Introduce el PIN (por defecto: 0000)"
+                        when (lang.lowercase()) {
+                            "en" -> "Enter PIN (default: 0000)"
+                            "ro" -> "Introdu PIN-ul (implicit: 0000)"
+                            else -> "Introduce el PIN (por defecto: 0000)"
+                        }
                     } else {
-                        "Introduce el PIN de 4 dígitos"
+                        when (lang.lowercase()) {
+                            "en" -> "Enter 4-digit PIN"
+                            "ro" -> "Introdu PIN-ul de 4 cifre"
+                            else -> "Introduce el PIN de 4 dígitos"
+                        }
                     },
                     color = Color.LightGray,
                     fontSize = 13.sp,
@@ -243,7 +252,11 @@ fun ParentalPinDialog(
                         containerColor = Color.White.copy(alpha = 0.1f)
                     ) { isFocused ->
                         Text(
-                            text = "Cancelar",
+                            text = when (lang.lowercase()) {
+                                "en" -> "Cancel"
+                                "ro" -> "Anulează"
+                                else -> "Cancelar"
+                            },
                             color = if (isFocused) TV_FOCUSED_TEXT else Color.LightGray,
                             fontSize = 13.sp
                         )
@@ -278,7 +291,11 @@ fun ParentalPinDialog(
                                     pinSuccess = false
                                 )
                                 pinError = true
-                                errorMessage = "PIN incorrecto"
+                                errorMessage = when (lang.lowercase()) {
+                                    "en" -> "Incorrect PIN"
+                                    "ro" -> "PIN incorect"
+                                    else -> "PIN incorrecto"
+                                }
                             }
                         },
                         focusRequester = initialFocusRequester,
@@ -287,7 +304,11 @@ fun ParentalPinDialog(
                         focusedContainerColor = parseHexColor(theme.accentLight)
                     ) { isFocused ->
                         Text(
-                            text = "Desbloquear",
+                            text = when (lang.lowercase()) {
+                                "en" -> "Unlock"
+                                "ro" -> "Deblochează"
+                                else -> "Desbloquear"
+                            },
                             color = if (isFocused) TV_FOCUSED_TEXT else Color.White,
                             fontWeight = FontWeight.Bold,
                             fontSize = 13.sp

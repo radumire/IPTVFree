@@ -17,6 +17,7 @@ import com.example.motor.repository.IptvRepository
 import com.example.motor.repository.MediaCacheRepository
 import com.example.motor.repository.PlaylistConnectionGuard
 import com.example.motor.repository.PortalSessionRepository
+import com.example.motor.repository.ThrottledCategoryCacheSaver
 import com.example.motor.sync.SyncServerDataProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -427,13 +428,14 @@ class PlaylistViewModel(application: Application) : AndroidViewModel(application
                         return@launch
                     }
                     sessionRepo.setStalkerSession(pl.id.toString(), sessionMap)
+                    val negotiatedDev = (sessionMap["device"] as? StalkerDevice) ?: dev
 
                     // PASO 2: Obtener estructura/categorías y canales de TV
                     if (!silent) _connectLog.value = "Obteniendo categorías y canales de TV..."
                     val tvChannels = iptvRepo.fetchStalkerTv(
                         host = pl.host,
                         mac = pl.mac,
-                        device = dev,
+                        device = negotiatedDev,
                         onProgress = { msg ->
                             if (currentGen == connectGeneration && !silent) {
                                 _connectLog.value = msg
@@ -493,6 +495,10 @@ class PlaylistViewModel(application: Application) : AndroidViewModel(application
                     stalkerBackgroundJob?.cancel()
                     val stalkerJobGen = currentGen
                     stalkerBackgroundJob = viewModelScope.launch(Dispatchers.IO) {
+                        val bgScope = this
+                        val partialCacheSaver = ThrottledCategoryCacheSaver { type, grouped ->
+                            mediaCacheRepo.saveCategoryCache(pl.id, type, grouped)
+                        }
                         _stalkerDownloading.value = true
                         _stalkerDownloadStats.value = "Descargando películas en segundo plano..."
                         try {
@@ -500,31 +506,29 @@ class PlaylistViewModel(application: Application) : AndroidViewModel(application
                             val movies = iptvRepo.fetchStalkerVod(
                                 host = pl.host,
                                 mac = pl.mac,
-                                device = dev,
+                                device = negotiatedDev,
                                 onProgress = { msg ->
                                     if (stalkerJobGen == connectGeneration) {
                                         _stalkerDownloadStats.value = msg
                                     }
                                 },
                                 onPartialUpdate = { type, items ->
-                                    if (stalkerJobGen == connectGeneration) {
-                                        val grouped = items.groupBy { it.group }
-                                        viewModelScope.launch(Dispatchers.IO) {
-                                            if (stalkerJobGen != connectGeneration) return@launch
-                                            try {
-                                                mediaCacheRepo.saveCategoryCache(pl.id, type, grouped)
-                                            } catch (t: Throwable) {
-                                                Log.w(TAG, "Error guardando caché parcial Stalker $type", t)
-                                            }
-                                        }
-                                    }
+                                    partialCacheSaver.submitPartial(
+                                        scope = bgScope,
+                                        type = type,
+                                        itemsSnapshot = items,
+                                        shouldContinue = { stalkerJobGen == connectGeneration }
+                                    )
                                 },
                                 existingSession = sessionMap
                             )
                             if (movies.isNotEmpty() && stalkerJobGen == connectGeneration) {
-                                val movieMap = movies.groupBy { it.group }
                                 try {
-                                    mediaCacheRepo.saveCategoryCache(pl.id, "movie", movieMap)
+                                    partialCacheSaver.saveFinal(
+                                        type = "movie",
+                                        items = movies,
+                                        shouldContinue = { stalkerJobGen == connectGeneration }
+                                    )
                                     mediaCacheRepo.notifyCacheUpdated(pl.id)
                                 } catch (t: Throwable) {
                                     Log.w(TAG, "Error guardando caché películas Stalker", t)
@@ -537,31 +541,29 @@ class PlaylistViewModel(application: Application) : AndroidViewModel(application
                                 val series = iptvRepo.fetchStalkerSeries(
                                     host = pl.host,
                                     mac = pl.mac,
-                                    device = dev,
+                                    device = negotiatedDev,
                                     onProgress = { msg ->
                                         if (stalkerJobGen == connectGeneration) {
                                             _stalkerDownloadStats.value = msg
                                         }
                                     },
                                     onPartialUpdate = { type, items ->
-                                        if (stalkerJobGen == connectGeneration) {
-                                            val grouped = items.groupBy { it.group }
-                                            viewModelScope.launch(Dispatchers.IO) {
-                                                if (stalkerJobGen != connectGeneration) return@launch
-                                                try {
-                                                    mediaCacheRepo.saveCategoryCache(pl.id, type, grouped)
-                                                } catch (t: Throwable) {
-                                                    Log.w(TAG, "Error guardando caché parcial Stalker $type", t)
-                                                }
-                                            }
-                                        }
+                                        partialCacheSaver.submitPartial(
+                                            scope = bgScope,
+                                            type = type,
+                                            itemsSnapshot = items,
+                                            shouldContinue = { stalkerJobGen == connectGeneration }
+                                        )
                                     },
                                     existingSession = sessionMap
                                 )
                                 if (series.isNotEmpty() && stalkerJobGen == connectGeneration) {
-                                    val seriesMap = series.groupBy { it.group }
                                     try {
-                                        mediaCacheRepo.saveCategoryCache(pl.id, "series", seriesMap)
+                                        partialCacheSaver.saveFinal(
+                                            type = "series",
+                                            items = series,
+                                            shouldContinue = { stalkerJobGen == connectGeneration }
+                                        )
                                         mediaCacheRepo.notifyCacheUpdated(pl.id)
                                     } catch (t: Throwable) {
                                         Log.w(TAG, "Error guardando caché series Stalker", t)

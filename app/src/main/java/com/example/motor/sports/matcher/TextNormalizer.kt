@@ -17,13 +17,18 @@ import java.util.regex.Pattern
 object TextNormalizer {
 
     private val DIACRITICS_PATTERN: Pattern = Pattern.compile("\\p{InCombiningDiacriticalMarks}+")
+    private val CODEC_PATTERN: Pattern = Pattern.compile("\\b([hx])[.\\-_\\s]?(26[45])\\b")
+    private val FPS_PATTERN: Pattern = Pattern.compile("\\b(25|30|50|60|120)[.\\-_\\s]?fps\\b")
+    private val HDR10_PATTERN: Pattern = Pattern.compile("\\bhdr[.\\-_\\s]?10\\+?\\b")
     private val SEPARATORS_PATTERN: Pattern = Pattern.compile("[+:|/_\\-\\\\•~()\\[\\]{}.,;!¿?¡\"']+")
     private val MULTI_SPACE_PATTERN: Pattern = Pattern.compile("\\s+")
 
     // Ruido habitual en sufijos o prefijos de canales IPTV
     private val NOISE_TOKENS = setOf(
-        "fhd", "uhd", "4k", "hd", "sd", "h265", "hevc", "raw",
-        "1080p", "720p", "50fps", "60fps", "vip", "backup", "opt",
+        "fhd", "uhd", "4k", "8k", "hd", "sd", "h265", "h264", "x265", "x264",
+        "hevc", "hdr", "hdr10", "sdr", "hlg", "raw",
+        "1080p", "1080i", "720p", "25fps", "30fps", "50fps", "60fps", "120fps",
+        "aac", "ac3", "dolby", "vip", "backup", "opt",
         "es", "spa", "esp", "lat", "latam", "us", "uk", "fr", "de", "it",
         "ar", "mx", "canal", "canales", "tv"
     )
@@ -41,10 +46,15 @@ object TextNormalizer {
             result = DIACRITICS_PATTERN.matcher(nfd).replaceAll("")
         }
 
-        // 3. Sustitución de separadores por espacios
+        // 3. Preservar etiquetas técnicas con punto o espacio (H.265, H.264, 50 FPS, HDR10+)
+        result = CODEC_PATTERN.matcher(result).replaceAll("$1$2")
+        result = FPS_PATTERN.matcher(result).replaceAll("$1fps")
+        result = HDR10_PATTERN.matcher(result).replaceAll("hdr10")
+
+        // 4. Sustitución de separadores por espacios
         result = SEPARATORS_PATTERN.matcher(result).replaceAll(" ")
 
-        // 4. Colapso de espacios múltiples
+        // 5. Colapso de espacios múltiples
         result = MULTI_SPACE_PATTERN.matcher(result).replaceAll(" ").trim()
 
         return result

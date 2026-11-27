@@ -8,6 +8,7 @@ import com.example.motor.sports.parser.BasketballSportsParser
 import com.example.motor.sports.parser.FootballSportsParser
 import com.example.motor.sports.parser.RugbySportsParser
 import com.example.motor.sports.remote.ApiSportsRemoteDataSource
+import com.example.motor.sports.remote.OpenSportsRemoteDataSource
 import com.example.motor.sports.remote.SportsRemoteDataSource
 import com.example.motor.sports.repository.*
 import kotlinx.coroutines.runBlocking
@@ -293,5 +294,59 @@ class SportsApiIntegrationTest {
                     .build()
             }
             .build()
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 9. SportsSport.OTHER CONSULTA HOCKEY/NFL EN LUGAR DE DUPLICAR FÚTBOL
+    // ─────────────────────────────────────────────────────────────────────────
+    @Test
+    fun test09_openSportsOtherSportFetchesNhlNflWithoutDuplicatingFootball() = runBlocking {
+        val requestedUrls = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val nhlEventJson = """
+        {
+          "events": [
+            {
+              "id": "nhl-9001",
+              "date": "2026-10-01T23:00Z",
+              "competitions": [
+                {
+                  "status": { "type": { "state": "in", "detail": "2nd Period" } },
+                  "competitors": [
+                    { "homeAway": "home", "score": "3", "team": { "displayName": "Boston Bruins", "shortDisplayName": "Bruins" } },
+                    { "homeAway": "away", "score": "2", "team": { "displayName": "Toronto Maple Leafs", "shortDisplayName": "Maple Leafs" } }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+        """.trimIndent()
+        val emptyBoardJson = """{ "events": [] }"""
+
+        val client = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                val req = chain.request()
+                val urlStr = req.url.toString()
+                requestedUrls.add(urlStr)
+                val bodyStr = if (urlStr.contains("hockey/nhl")) nhlEventJson else emptyBoardJson
+                Response.Builder()
+                    .request(req)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .body(bodyStr.toResponseBody("application/json".toMediaType()))
+                    .build()
+            }
+            .build()
+
+        val dataSource = OpenSportsRemoteDataSource(client = client)
+        val liveOther = dataSource.getLiveEvents(SportsSport.OTHER)
+
+        assertTrue("Debe consultar hockey/nhl para SportsSport.OTHER", requestedUrls.any { it.contains("hockey/nhl") })
+        assertTrue("Debe consultar football/nfl para SportsSport.OTHER", requestedUrls.any { it.contains("football/nfl") })
+        assertFalse("No debe duplicar ligas de soccer para SportsSport.OTHER", requestedUrls.any { it.contains("/soccer/") })
+        assertEquals(1, liveOther.size)
+        assertEquals(SportsSport.OTHER.id, liveOther.first().sport)
+        assertEquals("Boston Bruins", liveOther.first().homeTeam)
     }
 }

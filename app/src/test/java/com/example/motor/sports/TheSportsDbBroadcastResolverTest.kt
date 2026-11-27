@@ -399,4 +399,34 @@ class TheSportsDbBroadcastResolverTest {
         assertNotNull(viewModel)
         assertNotNull(viewModel.uiState.value)
     }
+
+    // 16. Tildes y diacríticos se normalizan a ASCII ("Atlético" -> "Atletico") en vez de eliminar la letra
+    @Test
+    fun test16_accentsAreNormalizedToAsciiInsteadOfBeingStripped() = runBlocking {
+        val requestedUrls = mutableListOf<String>()
+        val client = createDispatcherMockClient { req ->
+            requestedUrls.add(req.url.toString())
+            if (req.url.encodedPath.contains("searchevents.php")) {
+                createJsonResponse(req, 200, EMPTY_SEARCH_JSON)
+            } else {
+                createJsonResponse(req, 200, EMPTY_TV_JSON)
+            }
+        }
+        val resolver = TheSportsDbBroadcastResolver(client)
+        val event = createSampleEvent(
+            home = "Atlético Madrid",
+            away = "Bayern München",
+            date = LocalDate.of(2026, 10, 1)
+        )
+
+        resolver.resolveBroadcastInfo(event)
+
+        assertEquals("Atletico_Madrid", resolver.sanitizeTeamNameForQuery("Atlético Madrid"))
+        assertEquals("Bayern_Munchen", resolver.sanitizeTeamNameForQuery("Bayern München"))
+        assertTrue(requestedUrls.isNotEmpty())
+        assertTrue(
+            "La búsqueda debe conservar las vocales sin tilde: ${requestedUrls.first()}",
+            requestedUrls.first().contains("e=Atletico_Madrid_vs_Bayern_Munchen")
+        )
+    }
 }

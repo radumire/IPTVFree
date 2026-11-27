@@ -101,7 +101,10 @@ class LiveTvViewModel(application: Application) : AndroidViewModel(application) 
             iptvRepo.favoriteItems.collect { favs ->
                 val activeId = sessionRepo.activePlaylist.value?.id
                 val filtered = if (activeId != null) favs.filter { it.playlistId == activeId } else emptyList()
-                val favIds = filtered.filter { it.type == "tv" }.flatMap { listOfNotNull(it.id, it.url, it.title) }.toSet()
+                val favIds = filtered.filter { IptvRepository.normalizeFavoriteType(it.type) == "tv" }
+                    .flatMap { listOfNotNull(it.id, it.url.takeIf { u -> u.isNotBlank() }, it.stalkerCmd, it.title.takeIf { t -> t.isNotBlank() }) }
+                    .filter { it.isNotBlank() }
+                    .toSet()
                 _uiState.update { state -> state.copy(favoriteIds = favIds) }
             }
         }
@@ -190,6 +193,8 @@ class LiveTvViewModel(application: Application) : AndroidViewModel(application) 
     fun updateLiveChannels(channels: Map<String, List<IptvItem>>) {
         _liveChannels.value = channels
     }
+
+    fun getActivePlaylistId(): Long? = sessionRepo.activePlaylist.value?.id
 
     suspend fun resolveStream(channel: IptvItem): Pair<String, Map<String, String>> = withContext(Dispatchers.IO) {
         val pl = sessionRepo.activePlaylist.value
@@ -296,13 +301,7 @@ class LiveTvViewModel(application: Application) : AndroidViewModel(application) 
     fun toggleFavorite(item: IptvItem) {
         viewModelScope.launch {
             val pl = sessionRepo.activePlaylist.value ?: return@launch
-            val id = item.name
-            if (_uiState.value.favoriteIds.contains(id) || (item.url != null && _uiState.value.favoriteIds.contains(item.url))) {
-                iptvRepo.removeFavorite(id, pl.id)
-                item.url?.let { iptvRepo.removeFavorite(it, pl.id) }
-            } else {
-                iptvRepo.addFavorite(id, item.name, "tv", item.url ?: "", item.logo, pl.id)
-            }
+            iptvRepo.toggleFavoriteItem(item, "tv", pl.id)
         }
     }
 

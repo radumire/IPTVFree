@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -40,6 +41,7 @@ import com.example.Translator
 import com.example.parseHexColor
 import com.example.motor.db.*
 import com.example.motor.config.*
+import com.example.motor.repository.IptvRepository
 import com.example.interfaz.AppThemeColors
 import com.example.interfaz.getFailedChannelColors
 import com.example.interfaz.viewmodel.LiveTvViewModel
@@ -223,19 +225,12 @@ fun LiveTVScreen(
     }
 
     val favorites by viewModel.favoritesList.collectAsStateWithLifecycle()
-    val tvFavorites = remember(favorites) { favorites.filter { it.type == "tv" } }
-    val favoriteTvIds = remember(tvFavorites) {
-        tvFavorites.flatMap { listOfNotNull(it.id, it.title, it.url) }.toSet()
+    val tvFavorites = remember(favorites) {
+        favorites.filter { IptvRepository.normalizeFavoriteType(it.type) == "tv" }
     }
-    val favoriteChannels = remember(tvFavorites) {
+    val favoriteChannels = remember(tvFavorites, liveChannelsMap) {
         tvFavorites.map { fav ->
-            IptvItem(
-                name = fav.title,
-                group = "Favoritos",
-                url = fav.url,
-                logo = fav.logo,
-                tvgId = fav.id
-            )
+            IptvRepository.resolveCatalogItemForFavorite(fav, liveChannelsMap)
         }
     }
 
@@ -633,7 +628,10 @@ fun LiveTVScreen(
                         modifier = Modifier.fillMaxSize(),
                         verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(6.dp)
                     ) {
-                        items(activeChannels, key = { it.url ?: (it.name + "_" + it.group) }) { channel ->
+                        itemsIndexed(
+                            activeChannels,
+                            key = { index, channel -> liveChannelItemKey(index, channel) }
+                        ) { _, channel ->
                             val isSel = channel == selectedChannel
                             val channelKey = remember(channel) { LiveTvViewModel.getChannelCheckKey(channel) }
                             val isFailed = failedChannelKeys.contains(channelKey)
@@ -663,8 +661,9 @@ fun LiveTVScreen(
                                 else -> Color.LightGray
                             }
 
-                            val favId = channel.tvgId?.ifBlank { channel.name } ?: channel.name
-                            val isChannelFav = favoriteTvIds.contains(favId) || favoriteTvIds.contains(channel.name) || (channel.url != null && favoriteTvIds.contains(channel.url))
+                            val isChannelFav = remember(channel, tvFavorites) {
+                                IptvRepository.isItemFavorited(channel, "tv", tvFavorites)
+                            }
                             val idleBg = when {
                                 isFailed -> failedColors.bg
                                 isSel -> parseHexColor(theme.accent).copy(alpha = 0.35f)
@@ -753,22 +752,7 @@ fun LiveTVScreen(
 
                                 // Favorite Star Button in Channel Card (Bottom/Right)
                                 TvIconButton(
-                                    onClick = {
-                                        if (isChannelFav) {
-                                            viewModel.removeFavorite(favId)
-                                            if (channel.tvgId != null && channel.tvgId != channel.name) {
-                                                viewModel.removeFavorite(channel.name)
-                                            }
-                                        } else {
-                                            viewModel.addFavorite(
-                                                id = favId,
-                                                title = channel.name,
-                                                type = "tv",
-                                                url = channel.url ?: "",
-                                                logo = channel.logo
-                                            )
-                                        }
-                                    },
+                                    onClick = { viewModel.toggleFavorite(channel) },
                                     containerColor = Color.Transparent,
                                     shape = CircleShape,
                                     modifier = Modifier
@@ -990,32 +974,12 @@ fun LiveTVScreen(
                                 }
                             }
                             
-                            var isFav by remember(channel.tvgId, channel.name) { mutableStateOf(false) }
-                            LaunchedEffect(channel.tvgId, channel.name, favoriteTvIds) {
-                                val id = channel.tvgId ?: channel.name
-                                isFav = favoriteTvIds.contains(id) || favoriteTvIds.contains(channel.name) || viewModel.isFavorite(id)
+                            val isFav = remember(channel, tvFavorites) {
+                                IptvRepository.isItemFavorited(channel, "tv", tvFavorites)
                             }
-                            
+
                             TvIconButton(
-                                onClick = {
-                                    val id = channel.tvgId ?: channel.name
-                                    if (isFav) {
-                                        viewModel.removeFavorite(id)
-                                        if (channel.tvgId != null && channel.tvgId != channel.name) {
-                                            viewModel.removeFavorite(channel.name)
-                                        }
-                                        isFav = false
-                                    } else {
-                                        viewModel.addFavorite(
-                                            id = id,
-                                            title = channel.name,
-                                            type = "tv",
-                                            url = channel.url ?: "",
-                                            logo = channel.logo
-                                        )
-                                        isFav = true
-                                    }
-                                },
+                                onClick = { viewModel.toggleFavorite(channel) },
                                 shape = CircleShape,
                                 modifier = Modifier.size(36.dp)
                             ) { isFocused ->
@@ -1322,4 +1286,8 @@ private fun ChannelCheckProgressModal(
         }
     }
 }
+
+internal fun liveChannelItemKey(index: Int, channel: IptvItem): String =
+    "${channel.name}_${channel.group}_${channel.stalkerCmd ?: ""}_${channel.url ?: ""}_$index"
+
 

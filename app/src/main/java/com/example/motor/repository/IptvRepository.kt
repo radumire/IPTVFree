@@ -47,9 +47,11 @@ class IptvRepository private constructor(
     // Memory cache for series episodes
     private val seriesEpisodesCache = ConcurrentHashMap<String, List<SeriesSeason>>()
 
-    fun getCachedEpisodes(key: String): List<SeriesSeason>? {
+    fun getCachedEpisodes(key: String): List<SeriesSeason>? = seriesEpisodesCache[key]
+
+    suspend fun getCachedEpisodesAsync(key: String): List<SeriesSeason>? {
         seriesEpisodesCache[key]?.let { return it }
-        return kotlinx.coroutines.runBlocking(Dispatchers.IO) {
+        return kotlinx.coroutines.withContext(Dispatchers.IO) {
             val roomResult = mediaCacheRepo.getEpisodesCache(key)
             if (roomResult.data != null) {
                 seriesEpisodesCache[key] = roomResult.data
@@ -104,24 +106,121 @@ class IptvRepository private constructor(
         type: String,
         url: String,
         logo: String?,
-        playlistId: Long? = null
+        playlistId: Long? = null,
+        stalkerCmd: String? = null,
+        seriesId: String? = null,
+        categoryGroup: String? = null,
+        drmScheme: String? = null,
+        drmLicenseUrl: String? = null
     ) = withContext(Dispatchers.IO) {
         val targetPlId = playlistId ?: sessionRepo.activePlaylist.value?.id ?: 0L
-        val fav = FavoriteItem(id, title, type, url, logo, System.currentTimeMillis(), targetPlId)
+        val safeId = id.trim().ifEmpty { "${normalizeFavoriteType(type)}::${title.trim()}" }
+        val fav = FavoriteItem(
+            id = safeId,
+            title = title,
+            type = normalizeFavoriteType(type),
+            url = url,
+            logo = logo,
+            addedAt = System.currentTimeMillis(),
+            playlistId = targetPlId,
+            stalkerCmd = stalkerCmd?.takeIf { it.isNotBlank() },
+            seriesId = seriesId?.takeIf { it.isNotBlank() },
+            categoryGroup = categoryGroup?.takeIf { it.isNotBlank() },
+            drmScheme = drmScheme?.takeIf { it.isNotBlank() },
+            drmLicenseUrl = drmLicenseUrl?.takeIf { it.isNotBlank() }
+        )
         favoriteDao.insert(fav)
     }
 
+    suspend fun addFavoriteItem(
+        item: IptvItem,
+        type: String,
+        playlistId: Long? = null
+    ) = withContext(Dispatchers.IO) {
+        val normType = normalizeFavoriteType(type)
+        val favId = buildFavoriteId(normType, item)
+        addFavorite(
+            id = favId,
+            title = item.name,
+            type = normType,
+            url = item.url ?: "",
+            logo = item.logo,
+            playlistId = playlistId,
+            stalkerCmd = item.stalkerCmd,
+            seriesId = item.seriesId,
+            categoryGroup = item.group,
+            drmScheme = item.drmScheme,
+            drmLicenseUrl = item.drmLicenseUrl
+        )
+    }
+
     suspend fun removeFavorite(id: String, playlistId: Long? = null) = withContext(Dispatchers.IO) {
+        val cleanKey = id.trim()
+        if (cleanKey.isEmpty()) return@withContext
         val targetPlId = playlistId ?: sessionRepo.activePlaylist.value?.id
         if (targetPlId != null && targetPlId > 0) {
-            favoriteDao.deleteByAnyKeyAndPlaylist(id, targetPlId)
+            favoriteDao.deleteByAnyKeyAndPlaylist(cleanKey, targetPlId)
+            favoriteDao.deleteByIdAndPlaylist(cleanKey, targetPlId)
+        } else {
+            favoriteDao.deleteById(cleanKey)
+        }
+    }
+
+    suspend fun removeFavoriteById(id: String, playlistId: Long? = null) = withContext(Dispatchers.IO) {
+        if (id.isBlank()) return@withContext
+        val targetPlId = playlistId ?: sessionRepo.activePlaylist.value?.id
+        if (targetPlId != null && targetPlId > 0) {
             favoriteDao.deleteByIdAndPlaylist(id, targetPlId)
         } else {
             favoriteDao.deleteById(id)
         }
     }
 
+    suspend fun removeFavoriteItem(
+        item: IptvItem,
+        type: String,
+        playlistId: Long? = null
+    ) = withContext(Dispatchers.IO) {
+        val normType = normalizeFavoriteType(type)
+        val targetPlId = playlistId ?: sessionRepo.activePlaylist.value?.id ?: return@withContext
+        if (targetPlId <= 0L) return@withContext
+
+        val favId = buildFavoriteId(normType, item)
+        favoriteDao.deleteByIdTypeAndPlaylist(favId, normType, targetPlId)
+
+        // Clean up any matching row stored under legacy keys or identical source metadata
+        val currentFavs = favoriteDao.getByTypeAndPlaylist(normType, targetPlId)
+        for (fav in currentFavs) {
+            if (matchesFavorite(item, normType, fav)) {
+                favoriteDao.deleteByIdAndPlaylist(fav.id, targetPlId)
+            }
+        }
+    }
+
+    suspend fun toggleFavoriteItem(
+        item: IptvItem,
+        type: String,
+        playlistId: Long? = null
+    ): Boolean = withContext(Dispatchers.IO) {
+        val normType = normalizeFavoriteType(type)
+        val targetPlId = playlistId ?: sessionRepo.activePlaylist.value?.id ?: return@withContext false
+        if (targetPlId <= 0L) return@withContext false
+
+        val existing = favoriteDao.getByTypeAndPlaylist(normType, targetPlId)
+        val matched = existing.filter { matchesFavorite(item, normType, it) }
+        if (matched.isNotEmpty()) {
+            for (fav in matched) {
+                favoriteDao.deleteByIdAndPlaylist(fav.id, targetPlId)
+            }
+            false
+        } else {
+            addFavoriteItem(item, normType, targetPlId)
+            true
+        }
+    }
+
     suspend fun isFavorite(id: String, playlistId: Long? = null): Boolean = withContext(Dispatchers.IO) {
+        if (id.isBlank()) return@withContext false
         val targetPlId = playlistId ?: sessionRepo.activePlaylist.value?.id
         if (targetPlId != null && targetPlId > 0) {
             favoriteDao.getByIdAndPlaylist(id, targetPlId) != null
@@ -435,8 +534,17 @@ class IptvRepository private constructor(
         private var INSTANCE: IptvRepository? = null
 
         fun getInstance(application: Application, sessionRepo: PortalSessionRepository): IptvRepository {
-            return INSTANCE ?: synchronized(this) {
-                INSTANCE ?: IptvRepository(application, sessionRepo).also { INSTANCE = it }
+            val current = INSTANCE
+            if (current != null && current.application === application && current.sessionRepo === sessionRepo) {
+                return current
+            }
+            return synchronized(this) {
+                val existing = INSTANCE
+                if (existing != null && existing.application === application && existing.sessionRepo === sessionRepo) {
+                    existing
+                } else {
+                    IptvRepository(application, sessionRepo).also { INSTANCE = it }
+                }
             }
         }
 
@@ -446,6 +554,82 @@ class IptvRepository private constructor(
 
         fun cleanTitleAndExtractYear(rawTitle: String): TmdbService.CleanedTitle {
             return TmdbRepository.getInstance().cleanTitleAndExtractYear(rawTitle)
+        }
+
+        fun normalizeFavoriteType(type: String): String {
+            return when (type.trim().lowercase()) {
+                "live", "tv" -> "tv"
+                "vod", "movie" -> "movie"
+                "series" -> "series"
+                else -> type.trim().lowercase().ifEmpty { "movie" }
+            }
+        }
+
+        fun buildFavoriteId(type: String, item: IptvItem): String {
+            val normType = normalizeFavoriteType(type)
+            val uniqueSourceKey = item.stalkerCmd?.trim()?.takeIf { it.isNotEmpty() }
+                ?: item.seriesId?.trim()?.takeIf { it.isNotEmpty() }
+                ?: item.url?.trim()?.takeIf { it.isNotEmpty() }
+                ?: item.tvgId?.trim()?.takeIf { it.isNotEmpty() }?.let { "$it|${item.name.trim()}" }
+                ?: "${item.group.trim()}|${item.name.trim()}"
+            return "$normType::$uniqueSourceKey"
+        }
+
+        fun matchesFavorite(item: IptvItem, type: String, fav: FavoriteItem): Boolean {
+            val normType = normalizeFavoriteType(type)
+            if (normalizeFavoriteType(fav.type) != normType) return false
+
+            if (fav.id == buildFavoriteId(normType, item)) return true
+
+            val favCmd = fav.stalkerCmd?.trim()?.takeIf { it.isNotEmpty() }
+            if (favCmd != null) {
+                return item.stalkerCmd?.trim() == favCmd
+            }
+
+            val favSeriesId = fav.seriesId?.trim()?.takeIf { it.isNotEmpty() }
+            if (favSeriesId != null) {
+                return item.seriesId?.trim() == favSeriesId
+            }
+
+            val favUrl = fav.url.trim().takeIf { it.isNotEmpty() }
+            if (favUrl != null) {
+                return item.url?.trim() == favUrl
+            }
+
+            // Legacy v5 fallback (rows saved without stalkerCmd/seriesId and with empty url)
+            val cleanName = item.name.trim()
+            val cleanTvgId = item.tvgId?.trim()?.takeIf { it.isNotEmpty() }
+            return (cleanName.isNotEmpty() && (fav.title.trim() == cleanName || fav.id.trim() == cleanName)) ||
+                (cleanTvgId != null && fav.id.trim() == cleanTvgId)
+        }
+
+        fun isItemFavorited(item: IptvItem, type: String, favorites: List<FavoriteItem>): Boolean {
+            return favorites.any { matchesFavorite(item, type, it) }
+        }
+
+        fun toFallbackIptvItem(fav: FavoriteItem): IptvItem {
+            return IptvItem(
+                name = fav.title,
+                group = fav.categoryGroup?.takeIf { it.isNotBlank() } ?: "Favoritos",
+                logo = fav.logo,
+                tvgId = fav.id.takeIf { !it.contains("::") },
+                url = fav.url.takeIf { it.isNotBlank() },
+                stalkerCmd = fav.stalkerCmd?.takeIf { it.isNotBlank() },
+                seriesId = fav.seriesId?.takeIf { it.isNotBlank() },
+                drmScheme = fav.drmScheme?.takeIf { it.isNotBlank() },
+                drmLicenseUrl = fav.drmLicenseUrl?.takeIf { it.isNotBlank() }
+            )
+        }
+
+        fun resolveCatalogItemForFavorite(
+            fav: FavoriteItem,
+            catalogMap: Map<String, List<IptvItem>>
+        ): IptvItem {
+            val normType = normalizeFavoriteType(fav.type)
+            val matched = catalogMap.values.asSequence().flatten().firstOrNull { item ->
+                matchesFavorite(item, normType, fav)
+            }
+            return matched ?: toFallbackIptvItem(fav)
         }
     }
 }

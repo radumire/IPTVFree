@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -26,6 +27,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -35,6 +37,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
 import com.example.Translator
 import com.example.interfaz.AppThemeColors
+import com.example.interfaz.ParentalPinDialog
 import com.example.interfaz.components.*
 import com.example.interfaz.viewmodel.SportsUiState
 import com.example.interfaz.viewmodel.SportsViewModel
@@ -46,6 +49,7 @@ import com.example.parseHexColor
 import kotlinx.coroutines.delay
 
 import com.example.motor.sports.matcher.SportsChannelCandidate
+import com.example.motor.sports.matcher.dedupIdentityKey
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 
@@ -333,8 +337,64 @@ fun SportsScreen(
                     },
                     onDismiss = { viewModel.dismissChannelSelection() },
                     theme = theme,
+                    lang = lang,
+                    isLockedChannel = { viewModel.isChannelParentalLocked(it) }
+                )
+            }
+
+            // ─── CONTROL PARENTAL PIN PARA CANALES RESTRINGIDOS ────────────────
+            val pendingParental = uiState.pendingParentalUnlock
+            if (pendingParental != null) {
+                ParentalPinDialog(
+                    channelName = pendingParental.candidate.channel.name,
+                    expectedPin = viewModel.getExpectedParentalPin(),
+                    onDismiss = { viewModel.dismissParentalPrompt() },
+                    onSuccess = {
+                        viewModel.confirmParentalUnlockAndPlay(
+                            onPlay = onPlay,
+                            onNotice = { linkedChannelNotice = it }
+                        )
+                    },
+                    theme = theme,
                     lang = lang
                 )
+            }
+
+            // ─── INDICADOR MODAL MIENTRAS BUSCA / RESUELVE ENLACE DEL CANAL ───
+            if (uiState.isMatchingChannel) {
+                Dialog(
+                    onDismissRequest = {},
+                    properties = DialogProperties(dismissOnBackPress = false, dismissOnClickOutside = false)
+                ) {
+                    Surface(
+                        shape = RoundedCornerShape(16.dp),
+                        color = themeSurface.copy(alpha = 0.95f),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, themeAccent.copy(alpha = 0.4f)),
+                        shadowElevation = 12.dp,
+                        modifier = Modifier
+                            .padding(24.dp)
+                            .testTag("sports_matching_loader_dialog")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 24.dp, vertical = 18.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center
+                        ) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(24.dp),
+                                color = themeAccent,
+                                strokeWidth = 2.5.dp
+                            )
+                            Spacer(modifier = Modifier.width(16.dp))
+                            Text(
+                                text = Translator.translate("sports_searching_channel", lang),
+                                color = Color.White,
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Medium
+                            )
+                        }
+                    }
+                }
             }
 
             // ─── AVISO TEMPORAL FLOTANTE ──────────────────────────────────────
@@ -386,7 +446,8 @@ internal fun SportsChannelSelectionDialog(
     onSelect: (SportsChannelCandidate) -> Unit,
     onDismiss: () -> Unit,
     theme: AppThemeColors,
-    lang: String = "es"
+    lang: String = "es",
+    isLockedChannel: (com.example.motor.db.IptvItem) -> Boolean = { false }
 ) {
     val themeBg = parseHexColor(theme.bg)
     val themeSurface = parseHexColor(theme.surface)
@@ -485,7 +546,10 @@ internal fun SportsChannelSelectionDialog(
                             .heightIn(max = 280.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        items(selectionState.candidates) { candidate ->
+                        itemsIndexed(
+                            items = selectionState.candidates,
+                            key = { index, candidate -> "${candidate.channel.dedupIdentityKey()}_$index" }
+                        ) { index, candidate ->
                             var isFocused by remember { mutableStateOf(false) }
 
                             Box(
@@ -501,7 +565,7 @@ internal fun SportsChannelSelectionDialog(
                                         shape = RoundedCornerShape(10.dp),
                                         focusedBackgroundColor = TV_FOCUSED_BG,
                                         unfocusedBackgroundColor = Color.White.copy(alpha = 0.05f),
-                                        focusRequester = if (candidate == selectionState.candidates.first()) initialFocus else null,
+                                        focusRequester = if (index == 0) initialFocus else null,
                                         onFocusChange = { isFocused = it },
                                         onClick = { onSelect(candidate) }
                                     )
@@ -538,14 +602,26 @@ internal fun SportsChannelSelectionDialog(
                                         }
 
                                         Column {
-                                            Text(
-                                                text = candidate.channel.name,
-                                                color = if (isFocused) TV_FOCUSED_TEXT else Color.White,
-                                                fontSize = 14.sp,
-                                                fontWeight = FontWeight.Bold,
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis
-                                            )
+                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                Text(
+                                                    text = candidate.channel.name,
+                                                    color = if (isFocused) TV_FOCUSED_TEXT else Color.White,
+                                                    fontSize = 14.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                    modifier = Modifier.weight(1f, fill = false)
+                                                )
+                                                if (isLockedChannel(candidate.channel)) {
+                                                    Spacer(modifier = Modifier.width(6.dp))
+                                                    Icon(
+                                                        imageVector = Icons.Default.Lock,
+                                                        contentDescription = "Parental lock",
+                                                        tint = if (isFocused) TV_FOCUSED_TEXT else Color(0xFFF59E0B),
+                                                        modifier = Modifier.size(14.dp)
+                                                    )
+                                                }
+                                            }
                                             Row(verticalAlignment = Alignment.CenterVertically) {
                                                 if (candidate.channel.group.isNotBlank()) {
                                                     Text(
@@ -760,7 +836,7 @@ private fun SportsCategoriesRow(
         horizontalArrangement = Arrangement.spacedBy(10.dp),
         contentPadding = PaddingValues(horizontal = 2.dp)
     ) {
-        items(displayedSports) { sport ->
+        items(displayedSports, key = { it.id }) { sport ->
             val isSelected = sport == selectedSport
             var isFocused by remember { mutableStateOf(false) }
             val count = getSportCount(sport)
@@ -847,7 +923,7 @@ private fun SportsFiltersRow(
         horizontalArrangement = Arrangement.spacedBy(10.dp),
         contentPadding = PaddingValues(horizontal = 2.dp)
     ) {
-        items(filters) { filter ->
+        items(filters, key = { it.id }) { filter ->
             val isSelected = filter == selectedFilter
             var isFocused by remember { mutableStateOf(false) }
 
@@ -956,7 +1032,7 @@ private fun SportsSectionsList(
     ) {
         // SECCIÓN 1: 🔴 EN DIRECTO
         if (showLive) {
-            item {
+            item(key = "header_live") {
                 SectionHeader(
                     title = Translator.translate("live_now", lang),
                     icon = Icons.Default.FiberManualRecord,
@@ -966,7 +1042,10 @@ private fun SportsSectionsList(
                 )
             }
 
-            items(livePairs) { pair ->
+            itemsIndexed(
+                items = livePairs,
+                key = { index, pair -> "live_${pair[0].id}_${pair.getOrNull(1)?.id ?: "single"}_$index" }
+            ) { _, pair ->
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -995,7 +1074,7 @@ private fun SportsSectionsList(
 
         // SECCIÓN 2: ⏱️ PRÓXIMOS - HOY
         if (showToday) {
-            item {
+            item(key = "header_today") {
                 SectionHeader(
                     title = Translator.translate("upcoming_today", lang),
                     icon = Icons.Default.Schedule,
@@ -1005,7 +1084,10 @@ private fun SportsSectionsList(
                 )
             }
 
-            items(todayPairs) { pair ->
+            itemsIndexed(
+                items = todayPairs,
+                key = { index, pair -> "today_${pair[0].id}_${pair.getOrNull(1)?.id ?: "single"}_$index" }
+            ) { _, pair ->
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -1034,7 +1116,7 @@ private fun SportsSectionsList(
 
         // SECCIÓN 3: 📅 MAÑANA
         if (showTomorrow) {
-            item {
+            item(key = "header_tomorrow") {
                 SectionHeader(
                     title = Translator.translate("tomorrow_events", lang),
                     icon = Icons.Default.CalendarToday,
@@ -1044,7 +1126,10 @@ private fun SportsSectionsList(
                 )
             }
 
-            items(tomorrowPairs) { pair ->
+            itemsIndexed(
+                items = tomorrowPairs,
+                key = { index, pair -> "tomorrow_${pair[0].id}_${pair.getOrNull(1)?.id ?: "single"}_$index" }
+            ) { _, pair ->
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -1073,7 +1158,7 @@ private fun SportsSectionsList(
 
         // SECCIÓN 4: 🗓️ PRÓXIMAMENTE ESTA SEMANA
         if (showWeek) {
-            item {
+            item(key = "header_week") {
                 SectionHeader(
                     title = Translator.translate("upcoming_week", lang),
                     icon = Icons.Default.DateRange,
@@ -1083,7 +1168,10 @@ private fun SportsSectionsList(
                 )
             }
 
-            items(weekPairs) { pair ->
+            itemsIndexed(
+                items = weekPairs,
+                key = { index, pair -> "week_${pair[0].id}_${pair.getOrNull(1)?.id ?: "single"}_$index" }
+            ) { _, pair ->
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
