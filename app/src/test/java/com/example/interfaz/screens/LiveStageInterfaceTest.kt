@@ -380,4 +380,103 @@ class LiveStageInterfaceTest {
         composeTestRule.waitForIdle()
         assertEquals(listOf("sports"), navigatedRoutes)
     }
+
+    @Test
+    fun liveStageHomeContent_restoresInitialSelectedTabAcrossAllSections() {
+        val movies = listOf(IptvItem(name = "Película Persistente", url = "http://ex/m.mp4", logo = null, group = "Cine"))
+        val series = listOf(IptvItem(name = "Serie Persistente", url = "http://ex/s.mp4", logo = null, group = "Drama", seriesId = "99"))
+        val match = SportsEvent(
+            id = "m-persisted",
+            sport = "football",
+            league = "Champions",
+            homeTeam = "Arsenal",
+            awayTeam = "Milan",
+            startTime = System.currentTimeMillis(),
+            status = SportsEventStatus.LIVE
+        )
+        val favs = listOf(
+            FavoriteItem(
+                id = "movie::persisted",
+                title = "Favorito Persistente",
+                type = "movie",
+                url = "http://ex/fav.mp4",
+                addedAt = 1000L,
+                playlistId = 1L
+            )
+        )
+        val playlist = Playlist(id = 1L, name = "Lista Persistente", type = "xtream", host = "http://demo.tv:8080")
+        val reportedTabs = mutableListOf<LiveStageTab?>()
+        val currentPersistedTab = androidx.compose.runtime.mutableStateOf<LiveStageTab?>(LiveStageTab.MOVIES)
+
+        composeTestRule.setContent {
+            Box(modifier = Modifier.size(width = 1280.dp, height = 720.dp)) {
+                LiveStageHomeContent(
+                    settings = PlayerSettings(lang = "es", homeLayout = "live_stage"),
+                    activePlaylist = playlist,
+                    isOnline = true,
+                    totalLiveCount = 10,
+                    totalMoviesCount = 1,
+                    totalSeriesCount = 1,
+                    categoryChannels = listOf(channel("La 1 HD", "ES | TDT")),
+                    selectedPreviewChannel = channel("La 1 HD", "ES | TDT"),
+                    isChannelLocked = { false },
+                    isResolvingPreview = false,
+                    hasPreviewStream = false,
+                    newestMovies = movies,
+                    precomputedMoviesData = PrecomputedMoviesData(
+                        groups = listOf("Cine"),
+                        allMovies = movies,
+                        groupToMovies = mapOf("Cine" to movies),
+                        categoryCounts = mapOf("Cine" to 1),
+                        totalMoviesCount = 1
+                    ),
+                    precomputedSeriesData = PrecomputedSeriesData(
+                        groups = listOf("Drama"),
+                        seriesBaseNameCache = emptyMap(),
+                        categoryCounts = mapOf("Drama" to 1),
+                        allSeriesUnique = series,
+                        groupToUniqueSeries = mapOf("Drama" to series),
+                        allSeries = series
+                    ),
+                    sportsUiState = SportsUiState(isLoading = false, liveEvents = listOf(match)),
+                    favorites = favs,
+                    onSelectPreviewChannel = {},
+                    onOpenFullscreenPreview = {},
+                    onMatchClick = {},
+                    onMovieClick = {},
+                    onSeriesClick = {},
+                    onFavoriteClick = {},
+                    onSelectInterface = {},
+                    onNavigate = {},
+                    onExitRequest = {},
+                    theme = THEMES_LIST.first(),
+                    initialSelectedTab = currentPersistedTab.value,
+                    onSelectedTabChanged = { reportedTabs.add(it) }
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("Película Persistente", useUnmergedTree = true).assertIsDisplayed()
+
+        // Switching persisted tab verifies Series, Favorites, Sports, Playlists, Settings restore directly
+        composeTestRule.runOnIdle { currentPersistedTab.value = LiveStageTab.SERIES }
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("Serie Persistente", useUnmergedTree = true).assertIsDisplayed()
+
+        composeTestRule.runOnIdle { currentPersistedTab.value = LiveStageTab.FAVORITES }
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("Favorito Persistente", useUnmergedTree = true).assertIsDisplayed()
+
+        composeTestRule.runOnIdle { currentPersistedTab.value = LiveStageTab.SPORTS }
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("Arsenal vs Milan", useUnmergedTree = true).assertIsDisplayed()
+
+        composeTestRule.runOnIdle { currentPersistedTab.value = LiveStageTab.PLAYLISTS }
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("Lista Persistente", useUnmergedTree = true).assertIsDisplayed()
+
+        composeTestRule.runOnIdle { currentPersistedTab.value = LiveStageTab.SETTINGS }
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("livestage_interface_item_showcase").assertIsDisplayed()
+    }
 }

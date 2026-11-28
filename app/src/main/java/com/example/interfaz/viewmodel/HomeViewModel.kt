@@ -67,6 +67,13 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
         _cinemaBarSelectedTab.value = tabKey
     }
 
+    private val _liveStageSelectedTab = MutableStateFlow<String?>(null)
+    val liveStageSelectedTab: StateFlow<String?> = _liveStageSelectedTab.asStateFlow()
+
+    fun setLiveStageSelectedTab(tabName: String?) {
+        _liveStageSelectedTab.value = tabName
+    }
+
     private val _isStalkerDownloading = MutableStateFlow(false)
     val isStalkerDownloading: StateFlow<Boolean> = _isStalkerDownloading.asStateFlow()
     val stalkerDownloading: StateFlow<Boolean> = _isStalkerDownloading.asStateFlow()

@@ -50,16 +50,19 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.InputMode
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.platform.LocalInputModeManager
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -234,6 +237,10 @@ fun LiveStageHomeScreen(
     val precomputedSeriesData by seriesViewModel.precomputedSeriesData.collectAsStateWithLifecycle()
     val sportsUiState by sportsViewModel.uiState.collectAsStateWithLifecycle()
     val isOnline by homeViewModel.isOnline.collectAsStateWithLifecycle()
+    val persistedTabName by homeViewModel.liveStageSelectedTab.collectAsStateWithLifecycle()
+    val initialSelectedTab = remember(persistedTabName) {
+        LiveStageTab.entries.firstOrNull { it.name == persistedTabName }
+    }
 
     val scope = rememberCoroutineScope()
     val lang = settings.lang
@@ -348,6 +355,8 @@ fun LiveStageHomeScreen(
         precomputedSeriesData = precomputedSeriesData,
         sportsUiState = sportsUiState,
         favorites = homeUiState.favorites,
+        initialSelectedTab = initialSelectedTab,
+        onSelectedTabChanged = { tab -> homeViewModel.setLiveStageSelectedTab(tab?.name) },
         onSelectPreviewChannel = { ch ->
             val locked = settings.parentalEnabled &&
                 ParentalControl.isChannelRestricted(ch, settings) &&
@@ -458,6 +467,9 @@ fun LiveStageHomeScreen(
             }
         },
         onSelectInterface = { layoutId ->
+            if (layoutId != "live_stage") {
+                homeViewModel.setLiveStageSelectedTab(null)
+            }
             settingsViewModel.updateCurrentProfileField(settings = settings.copy(homeLayout = layoutId))
         },
         onNavigate = onNavigate,
@@ -628,20 +640,25 @@ internal fun LiveStageHomeContent(
     onNavigate: (String) -> Unit,
     onExitRequest: () -> Unit,
     theme: AppThemeColors,
+    initialSelectedTab: LiveStageTab? = null,
+    onSelectedTabChanged: (LiveStageTab?) -> Unit = {},
     videoPreviewSlot: @Composable () -> Unit = {}
 ) {
     val lang = settings.lang
+    val inputModeManager = LocalInputModeManager.current
     val themeBg = remember(theme) { parseHexColor(theme.bg) }
     val themeSurface = remember(theme) { parseHexColor(theme.surface) }
     val themeCard = remember(theme) { parseHexColor(theme.card) }
     val themeAccent = remember(theme) { parseHexColor(theme.accent) }
     val themeAccentLight = remember(theme) { parseHexColor(theme.accentLight) }
 
-    // Startup requirement: NO tab visually highlighted at launch, while TV view is shown below
-    var highlightedTab by remember { mutableStateOf<LiveStageTab?>(null) }
-    var activeContentTab by remember { mutableStateOf(LiveStageTab.TV) }
+    // Startup requirement: NO tab visually highlighted at launch (initialSelectedTab == null), while TV view is shown below.
+    // When returning from a section/detail screen, initialSelectedTab restores the tab the user came from.
+    var highlightedTab by remember(initialSelectedTab) { mutableStateOf(initialSelectedTab) }
+    var activeContentTab by remember(initialSelectedTab) { mutableStateOf(initialSelectedTab ?: LiveStageTab.TV) }
     var focusedTab by remember { mutableStateOf<LiveStageTab?>(null) }
     var isProfilesFocused by remember { mutableStateOf(false) }
+    var isSentinelFocused by remember { mutableStateOf(false) }
     var consumeInitialConfirmUp by remember { mutableStateOf(false) }
 
     val startupSentinelFocusRequester = remember { FocusRequester() }
@@ -649,11 +666,17 @@ internal fun LiveStageHomeContent(
         LiveStageTab.entries.associateWith { FocusRequester() }
     }
 
-    LaunchedEffect(Unit) {
+    LaunchedEffect(initialSelectedTab) {
         delay(120L)
-        if (highlightedTab == null && focusedTab == null && !isProfilesFocused) {
+        if (initialSelectedTab == null) {
+            if (highlightedTab == null && focusedTab == null && !isProfilesFocused) {
+                try {
+                    startupSentinelFocusRequester.requestFocus()
+                } catch (_: Exception) {}
+            }
+        } else if (inputModeManager.inputMode != InputMode.Touch && focusedTab == null && !isProfilesFocused) {
             try {
-                startupSentinelFocusRequester.requestFocus()
+                tabFocusRequesters[initialSelectedTab]?.requestFocus()
             } catch (_: Exception) {}
         }
     }
@@ -766,7 +789,7 @@ internal fun LiveStageHomeContent(
                 )
             }
             .onPreviewKeyEvent { event ->
-                if (highlightedTab == null && focusedTab == null && !isProfilesFocused && isRemoteNavigationKey(event.key)) {
+                if (isSentinelFocused && highlightedTab == null && focusedTab == null && !isProfilesFocused && isRemoteNavigationKey(event.key)) {
                     if (event.type == KeyEventType.KeyDown) {
                         val isConfirm = event.key == Key.DirectionCenter ||
                             event.key == Key.Enter ||
@@ -805,6 +828,7 @@ internal fun LiveStageHomeContent(
                 .size(1.dp)
                 .testTag("livestage_startup_sentinel")
                 .focusRequester(startupSentinelFocusRequester)
+                .onFocusChanged { isSentinelFocused = it.isFocused }
                 .focusable()
         )
 
@@ -855,6 +879,7 @@ internal fun LiveStageHomeContent(
                                         focusedTab = tab
                                         highlightedTab = tab
                                         activeContentTab = tab
+                                        onSelectedTabChanged(tab)
                                     } else if (focusedTab == tab) {
                                         focusedTab = null
                                     }
@@ -863,7 +888,9 @@ internal fun LiveStageHomeContent(
                                     if (highlightedTab != tab) {
                                         highlightedTab = tab
                                         activeContentTab = tab
+                                        onSelectedTabChanged(tab)
                                     } else {
+                                        onSelectedTabChanged(tab)
                                         onNavigate(tab.route)
                                     }
                                 }

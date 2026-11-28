@@ -199,8 +199,10 @@ fun AppContent(viewModel: MainViewModel, theme: AppThemeColors) {
         val prof = currentProfile
         if (prof == null) {
             lastHandledProfileId = null
+            homeViewModel.setLiveStageSelectedTab(null)
         } else if (prof.id != lastHandledProfileId) {
             lastHandledProfileId = prof.id
+            homeViewModel.setLiveStageSelectedTab(null)
             activePlayerSrc = null
             activeStreamHeaders = emptyMap()
             activeCategoryPlaylistId = null
